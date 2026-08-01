@@ -1,0 +1,98 @@
+{
+  "name": "profile-git-sync",
+  "displayName": "Profile Git Sync",
+  "description": "在 VS Code 与 Cursor 中通过 Git 自动同步全部用户配置文件。",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:profileGitSync.sidebar",
+    "onCommand:profileGitSync.syncNow",
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "profileGitSync.syncNow",
+        "title": "Profile Git Sync: 立即同步"
+      },
+      {
+        "command": "profileGitSync.openSettings",
+        "title": "Profile Git Sync: 打开设置"
+      },
+      {
+        "command": "profileGitSync.applyPending",
+        "title": "Profile Git Sync: 应用待处理的远程配置"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "profileGitSync",
+          "title": "配置同步",
+          "icon": "media/sync.svg"
+        }
+      ]
+    },
+    "views": {
+      "profileGitSync": [
+        {
+          "id": "profileGitSync.sidebar",
+          "name": "同步状态",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Profile Git Sync",
+      "properties": {
+        "profileGitSync.autoSync": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动检测本机和远程配置变化并同步。"
+        },
+        "profileGitSync.pollIntervalSeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 30,
+          "description": "远程仓库轮询间隔（秒）。"
+        },
+        "profileGitSync.debounceSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "description": "本机配置变化合并等待时间（秒）。"
+        },
+        "profileGitSync.includeProfileAssociations": {
+          "type": "boolean",
+          "default": false,
+          "description": "同步工作区与配置文件的关联关系。默认关闭以避免把本机路径提交到仓库。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "test": "npm run build && node esbuild.test.mjs && node --test dist/test.cjs",
+    "package": "npm run check && npm run test && vsce package --no-dependencies --allow-missing-repository"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}
