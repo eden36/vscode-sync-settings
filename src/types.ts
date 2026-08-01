@@ -6,10 +6,16 @@ export type SyncPhase =
   | '正在拉取'
   | '正在提交'
   | '正在推送'
+  | '正在同步扩展'
   | '等待其他窗口关闭'
   | '等待 AI'
   | '存在冲突'
   | '失败';
+
+export interface SyncOutcome {
+  ok: boolean;
+  extensionsPending?: string[];
+}
 
 export interface SyncConfiguration {
   repositoryUrl: string;

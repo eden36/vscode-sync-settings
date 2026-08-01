@@ -9,7 +9,7 @@ import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { SidebarProvider } from './sidebar';
 import { SyncEngine } from './sync-engine';
-import { RuntimeStatus } from './types';
+import { RuntimeStatus, SyncOutcome } from './types';
 
 let coordinator: MultiWindowCoordinator | undefined;
 let localTimer: NodeJS.Timeout | undefined;
@@ -37,9 +37,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const ai = new AiService();
   let localFingerprint = await adapter.fingerprint();
   let sidebar: SidebarProvider;
+  let activeProgress: vscode.Progress<{ message?: string }> | undefined;
   const updateStatus = (patch: Partial<RuntimeStatus>) => {
     Object.assign(status, patch);
     if (patch.lastSyncAt) void context.globalState.update(LAST_SYNC_KEY, patch.lastSyncAt);
+    if (activeProgress && (patch.phase || patch.message)) {
+      activeProgress.report({ message: patch.message ?? patch.phase });
+    }
     void sidebar?.pushState();
   };
   const engine = new SyncEngine(
@@ -52,17 +56,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => coordinator!.activeWindowCount()
   );
 
-  const synchronize = async (allowStructural = false) => {
+  const reloadAfterSync = async (outcome: SyncOutcome | undefined) => {
+    if (!outcome?.ok || status.phase === '失败') return;
+    if (outcome.extensionsPending?.length) {
+      const answer = await vscode.window.showWarningMessage(
+        `部分扩展尚未安装完成：${outcome.extensionsPending.join('、')}。是否仍重载窗口？`,
+        { modal: true },
+        '仍要重载'
+      );
+      if (answer !== '仍要重载') return;
+    }
+    await vscode.commands.executeCommand('workbench.action.reloadWindow');
+  };
+
+  const synchronize = async (allowStructural = false): Promise<SyncOutcome | undefined> => {
     if (!coordinator!.isLeader) {
       await coordinator!.requestSync();
       updateStatus({ role: 'follower', message: '同步请求已发送给 leader 窗口。' });
-      return;
+      return undefined;
     }
-    const acquired = await coordinator!.runExclusive(async () => {
-      await engine.synchronize(allowStructural);
-      localFingerprint = await adapter.fingerprint();
-    });
-    if (!acquired) updateStatus({ message: '另一窗口正在执行同步，本次请求已合并。' });
+    return vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'Profile Git Sync',
+        cancellable: false
+      },
+      async (progress) => {
+        activeProgress = progress;
+        progress.report({ message: status.phase });
+        let outcome: SyncOutcome | undefined;
+        try {
+          const acquired = await coordinator!.runExclusive(async () => {
+            outcome = await engine.synchronize(allowStructural);
+            localFingerprint = await adapter.fingerprint();
+          });
+          if (!acquired) updateStatus({ message: '另一窗口正在执行同步，本次请求已合并。' });
+        } finally {
+          activeProgress = undefined;
+        }
+        return outcome;
+      }
+    );
   };
   const updateWindowState = async () => {
     updateStatus({
@@ -90,7 +124,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     setTimeout(() => void synchronize(), 1_500);
   };
 
-  sidebar = new SidebarProvider(configurationStore, () => status, synchronize, async () => {
+  sidebar = new SidebarProvider(configurationStore, () => status, async () => { await synchronize(); }, async () => {
     if ((await coordinator!.activeWindowCount()) > 1) {
       updateStatus({ phase: '等待其他窗口关闭', message: '请关闭其他 IDE 窗口后再安全应用。' });
       return;
@@ -101,8 +135,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       '继续应用'
     );
     if (answer !== '继续应用') return;
-    await synchronize(true);
-    if (status.phase !== '失败') void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    const outcome = await synchronize(true);
+    await reloadAfterSync(outcome);
   });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar),
@@ -115,8 +149,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const answer = await vscode.window.showWarningMessage('是否应用待处理的 Profile 结构变化？', { modal: true }, '应用');
       if (answer === '应用') {
-        await synchronize(true);
-        if (status.phase !== '失败') void vscode.commands.executeCommand('workbench.action.reloadWindow');
+        const outcome = await synchronize(true);
+        await reloadAfterSync(outcome);
       }
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {

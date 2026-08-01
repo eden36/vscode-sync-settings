@@ -10,7 +10,8 @@ import { HostEnvironment } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
 import { chooseFallbackSide, fallbackCommitMessage } from './sync-fallback';
-import { RuntimeStatus, SnapshotManifest } from './types';
+import { collectExtensionIdsFromFiles, waitForExtensions } from './extension-wait';
+import { RuntimeStatus, SnapshotManifest, SyncOutcome } from './types';
 
 export class SyncEngine {
   private running = false;
@@ -25,8 +26,8 @@ export class SyncEngine {
     private readonly activeWindowCount: () => Promise<number>
   ) {}
 
-  public async synchronize(allowStructural = false): Promise<void> {
-    if (this.running) return;
+  public async synchronize(allowStructural = false): Promise<SyncOutcome | undefined> {
+    if (this.running) return undefined;
     this.running = true;
     const configuration = this.configurationStore.get();
     let usedAiFallback = false;
@@ -35,14 +36,14 @@ export class SyncEngine {
     try {
       if (!configuration.repositoryUrl) {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
-        return;
+        return { ok: false };
       }
       const dirty = vscode.workspace.textDocuments.filter(
         (document) => document.isDirty && document.uri.scheme === 'file' && isInside(this.environment.userDataPath, document.uri.fsPath)
       );
       if (dirty.length) {
         this.updateStatus({ phase: '空闲', message: `有 ${dirty.length} 个未保存的配置文件，保存后再同步。` });
-        return;
+        return { ok: false };
       }
 
       this.updateStatus({ phase: '正在扫描', message: undefined });
@@ -102,6 +103,18 @@ export class SyncEngine {
 
       const windows = await this.activeWindowCount();
       const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, allowStructural && windows <= 1);
+      let extensionsPending: string[] | undefined;
+      const extensionFiles = restore.changedFiles.filter((file) => path.basename(file) === 'extensions.json');
+      if (extensionFiles.length) {
+        const targetIds = await collectExtensionIdsFromFiles(extensionFiles);
+        this.updateStatus({ phase: '正在同步扩展', message: '等待 IDE 安装扩展…' });
+        const extensionResult = await waitForExtensions(targetIds, {
+          onProgress: (message) => this.updateStatus({ phase: '正在同步扩展', message })
+        });
+        if (!extensionResult.converged) {
+          extensionsPending = extensionResult.pending;
+        }
+      }
       if (restore.structuralChange) {
         this.updateStatus({ phase: '等待其他窗口关闭', activeWindows: windows, message: restore.message });
       }
@@ -109,10 +122,18 @@ export class SyncEngine {
         phase: restore.structuralChange ? '等待其他窗口关闭' : '空闲',
         pendingChanges: 0,
         lastSyncAt: new Date().toISOString(),
-        message: finalSyncMessage(restore.message, changed.length > 0, usedAiFallback, recoveredPendingChanges)
+        message: finalSyncMessage(
+          restore.message,
+          changed.length > 0,
+          usedAiFallback,
+          recoveredPendingChanges,
+          extensionsPending
+        )
       });
+      return { ok: true, extensionsPending };
     } catch (error) {
       this.updateStatus({ phase: '失败', message: error instanceof Error ? error.message : String(error) });
+      return { ok: false };
     } finally {
       this.running = false;
       if (temporaryRoot) {
@@ -249,13 +270,17 @@ function finalSyncMessage(
   structuralMessage: string | undefined,
   changed: boolean,
   usedAiFallback: boolean,
-  recoveredPendingChanges: boolean
+  recoveredPendingChanges: boolean,
+  extensionsPending?: string[]
 ): string {
   if (structuralMessage) return structuralMessage;
   if (!changed) return recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
   const notes: string[] = [];
   if (usedAiFallback) notes.push('AI 不可用或结果无效，已使用兜底策略');
   if (recoveredPendingChanges) notes.push('已清理上次中断的暂存状态');
+  if (extensionsPending?.length) {
+    notes.push(`部分扩展尚未安装完成：${extensionsPending.join('、')}`);
+  }
   return notes.length ? `同步完成（${notes.join('；')}）。` : '同步完成。';
 }
 

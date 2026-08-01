@@ -11,6 +11,7 @@ import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
 import { containsPotentialSecret } from '../src/secret-scanner';
 import { hasEmbeddedCredentials, resolveRepositoryUrl } from '../src/configuration';
+import { parseExtensionIds } from '../src/extension-manifest';
 import { SyncConfiguration } from '../src/types';
 
 test('快照路径拒绝目录穿越', () => {
@@ -176,6 +177,16 @@ test('仓库地址优先从 secret 读取，并迁移 globalState 中的旧值',
     persisted: { branch: 'dev', gitUserName: '', gitUserEmail: '' },
     shouldPersistSecret: true
   });
+});
+
+test('解析 extensions.json 中的扩展标识', () => {
+  assert.deepEqual(parseExtensionIds('[]'), []);
+  assert.deepEqual(parseExtensionIds('not-json'), []);
+  assert.deepEqual(parseExtensionIds(JSON.stringify([
+    { identifier: { id: 'ms-python.python', uuid: 'abc' }, version: '1.0.0' },
+    { identifier: { id: 'vscodevim.vim' }, version: '2.0.0' },
+    { identifier: {} }
+  ])), ['ms-python.python', 'vscodevim.vim']);
 });
 
 test('检测 URL 中嵌入的明文凭据', () => {
