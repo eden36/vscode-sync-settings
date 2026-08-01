@@ -47,10 +47,10 @@ export class ProfileAdapter {
   }
 
   public async fingerprint(): Promise<string> {
-    const profiles = await this.listProfiles();
+    const profiles = (await this.listProfiles()).sort((left, right) => left.id.localeCompare(right.id));
     const hash = createHash('sha256');
     for (const profile of profiles) {
-      hash.update(`${profile.id}\0${profile.name}\0`);
+      hash.update(`${profile.id}\0${profile.name}\0${profile.isDefault ? '1' : '0'}\0`);
       for (const resource of FILE_RESOURCES) {
         const content = await stableRead(path.join(profile.location, resource)).catch((error: NodeJS.ErrnoException) => {
           if (error.code === 'ENOENT') return undefined;

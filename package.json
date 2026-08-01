@@ -14,7 +14,8 @@
   "activationEvents": [
     "onView:profileGitSync.sidebar",
     "onCommand:profileGitSync.syncNow",
-    "onStartupFinished"
+    "onCommand:profileGitSync.openSettings",
+    "onCommand:profileGitSync.applyPending"
   ],
   "main": "./dist/extension.js",
   "contributes": {

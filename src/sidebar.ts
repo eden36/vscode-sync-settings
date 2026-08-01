@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
-import { ConfigurationStore } from './configuration';
+import { ConfigurationStore, hasEmbeddedCredentials } from './configuration';
 import { RuntimeStatus, SyncConfiguration } from './types';
 
 interface AutomationSettings {
@@ -35,6 +35,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (message.type === 'save') {
+        if (hasEmbeddedCredentials(message.configuration.repositoryUrl)) {
+          const proceed = await vscode.window.showWarningMessage(
+            '仓库 URL 中包含明文凭据，建议使用 SSH 或系统凭据管理器。仍要保存吗？',
+            { modal: true },
+            '仍要保存'
+          );
+          if (proceed !== '仍要保存') return;
+        }
         await this.configurationStore.save(message.configuration);
         const settings = vscode.workspace.getConfiguration('profileGitSync');
         await Promise.all([

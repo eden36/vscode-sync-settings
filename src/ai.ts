@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { parseUtilityModelSetting } from './ai-model';
 
+const AI_REQUEST_TIMEOUT_MS = 60_000;
+
 export class AiService {
   public async createCommitMessage(summary: string): Promise<string> {
     const prompt = [
@@ -34,6 +36,7 @@ export class AiService {
     const model = models[0];
     if (!model) throw new Error('当前 IDE 没有向扩展开放默认 AI 模型，提交已暂停。');
     const cancellation = new vscode.CancellationTokenSource();
+    const timer = setTimeout(() => cancellation.cancel(), AI_REQUEST_TIMEOUT_MS);
     try {
       const response = await model.sendRequest(
         [vscode.LanguageModelChatMessage.User(prompt)],
@@ -41,9 +44,20 @@ export class AiService {
         cancellation.token
       );
       let text = '';
-      for await (const fragment of response.text) text += fragment;
+      for await (const fragment of response.text) {
+        if (cancellation.token.isCancellationRequested) {
+          throw new Error('AI 请求超时。');
+        }
+        text += fragment;
+      }
       return text.trim();
+    } catch (error) {
+      if (cancellation.token.isCancellationRequested) {
+        throw new Error('AI 请求超时。');
+      }
+      throw error;
     } finally {
+      clearTimeout(timer);
       cancellation.dispose();
     }
   }

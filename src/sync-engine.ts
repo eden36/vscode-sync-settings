@@ -31,6 +31,7 @@ export class SyncEngine {
     const configuration = this.configurationStore.get();
     let usedAiFallback = false;
     let recoveredPendingChanges = false;
+    let temporaryRoot: string | undefined;
     try {
       if (!configuration.repositoryUrl) {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
@@ -45,7 +46,7 @@ export class SyncEngine {
       }
 
       this.updateStatus({ phase: '正在扫描', message: undefined });
-      const temporaryRoot = path.join(this.environment.runtimePath, 'snapshots', `local-${process.pid}`);
+      temporaryRoot = path.join(this.environment.runtimePath, 'snapshots', `local-${process.pid}-${Date.now()}`);
       const localHostRoot = path.join(temporaryRoot, this.environment.kind);
       const includeAssociations = vscode.workspace.getConfiguration('profileGitSync').get<boolean>('includeProfileAssociations', false);
       const localManifest = await this.adapter.createSnapshot(localHostRoot, includeAssociations);
@@ -77,10 +78,10 @@ export class SyncEngine {
       await fs.mkdir(path.dirname(repositoryHostRoot), { recursive: true });
       await fs.cp(mergedRoot, repositoryHostRoot, { recursive: true });
 
-      const windows = await this.activeWindowCount();
-      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, allowStructural && windows <= 1);
-      if (restore.structuralChange) {
-        this.updateStatus({ phase: '等待其他窗口关闭', activeWindows: windows, message: restore.message });
+      const mergedManifest = await readManifest(repositoryHostRoot);
+      const mergedSecrets = await findPotentialSecrets(repositoryHostRoot, mergedManifest);
+      if (mergedSecrets.length) {
+        throw new Error(`检测到可能包含凭据的配置，已拒绝同步：${mergedSecrets.join('、')}`);
       }
 
       const changed = await this.git.stageHost(this.environment.kind);
@@ -98,6 +99,12 @@ export class SyncEngine {
       } else {
         await this.git.pushIfAhead(configuration);
       }
+
+      const windows = await this.activeWindowCount();
+      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, allowStructural && windows <= 1);
+      if (restore.structuralChange) {
+        this.updateStatus({ phase: '等待其他窗口关闭', activeWindows: windows, message: restore.message });
+      }
       this.updateStatus({
         phase: restore.structuralChange ? '等待其他窗口关闭' : '空闲',
         pendingChanges: 0,
@@ -108,6 +115,9 @@ export class SyncEngine {
       this.updateStatus({ phase: '失败', message: error instanceof Error ? error.message : String(error) });
     } finally {
       this.running = false;
+      if (temporaryRoot) {
+        await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 
@@ -214,6 +224,7 @@ function resolveSnapshotPath(root: string, relative: string): string {
 function validateCandidate(relative: string, content: string): void {
   if (!content.trim()) throw new Error(`AI 为 ${relative} 返回了空的合并结果。`);
   if (content.includes('<<<<<<<') || content.includes('>>>>>>>')) throw new Error(`AI 未完整解决 ${relative} 的冲突。`);
+  if (containsPotentialSecret(content)) throw new Error(`AI 为 ${relative} 生成的内容可能包含凭据。`);
   if (/\.(?:json|jsonc|code-snippets)$/i.test(relative)) {
     const errors: ParseError[] = [];
     parse(content, errors, { allowTrailingComma: true, disallowComments: false });

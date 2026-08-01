@@ -20,6 +20,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const environment = detectHost(context);
   await fs.mkdir(environment.runtimePath, { recursive: true });
   const configurationStore = new ConfigurationStore(context);
+  await configurationStore.initialize();
   const adapter = new ProfileAdapter(environment);
   const profiles = await adapter.listProfiles();
   const status: RuntimeStatus = {
@@ -33,7 +34,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   coordinator = new MultiWindowCoordinator(path.join(environment.runtimePath, 'coordination'));
   const git = new GitService(path.join(environment.runtimePath, 'repository'));
-  await context.secrets.delete('profileGitSync.aiApiKey');
   const ai = new AiService();
   let localFingerprint = await adapter.fingerprint();
   let sidebar: SidebarProvider;
@@ -72,6 +72,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
   };
   const startLeaderSchedules = () => {
+    if (!coordinator!.isLeader) return;
     if (localTimer) clearInterval(localTimer);
     if (remoteTimer) clearInterval(remoteTimer);
     const settings = vscode.workspace.getConfiguration('profileGitSync');
@@ -113,23 +114,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       const answer = await vscode.window.showWarningMessage('是否应用待处理的 Profile 结构变化？', { modal: true }, '应用');
-      if (answer === '应用') await synchronize(true);
+      if (answer === '应用') {
+        await synchronize(true);
+        if (status.phase !== '失败') void vscode.commands.executeCommand('workbench.action.reloadWindow');
+      }
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration('profileGitSync')) startLeaderSchedules();
+      if (event.affectsConfiguration('profileGitSync') && coordinator!.isLeader) startLeaderSchedules();
     })
   );
 
-  coordinator.on('becameLeader', () => {
+  const onBecameLeader = () => {
     void updateWindowState();
     startLeaderSchedules();
-  });
-  coordinator.on('becameFollower', () => {
+  };
+  const onBecameFollower = () => {
     if (localTimer) clearInterval(localTimer);
     if (remoteTimer) clearInterval(remoteTimer);
     void updateWindowState();
+  };
+  const onSyncRequested = () => void synchronize();
+
+  coordinator.on('becameLeader', onBecameLeader);
+  coordinator.on('becameFollower', onBecameFollower);
+  coordinator.on('syncRequested', onSyncRequested);
+  context.subscriptions.push({
+    dispose: () => {
+      coordinator?.off('becameLeader', onBecameLeader);
+      coordinator?.off('becameFollower', onBecameFollower);
+      coordinator?.off('syncRequested', onSyncRequested);
+    }
   });
-  coordinator.on('syncRequested', () => void synchronize());
   await coordinator.start();
   await updateWindowState();
   if (coordinator.isLeader) startLeaderSchedules();

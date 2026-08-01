@@ -9,6 +9,8 @@ import { chooseFallbackSide, fallbackCommitMessage } from '../src/sync-fallback'
 import { GitService } from '../src/git-service';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
+import { containsPotentialSecret } from '../src/secret-scanner';
+import { hasEmbeddedCredentials, resolveRepositoryUrl } from '../src/configuration';
 import { SyncConfiguration } from '../src/types';
 
 test('快照路径拒绝目录穿越', () => {
@@ -151,4 +153,32 @@ test('AI 不可用时使用稳定的提交和冲突兜底', () => {
   assert.equal(chooseFallbackSide('ours', 'theirs'), 'ours');
   assert.equal(chooseFallbackSide(undefined, 'theirs'), 'theirs');
   assert.equal(chooseFallbackSide(undefined, undefined), undefined);
+});
+
+test('凭据扫描覆盖常见键名与 token 值', () => {
+  assert.equal(containsPotentialSecret('{"apiKey":"x"}'), true);
+  assert.equal(containsPotentialSecret('{"token":"x"}'), true);
+  assert.equal(containsPotentialSecret('{"label":"ghp_1234567890123456789012345678901234"}'), true);
+  assert.equal(containsPotentialSecret('{"editor.fontSize":14}'), false);
+});
+
+test('仓库地址优先从 secret 读取，并迁移 globalState 中的旧值', () => {
+  assert.deepEqual(resolveRepositoryUrl('git@github.com:user/settings.git', {}), {
+    repositoryUrl: 'git@github.com:user/settings.git',
+    persisted: { branch: 'main', gitUserName: '', gitUserEmail: '' },
+    shouldPersistSecret: false
+  });
+  assert.deepEqual(resolveRepositoryUrl(undefined, {
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'dev'
+  }), {
+    repositoryUrl: 'git@github.com:user/settings.git',
+    persisted: { branch: 'dev', gitUserName: '', gitUserEmail: '' },
+    shouldPersistSecret: true
+  });
+});
+
+test('检测 URL 中嵌入的明文凭据', () => {
+  assert.equal(hasEmbeddedCredentials('https://user:ghp_token@github.com/user/repo.git'), true);
+  assert.equal(hasEmbeddedCredentials('git@github.com:user/repo.git'), false);
 });
