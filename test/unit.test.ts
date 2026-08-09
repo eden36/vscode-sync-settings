@@ -3,17 +3,27 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
+import type * as vscode from 'vscode';
 import { MultiWindowCoordinator } from '../src/coordinator';
+import { ConfigurationStore } from '../src/configuration';
 import { parseUtilityModelSetting } from '../src/ai-model';
 import { chooseFallbackSide, fallbackCommitMessage } from '../src/sync-fallback';
-import { GitService } from '../src/git-service';
+import { ConfigurationRepositoryGitService } from '../src/git-service';
+import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
 import { containsPotentialSecret } from '../src/secret-scanner';
-import { hasEmbeddedCredentials, resolveRepositoryUrl } from '../src/configuration';
+import {
+  compareConfigurationRecords,
+  createConfigurationRecord,
+  hasEmbeddedCredentials,
+  parseConfigurationRecord,
+  resolveRepositoryUrl,
+} from '../src/configuration-record';
 import { parseExtensionIds } from '../src/extension-manifest';
 import { displaySyncPhase, formatRelativeSyncTime } from '../src/sidebar-status';
-import { SyncConfiguration } from '../src/types';
+import { DEFAULT_CONFIGURATION, PluginConfiguration, SyncConfiguration } from '../src/types';
+import { resetApplicationSettings } from './vscode-stub';
 
 test('快照路径拒绝目录穿越', () => {
   assert.throws(() => testing.normalizeRelative('../settings.json'), /非法相对路径/);
@@ -251,6 +261,17 @@ test('扩展在启动后激活并固定运行于 UI extension host', async () =>
   assert.deepEqual(manifest.extensionKind, ['ui']);
 });
 
+test('默认与命名 Profile 解析到同一扩展运行目录', () => {
+  const root = path.join(tmpdir(), 'profile-git-sync-storage');
+  const extensionId = 'saltcoreyan.my-setting-sync';
+  const expected = {
+    userDataPath: path.join(root, 'User'),
+    runtimePath: path.join(root, 'User', 'globalStorage', extensionId),
+  };
+  assert.deepEqual(resolveHostStoragePaths(path.join(root, 'User', 'globalStorage', extensionId)), expected);
+  assert.deepEqual(resolveHostStoragePaths(path.join(root, 'User', 'profiles', 'abc123', 'globalStorage', extensionId)), expected);
+});
+
 test('按 location 枚举命名 Profile，并恢复文件修改和删除', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-'));
   const userDataPath = path.join(root, 'User');
@@ -290,7 +311,7 @@ test('Git 服务通过普通快进推送同步宿主目录', async () => {
   };
   try {
     assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
-    const first = new GitService(path.join(root, 'first'));
+    const first = new ConfigurationRepositoryGitService(path.join(root, 'first'));
     await first.prepare(configuration);
     const hostRoot = path.join(first.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
     await mkdir(hostRoot, { recursive: true });
@@ -306,16 +327,57 @@ test('Git 服务通过普通快进推送同步宿主目录', async () => {
     );
     assert.equal(await readFile(path.join(hostRoot, 'manifest.json'), 'utf8'), '{"schemaVersion":1}');
 
-    const second = new GitService(path.join(root, 'second'));
+    const second = new ConfigurationRepositoryGitService(path.join(root, 'second'));
     await second.prepare(configuration);
     await second.pull(configuration);
     assert.equal(await readFile(path.join(second.repositoryPath, '.profile-git-sync', 'hosts', 'vscode', 'manifest.json'), 'utf8'), '{"schemaVersion":1}');
 
-    const inherited = new GitService(path.join(root, 'inherited'));
+    const inherited = new ConfigurationRepositoryGitService(path.join(root, 'inherited'));
     const inheritedConfiguration = { ...configuration, gitUserName: '', gitUserEmail: '' };
     await inherited.prepare(inheritedConfiguration);
     assert.notEqual((await runProcess('git', ['-C', inherited.repositoryPath, 'config', '--local', '--get', 'user.name'])).exitCode, 0);
     assert.notEqual((await runProcess('git', ['-C', inherited.repositoryPath, 'config', '--local', '--get', 'user.email'])).exitCode, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('配置同步仓库 Git 操作不会修改当前项目仓库', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-isolation-'));
+  const project = path.join(root, 'project');
+  const remote = path.join(root, 'remote.git');
+  const runtime = path.join(root, 'runtime');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    await mkdir(project, { recursive: true });
+    assert.equal((await runProcess('git', ['init', project])).exitCode, 0);
+    assert.equal((await runProcess('git', ['-C', project, 'config', 'user.name', '项目用户'])).exitCode, 0);
+    assert.equal((await runProcess('git', ['-C', project, 'config', 'user.email', 'project@example.com'])).exitCode, 0);
+    await writeFile(path.join(project, 'project.txt'), '项目内容');
+    assert.equal((await runProcess('git', ['-C', project, 'add', 'project.txt'])).exitCode, 0);
+    assert.equal((await runProcess('git', ['-C', project, 'commit', '-m', '项目初始提交'])).exitCode, 0);
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const beforeHead = (await runProcess('git', ['-C', project, 'rev-parse', 'HEAD'])).stdout;
+    const beforeStatus = (await runProcess('git', ['-C', project, 'status', '--porcelain=v1'])).stdout;
+    const beforeRemotes = (await runProcess('git', ['-C', project, 'remote', '-v'])).stdout;
+
+    const repository = new ConfigurationRepositoryGitService(runtime);
+    await repository.prepare(configuration);
+    const hostRoot = path.join(repository.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
+    await mkdir(hostRoot, { recursive: true });
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await repository.stageHost('vscode');
+    await repository.commitAndPush(configuration, 'chore(sync): 测试配置仓库隔离');
+
+    assert.equal((await runProcess('git', ['-C', project, 'rev-parse', 'HEAD'])).stdout, beforeHead);
+    assert.equal((await runProcess('git', ['-C', project, 'status', '--porcelain=v1'])).stdout, beforeStatus);
+    assert.equal((await runProcess('git', ['-C', project, 'remote', '-v'])).stdout, beforeRemotes);
+    assert.equal(repository.repositoryPath, path.join(runtime, 'repository'));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -366,6 +428,75 @@ test('仓库地址优先从 secret 读取，并迁移 globalState 中的旧值',
   });
 });
 
+test('版本化配置按逻辑时间和稳定标识确定性收敛', () => {
+  const configuration: PluginConfiguration = {
+    ...DEFAULT_CONFIGURATION,
+    repositoryUrl: 'git@github.com:user/settings.git',
+  };
+  const older = createConfigurationRecord(configuration, 'device-a', 0, 100, 'revision-a');
+  const newer = createConfigurationRecord({ ...configuration, branch: 'dev' }, 'device-b', older.logicalTime, 90, 'revision-b');
+  assert.equal(newer.logicalTime, 101);
+  assert.equal(compareConfigurationRecords(older, newer), -1);
+  assert.equal(compareConfigurationRecords(newer, older), 1);
+
+  const concurrentA = { ...older, logicalTime: 200, deviceId: 'device-a', revision: 'same-time-a' };
+  const concurrentB = { ...newer, logicalTime: 200, deviceId: 'device-b', revision: 'same-time-b' };
+  const records = [concurrentB, older, concurrentA, newer];
+  const winner = records.reduce((left, right) => compareConfigurationRecords(left, right) >= 0 ? left : right);
+  assert.equal(winner.revision, 'same-time-b');
+});
+
+test('同步配置记录拒绝无效结构和含凭据仓库地址', () => {
+  const valid = createConfigurationRecord({
+    ...DEFAULT_CONFIGURATION,
+    repositoryUrl: 'git@github.com:user/settings.git',
+  }, 'device-a', 0, 100, 'revision-a');
+  assert.deepEqual(parseConfigurationRecord(valid), valid);
+  assert.equal(parseConfigurationRecord({
+    ...valid,
+    configuration: { ...valid.configuration, repositoryUrl: 'https://user:token@example.com/settings.git' },
+  }), undefined);
+  assert.equal(parseConfigurationRecord({ ...valid, logicalTime: -1 }), undefined);
+  assert.equal(parseConfigurationRecord({ ...valid, configuration: { ...valid.configuration, branch: '../main' } }), undefined);
+});
+
+test('独立 Profile 配置实例通过共享锁收敛并可恢复被替换版本', async () => {
+  resetApplicationSettings();
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-shared-configuration-'));
+  const firstState = new Map<string, unknown>();
+  const secondState = new Map<string, unknown>();
+  const first = new ConfigurationStore(fakeExtensionContext(firstState), root);
+  const second = new ConfigurationStore(fakeExtensionContext(secondState), root);
+  try {
+    await Promise.all([first.initialize(), second.initialize()]);
+    const firstConfiguration = {
+      ...DEFAULT_CONFIGURATION,
+      repositoryUrl: 'git@github.com:user/settings.git',
+      branch: 'first',
+    };
+    const secondConfiguration = {
+      ...firstConfiguration,
+      branch: 'second',
+      pollIntervalSeconds: 900,
+    };
+    await first.save(firstConfiguration);
+    await second.save(secondConfiguration);
+    await Promise.all([first.reload(), second.reload()]);
+    assert.deepEqual(first.get(), secondConfiguration);
+    assert.deepEqual(second.get(), secondConfiguration);
+    assert.equal(first.viewState().revision, second.viewState().revision);
+    assert.equal(second.viewState().recovery?.configuration.branch, 'first');
+
+    assert.equal(await first.restoreRecovery(), true);
+    await second.reload();
+    assert.deepEqual(first.get(), firstConfiguration);
+    assert.deepEqual(second.get(), firstConfiguration);
+    assert.equal(first.viewState().revision, second.viewState().revision);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('解析 extensions.json 中的扩展标识', () => {
   assert.deepEqual(parseExtensionIds('[]'), []);
   assert.deepEqual(parseExtensionIds('not-json'), []);
@@ -403,4 +534,26 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
     if (Date.now() >= deadline) throw new Error('等待条件超时。');
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function fakeExtensionContext(globalValues: Map<string, unknown>): vscode.ExtensionContext {
+  const secrets = new Map<string, string>();
+  return {
+    globalState: {
+      get: <T>(key: string, defaultValue?: T): T | undefined => (
+        globalValues.has(key) ? globalValues.get(key) as T : defaultValue
+      ),
+      update: async (key: string, value: unknown): Promise<void> => {
+        if (value === undefined) globalValues.delete(key);
+        else globalValues.set(key, value);
+      },
+      keys: () => [...globalValues.keys()],
+      setKeysForSync: () => undefined,
+    },
+    secrets: {
+      get: async (key: string): Promise<string | undefined> => secrets.get(key),
+      store: async (key: string, value: string): Promise<void> => { secrets.set(key, value); },
+      delete: async (key: string): Promise<void> => { secrets.delete(key); },
+    },
+  } as unknown as vscode.ExtensionContext;
 }

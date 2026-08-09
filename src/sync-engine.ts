@@ -6,7 +6,7 @@ import { parse, ParseError } from 'jsonc-parser';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
-import { GitService } from './git-service';
+import { ConfigurationRepositoryGitService } from './git-service';
 import { HostEnvironment } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
@@ -20,7 +20,7 @@ export class SyncEngine {
   public constructor(
     private readonly environment: HostEnvironment,
     private readonly adapter: ProfileAdapter,
-    private readonly git: GitService,
+    private readonly git: ConfigurationRepositoryGitService,
     private readonly ai: AiService,
     private readonly configurationStore: ConfigurationStore,
     private readonly updateStatus: (patch: Partial<RuntimeStatus>) => void,
@@ -44,8 +44,7 @@ export class SyncEngine {
       this.updateStatus({ phase: '正在扫描', message: undefined });
       temporaryRoot = path.join(this.environment.runtimePath, 'snapshots', `local-${process.pid}-${Date.now()}`);
       const localHostRoot = path.join(temporaryRoot, this.environment.kind);
-      const includeAssociations = vscode.workspace.getConfiguration('profileGitSync').get<boolean>('includeProfileAssociations', false);
-      const localManifest = await this.adapter.createSnapshot(localHostRoot, includeAssociations);
+      const localManifest = await this.adapter.createSnapshot(localHostRoot, configuration.includeProfileAssociations);
       const secretFiles = await findPotentialSecrets(localHostRoot, localManifest);
       if (secretFiles.length) {
         throw new Error(`检测到可能包含凭据的配置，已拒绝提交：${secretFiles.join('、')}`);

@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
 import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
-import { GitService } from './git-service';
+import { ConfigurationRepositoryGitService } from './git-service';
 import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { SidebarProvider } from './sidebar';
@@ -16,13 +16,14 @@ let localTimer: NodeJS.Timeout | undefined;
 let remoteTimer: NodeJS.Timeout | undefined;
 let startupTimer: NodeJS.Timeout | undefined;
 let retryTimer: NodeJS.Timeout | undefined;
+let configurationTimer: NodeJS.Timeout | undefined;
 const LAST_SYNC_KEY = 'profileGitSync.lastSyncAt';
 const OPERATION_RETRY_MS = 5_000;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const environment = detectHost(context);
   await fs.mkdir(environment.runtimePath, { recursive: true });
-  const configurationStore = new ConfigurationStore(context);
+  const configurationStore = new ConfigurationStore(context, environment.runtimePath);
   await configurationStore.initialize();
   const adapter = new ProfileAdapter(environment);
   const profiles = await adapter.listProfiles();
@@ -36,7 +37,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   coordinator = new MultiWindowCoordinator(path.join(environment.runtimePath, 'coordination'));
-  const git = new GitService(path.join(environment.runtimePath, 'repository'));
+  const configurationRepository = new ConfigurationRepositoryGitService(environment.runtimePath);
   const ai = new AiService();
   let localFingerprint: string | undefined;
   let sidebar: SidebarProvider;
@@ -67,7 +68,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const engine = new SyncEngine(
     environment,
     adapter,
-    git,
+    configurationRepository,
     ai,
     configurationStore,
     updateStatus,
@@ -165,9 +166,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     leaderSchedulesReady = false;
     if (localTimer) clearInterval(localTimer);
     if (remoteTimer) clearInterval(remoteTimer);
+    if (configurationTimer) clearInterval(configurationTimer);
     if (startupTimer) clearTimeout(startupTimer);
     localTimer = undefined;
     remoteTimer = undefined;
+    configurationTimer = undefined;
     startupTimer = undefined;
   };
 
@@ -178,10 +181,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     localFingerprint = await adapter.fingerprint();
     if (!coordinator!.isLeader || generation !== scheduleGeneration) return;
     leaderSchedulesReady = true;
-    const settings = vscode.workspace.getConfiguration('profileGitSync');
-    if (!settings.get<boolean>('autoSync', true)) return;
-    const debounceMs = settings.get<number>('debounceSeconds', 60) * 1_000;
-    const pollMs = settings.get<number>('pollIntervalSeconds', 600) * 1_000;
+    configurationTimer = setInterval(() => {
+      if (!coordinator!.isLeader) return;
+      void configurationStore.reload().then(async (changed) => {
+        if (changed) await coordinator!.notifyConfigurationChanged();
+      }).catch((error: unknown) => applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false));
+    }, 5_000);
+    const configuration = configurationStore.get();
+    if (!configuration.autoSync) return;
+    const debounceMs = configuration.debounceSeconds * 1_000;
+    const pollMs = configuration.pollIntervalSeconds * 1_000;
     localTimer = setInterval(() => {
       if (localCheckRunning || !coordinator!.isLeader) return;
       localCheckRunning = true;
@@ -215,6 +224,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const refreshConfiguration = async () => {
     await configurationStore.reload();
+    if (!syncRunning) applyStatus({ phase: configurationStore.get().repositoryUrl ? '空闲' : '未配置' }, false);
     await sidebar?.pushState();
     if (coordinator!.isLeader) await startLeaderSchedules();
   };
@@ -266,8 +276,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration('profileGitSync')) return;
-      void sidebar.pushState();
-      if (coordinator!.isLeader) void startLeaderSchedules();
+      void configurationStore.saveApplicationSettings().then(async (changed) => {
+        if (changed) await coordinator!.notifyConfigurationChanged();
+        else await sidebar.pushState();
+      }).catch((error: unknown) => applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false));
     }),
     vscode.workspace.onDidOpenTextDocument(() => void refreshDirtyDocuments()),
     vscode.workspace.onDidChangeTextDocument(() => void refreshDirtyDocuments()),
@@ -324,10 +336,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export async function deactivate(): Promise<void> {
   if (localTimer) clearInterval(localTimer);
   if (remoteTimer) clearInterval(remoteTimer);
+  if (configurationTimer) clearInterval(configurationTimer);
   if (startupTimer) clearTimeout(startupTimer);
   if (retryTimer) clearTimeout(retryTimer);
   localTimer = undefined;
   remoteTimer = undefined;
+  configurationTimer = undefined;
   startupTimer = undefined;
   retryTimer = undefined;
   await coordinator?.dispose();

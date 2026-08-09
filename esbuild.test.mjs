@@ -4,7 +4,7 @@ await esbuild.build({
   entryPoints: ['test/unit.test.ts'],
   bundle: true,
   outfile: 'dist/test.cjs',
-  external: ['vscode'],
+  alias: { vscode: './test/vscode-stub.ts' },
   format: 'cjs',
   platform: 'node',
   mainFields: ['module', 'main'],

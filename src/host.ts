@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { resolveHostStoragePaths } from './host-paths';
 import { HostKind } from './types';
 
 export interface HostEnvironment {
@@ -12,14 +13,11 @@ export interface HostEnvironment {
 export function detectHost(context: vscode.ExtensionContext): HostEnvironment {
   const applicationName = vscode.env.appName.toLowerCase();
   const kind: HostKind = applicationName.includes('cursor') ? 'cursor' : 'vscode';
-  const globalStoragePath = context.globalStorageUri.fsPath;
-
-  // globalStorageUri 通常为 User/globalStorage/<publisher>.<extension>。
-  const userDataPath = path.dirname(path.dirname(globalStoragePath));
+  const { userDataPath, runtimePath } = resolveHostStoragePaths(context.globalStorageUri.fsPath);
   return {
     kind,
     userDataPath,
-    runtimePath: globalStoragePath,
+    runtimePath,
     extensionDataUri: context.extensionMode === vscode.ExtensionMode.Production
       ? toUriPath(path.dirname(path.dirname(context.extensionPath)))
       : undefined

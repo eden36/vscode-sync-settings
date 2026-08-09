@@ -3,8 +3,12 @@ import * as path from 'node:path';
 import { runProcess } from './process';
 import { SyncConfiguration } from './types';
 
-export class GitService {
-  public constructor(public readonly repositoryPath: string) {}
+export class ConfigurationRepositoryGitService {
+  public readonly repositoryPath: string;
+
+  public constructor(runtimePath: string) {
+    this.repositoryPath = path.join(runtimePath, 'repository');
+  }
 
   public async prepare(configuration: SyncConfiguration): Promise<void> {
     await fs.mkdir(this.repositoryPath, { recursive: true });
@@ -102,7 +106,7 @@ export class GitService {
 
   private async git(args: string[], allowFailure = false, timeoutMs = 60_000) {
     const result = await runProcess('git', args, this.repositoryPath, timeoutMs);
-    if (!allowFailure && result.exitCode !== 0) throw new Error(`Git 操作失败：${result.stderr || result.stdout}`);
+    if (!allowFailure && result.exitCode !== 0) throw new Error(`配置同步仓库 Git 操作失败：${result.stderr || result.stdout}`);
     return result;
   }
 

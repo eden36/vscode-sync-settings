@@ -25,6 +25,13 @@ export interface SyncConfiguration {
   gitUserEmail: string;
 }
 
+export interface PluginConfiguration extends SyncConfiguration {
+  autoSync: boolean;
+  pollIntervalSeconds: number;
+  debounceSeconds: number;
+  includeProfileAssociations: boolean;
+}
+
 export interface RuntimeStatus {
   phase: SyncPhase;
   role: 'leader' | 'follower' | 'stopped';
@@ -53,9 +60,13 @@ export interface SnapshotManifest {
   files: Record<string, string>;
 }
 
-export const DEFAULT_CONFIGURATION: SyncConfiguration = {
+export const DEFAULT_CONFIGURATION: PluginConfiguration = {
   repositoryUrl: '',
   branch: 'main',
   gitUserName: '',
-  gitUserEmail: ''
+  gitUserEmail: '',
+  autoSync: true,
+  pollIntervalSeconds: 600,
+  debounceSeconds: 60,
+  includeProfileAssociations: false,
 };
