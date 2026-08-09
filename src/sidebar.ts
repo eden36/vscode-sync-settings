@@ -11,6 +11,7 @@ interface AutomationSettings {
 }
 
 type IncomingMessage =
+  | { type: 'ready' }
   | { type: 'save'; configuration: SyncConfiguration; automation: AutomationSettings }
   | { type: 'sync' }
   | { type: 'applyPending' };
@@ -36,7 +37,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         void vscode.window.showErrorMessage('侧边栏提交了无效参数。');
         return;
       }
-      if (message.type === 'save') {
+      if (message.type === 'ready') {
+        await this.pushState();
+      } else if (message.type === 'save') {
         if (hasEmbeddedCredentials(message.configuration.repositoryUrl)) {
           const proceed = await vscode.window.showWarningMessage(
             '仓库 URL 中包含明文凭据，建议使用 SSH 或系统凭据管理器。仍要保存吗？',
@@ -116,6 +119,7 @@ const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName
 document.getElementById('save').onclick=()=>{const configuration={};for(const id of ids)configuration[id]=document.getElementById(id).value;const automation={autoSync:document.getElementById('autoSync').checked,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};vscode.postMessage({type:'save',configuration,automation})};
 document.getElementById('sync').onclick=()=>vscode.postMessage({type:'sync'});document.getElementById('apply').onclick=()=>vscode.postMessage({type:'applyPending'});
 addEventListener('message',({data})=>{if(data.type!=='state')return;for(const id of ids)document.getElementById(id).value=data.configuration[id]??'';document.getElementById('autoSync').checked=data.automation.autoSync;document.getElementById('debounceSeconds').value=String(data.automation.debounceSeconds);document.getElementById('pollIntervalSeconds').value=String(data.automation.pollIntervalSeconds);const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;document.getElementById('detail').textContent='窗口 '+s.activeWindows+' · Profiles '+s.profiles.join('、')+(s.message?' · '+s.message:'');document.getElementById('syncPhase').textContent=s.displayPhase;const dot=document.getElementById('syncDot');dot.className='dot '+syncClass(s.displayPhase);lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
+vscode.postMessage({type:'ready'});
 setInterval(renderLastSyncAt,60_000);
 function renderLastSyncAt(){const last=document.getElementById('lastSyncAt');if(!lastSyncAt){last.textContent='尚未同步';last.removeAttribute('title');return}const date=new Date(lastSyncAt);if(Number.isNaN(date.getTime())){last.textContent='时间无效';last.removeAttribute('title');return}last.textContent=date.toLocaleString()+'（'+relativeTime(date.getTime())+'）';last.title=lastSyncAt}
 function relativeTime(timestamp){const elapsed=Math.max(0,Date.now()-timestamp);if(elapsed<60_000)return'刚刚';if(elapsed<3_600_000)return Math.floor(elapsed/60_000)+'分钟前';if(elapsed<86_400_000)return Math.floor(elapsed/3_600_000)+'小时前';return Math.floor(elapsed/86_400_000)+'天前'}
@@ -127,6 +131,7 @@ function syncClass(phase){if(phase==='失败')return'error';if(['正在扫描','
 function parseMessage(raw: unknown): IncomingMessage | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const value = raw as Record<string, unknown>;
+  if (value.type === 'ready') return { type: 'ready' };
   if (value.type === 'sync') return { type: 'sync' };
   if (value.type === 'applyPending') return { type: 'applyPending' };
   if (value.type !== 'save' || !value.configuration || typeof value.configuration !== 'object' || !value.automation || typeof value.automation !== 'object') return undefined;
