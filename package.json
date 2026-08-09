@@ -1,6 +1,6 @@
 {
-  "name": "profile-git-sync",
-  "displayName": "Profile Git Sync",
+  "name": "my-setting-sync",
+  "displayName": "My Setting Sync",
   "description": "在 VS Code 与 Cursor 中通过 Git 自动同步全部用户配置文件。",
   "version": "0.1.0",
   "publisher": "local",
@@ -13,25 +13,29 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onView:profileGitSync.sidebar",
     "onCommand:profileGitSync.syncNow",
     "onCommand:profileGitSync.openSettings",
     "onCommand:profileGitSync.applyPending"
+  ],
+  "extensionKind": [
+    "ui"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "profileGitSync.syncNow",
-        "title": "Profile Git Sync: 立即同步"
+        "title": "My Setting Sync: 立即同步"
       },
       {
         "command": "profileGitSync.openSettings",
-        "title": "Profile Git Sync: 打开设置"
+        "title": "My Setting Sync: 打开设置"
       },
       {
         "command": "profileGitSync.applyPending",
-        "title": "Profile Git Sync: 应用待处理的远程配置"
+        "title": "My Setting Sync: 应用待处理的远程配置"
       }
     ],
     "viewsContainers": {
@@ -53,7 +57,7 @@
       ]
     },
     "configuration": {
-      "title": "Profile Git Sync",
+      "title": "My Setting Sync",
       "properties": {
         "profileGitSync.autoSync": {
           "type": "boolean",

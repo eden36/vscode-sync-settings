@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "调试 Profile Git Sync",
+      "name": "调试 My Setting Sync",
       "type": "extensionHost",
       "request": "launch",
       "args": [

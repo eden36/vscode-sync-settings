@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 import { parse, ParseError } from 'jsonc-parser';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
+import { WindowSafetySnapshot } from './coordinator';
 import { GitService } from './git-service';
 import { HostEnvironment } from './host';
 import { ProfileAdapter } from './profile-adapter';
@@ -23,7 +24,7 @@ export class SyncEngine {
     private readonly ai: AiService,
     private readonly configurationStore: ConfigurationStore,
     private readonly updateStatus: (patch: Partial<RuntimeStatus>) => void,
-    private readonly activeWindowCount: () => Promise<number>
+    private readonly windowSafety: () => Promise<WindowSafetySnapshot>,
   ) {}
 
   public async synchronize(allowStructural = false): Promise<SyncOutcome | undefined> {
@@ -38,13 +39,7 @@ export class SyncEngine {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
         return { ok: false };
       }
-      const dirty = vscode.workspace.textDocuments.filter(
-        (document) => document.isDirty && document.uri.scheme === 'file' && isInside(this.environment.userDataPath, document.uri.fsPath)
-      );
-      if (dirty.length) {
-        this.updateStatus({ phase: '空闲', message: `有 ${dirty.length} 个未保存的配置文件，保存后再同步。` });
-        return { ok: false };
-      }
+      if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
 
       this.updateStatus({ phase: '正在扫描', message: undefined });
       temporaryRoot = path.join(this.environment.runtimePath, 'snapshots', `local-${process.pid}-${Date.now()}`);
@@ -96,13 +91,16 @@ export class SyncEngine {
           usedAiFallback = true;
         }
         this.updateStatus({ phase: '正在提交', message });
+        if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
         await this.git.commitAndPush(configuration, message);
       } else {
+        if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
         await this.git.pushIfAhead(configuration);
       }
 
-      const windows = await this.activeWindowCount();
-      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, allowStructural && windows <= 1);
+      const safety = await this.ensureWindowSafety();
+      if (!safety) return { ok: false, retry: true };
+      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, allowStructural && safety.activeWindows <= 1);
       let extensionsPending: string[] | undefined;
       const extensionFiles = restore.changedFiles.filter((file) => path.basename(file) === 'extensions.json');
       if (extensionFiles.length) {
@@ -116,7 +114,7 @@ export class SyncEngine {
         }
       }
       if (restore.structuralChange) {
-        this.updateStatus({ phase: '等待其他窗口关闭', activeWindows: windows, message: restore.message });
+        this.updateStatus({ phase: '等待其他窗口关闭', activeWindows: safety.activeWindows, message: restore.message });
       }
       this.updateStatus({
         phase: restore.structuralChange ? '等待其他窗口关闭' : '空闲',
@@ -140,6 +138,27 @@ export class SyncEngine {
         await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
       }
     }
+  }
+
+  private async ensureWindowSafety(): Promise<WindowSafetySnapshot | undefined> {
+    const safety = await this.windowSafety();
+    if (safety.dirtyWindows > 0) {
+      this.updateStatus({
+        phase: '空闲',
+        activeWindows: safety.activeWindows,
+        message: `有 ${safety.dirtyWindows} 个窗口存在未保存的配置文件，保存后再同步。`,
+      });
+      return undefined;
+    }
+    if (safety.unreadableWindows > 0) {
+      this.updateStatus({
+        phase: '空闲',
+        activeWindows: safety.activeWindows,
+        message: `有 ${safety.unreadableWindows} 个窗口状态无法确认，已暂停同步。`,
+      });
+      return undefined;
+    }
+    return safety;
   }
 
   private async mergeSnapshots(baseRoot: string | undefined, oursRoot: string, theirsRoot: string, outputRoot: string): Promise<boolean> {
@@ -255,11 +274,6 @@ function validateCandidate(relative: string, content: string): void {
 
 function sameProfiles(left: SnapshotManifest, right: SnapshotManifest): boolean {
   return JSON.stringify(left.profiles) === JSON.stringify(right.profiles);
-}
-
-function isInside(root: string, candidate: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 function sha256(content: Buffer): string {

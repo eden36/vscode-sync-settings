@@ -22,7 +22,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     private readonly configurationStore: ConfigurationStore,
     private readonly status: () => RuntimeStatus,
     private readonly onSync: () => Promise<void>,
-    private readonly onApplyPending: () => Promise<void>
+    private readonly onApplyPending: () => Promise<void>,
+    private readonly onConfigurationSaved: () => Promise<void>,
   ) {}
 
   public resolveWebviewView(view: vscode.WebviewView): void {
@@ -51,6 +52,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           settings.update('debounceSeconds', message.automation.debounceSeconds, vscode.ConfigurationTarget.Global),
           settings.update('pollIntervalSeconds', message.automation.pollIntervalSeconds, vscode.ConfigurationTarget.Global)
         ]);
+        await this.onConfigurationSaved();
         void vscode.window.showInformationMessage('同步配置已保存。');
         await this.pushState();
       } else if (message.type === 'sync') {

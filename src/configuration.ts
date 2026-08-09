@@ -55,6 +55,10 @@ export class ConfigurationStore {
     }
   }
 
+  public async reload(): Promise<void> {
+    this.repositoryUrl = await this.context.secrets.get(REPOSITORY_URL_SECRET) ?? DEFAULT_CONFIGURATION.repositoryUrl;
+  }
+
   public get(): SyncConfiguration {
     const stored = this.context.globalState.get<StoredConfiguration>(CONFIG_KEY, {});
     return {

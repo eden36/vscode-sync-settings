@@ -47,14 +47,15 @@ test('新 leader 会立即接管死亡进程租约并清理孤儿操作锁', asy
     pid: -1,
     updatedAt: Date.now()
   }));
-  const coordinator = new MultiWindowCoordinator(root);
+  const coordinator = new MultiWindowCoordinator(root, { leaseTtlMs: 5, staleConfirmationMs: 5 });
   try {
     await coordinator.start();
     assert.equal(coordinator.isLeader, true);
     await writeFile(path.join(root, 'sync.operation.json'), JSON.stringify({
       instanceId: 'old-leader',
       pid: process.pid,
-      startedAt: Date.now()
+      startedAt: Date.now() - 100,
+      updatedAt: Date.now() - 100
     }));
     let executed = false;
     assert.equal(await coordinator.runExclusive(async () => { executed = true; }), true);
@@ -63,6 +64,191 @@ test('新 leader 会立即接管死亡进程租约并清理孤儿操作锁', asy
     await coordinator.dispose();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('leader 切换事件触发时角色已经更新', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-failover-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 80, staleConfirmationMs: 20 };
+  const first = new MultiWindowCoordinator(root, options);
+  const second = new MultiWindowCoordinator(root, options);
+  try {
+    await Promise.all([first.start(), second.start()]);
+    const leader = first.isLeader ? first : second;
+    const follower = first.isLeader ? second : first;
+    let leaderStateDuringEvent = false;
+    follower.on('becameLeader', () => { leaderStateDuringEvent = follower.isLeader; });
+    await leader.dispose();
+    await waitFor(() => follower.isLeader);
+    assert.equal(leaderStateDuringEvent, true);
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('仍在心跳期的操作锁不会因 leader 变化被抢占', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-live-operation-'));
+  const coordinator = new MultiWindowCoordinator(root, { leaseTtlMs: 50, staleConfirmationMs: 10 });
+  try {
+    await coordinator.start();
+    await writeFile(path.join(root, 'sync.operation.json'), JSON.stringify({
+      schemaVersion: 2,
+      token: 'live-operation',
+      instanceId: 'previous-leader',
+      pid: process.pid,
+      startedAt: Date.now(),
+      updatedAt: Date.now()
+    }));
+    let executed = false;
+    assert.equal(await coordinator.runExclusive(async () => { executed = true; }), false);
+    assert.equal(executed, false);
+  } finally {
+    await coordinator.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('操作锁写入中的空文件按占用处理', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-partial-operation-'));
+  const coordinator = new MultiWindowCoordinator(root, { leaseTtlMs: 50, staleConfirmationMs: 10 });
+  try {
+    await coordinator.start();
+    await writeFile(path.join(root, 'sync.operation.json'), '');
+    assert.equal(await coordinator.runExclusive(async () => assert.fail('不应进入并发操作')), false);
+  } finally {
+    await coordinator.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('多个调用同时竞争时只执行一个操作', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-exclusive-'));
+  const coordinator = new MultiWindowCoordinator(root);
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await coordinator.start();
+    let executions = 0;
+    const first = coordinator.runExclusive(async () => {
+      executions += 1;
+      await blocker;
+    });
+    await waitFor(async () => readFile(path.join(root, 'sync.operation.json'), 'utf8').then(() => true, () => false));
+    const second = await coordinator.runExclusive(async () => { executions += 1; });
+    release();
+    assert.equal(await first, true);
+    assert.equal(second, false);
+    assert.equal(executions, 1);
+  } finally {
+    release();
+    await coordinator.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('窗口 presence 汇总未保存配置和无法读取状态', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-presence-'));
+  const first = new MultiWindowCoordinator(root);
+  const second = new MultiWindowCoordinator(root);
+  try {
+    await first.setDirtyDocuments(0);
+    await second.setDirtyDocuments(2);
+    await Promise.all([first.start(), second.start()]);
+    const safety = await first.windowSafety();
+    assert.deepEqual(safety, { activeWindows: 2, dirtyWindows: 1, unreadableWindows: 0 });
+    await writeFile(path.join(root, 'window-unreadable.json'), '{');
+    assert.deepEqual(await first.windowSafety(), { activeWindows: 3, dirtyWindows: 1, unreadableWindows: 1 });
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('leader 发布的同步状态会传播给 follower', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-status-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 80 };
+  const first = new MultiWindowCoordinator(root, options);
+  const second = new MultiWindowCoordinator(root, options);
+  try {
+    await Promise.all([first.start(), second.start()]);
+    const leader = first.isLeader ? first : second;
+    const follower = first.isLeader ? second : first;
+    let received: { lastSyncAt?: string } | undefined;
+    follower.on('statusChanged', (value) => { received = value as { lastSyncAt?: string }; });
+    await leader.publishStatus({
+      phase: '空闲',
+      role: 'leader',
+      activeWindows: 2,
+      profiles: ['默认'],
+      pendingChanges: 0,
+      lastSyncAt: '2026-08-09T04:44:35.000Z'
+    });
+    await waitFor(() => received?.lastSyncAt === '2026-08-09T04:44:35.000Z');
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('任一窗口保存配置后会通知其他窗口重新加载', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-configuration-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 80 };
+  const first = new MultiWindowCoordinator(root, options);
+  const second = new MultiWindowCoordinator(root, options);
+  try {
+    await Promise.all([first.start(), second.start()]);
+    let notifications = 0;
+    first.on('configurationChanged', () => { notifications += 1; });
+    await second.notifyConfigurationChanged();
+    await waitFor(() => notifications > 0);
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('leader 切换后仍会恢复未完成的同步请求', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-request-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 80 };
+  const first = new MultiWindowCoordinator(root, options);
+  const second = new MultiWindowCoordinator(root, options);
+  try {
+    await Promise.all([first.start(), second.start()]);
+    const leader = first.isLeader ? first : second;
+    const follower = first.isLeader ? second : first;
+    let leaderRequests = 0;
+    let followerRequests = 0;
+    let structuralRequestPreserved = false;
+    leader.on('syncRequested', (allowStructural) => {
+      leaderRequests += 1;
+      structuralRequestPreserved ||= allowStructural === true;
+    });
+    follower.on('syncRequested', (allowStructural) => {
+      followerRequests += 1;
+      structuralRequestPreserved ||= allowStructural === true;
+    });
+    await follower.requestSync(true);
+    await waitFor(() => leaderRequests > 0);
+    await leader.dispose();
+    await waitFor(() => follower.isLeader && followerRequests > 0);
+    assert.equal(structuralRequestPreserved, true);
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('扩展在启动后激活并固定运行于 UI extension host', async () => {
+  const manifest = JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8')) as {
+    name?: string;
+    displayName?: string;
+    activationEvents?: string[];
+    extensionKind?: string[];
+  };
+  assert.equal(manifest.name, 'my-setting-sync');
+  assert.equal(manifest.displayName, 'My Setting Sync');
+  assert.equal(manifest.activationEvents?.includes('onStartupFinished'), true);
+  assert.deepEqual(manifest.extensionKind, ['ui']);
 });
 
 test('按 location 枚举命名 Profile，并恢复文件修改和删除', async () => {
@@ -210,3 +396,11 @@ test('格式化同步相对时间', () => {
   assert.equal(formatRelativeSyncTime('2026-08-09T12:01:00.000Z', now), '刚刚');
   assert.equal(formatRelativeSyncTime('invalid', now), '时间无效');
 });
+
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!await predicate()) {
+    if (Date.now() >= deadline) throw new Error('等待条件超时。');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
