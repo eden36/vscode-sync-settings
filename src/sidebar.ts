@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
 import { ConfigurationStore, hasEmbeddedCredentials } from './configuration';
+import { displaySyncPhase } from './sidebar-status';
 import { RuntimeStatus, SyncConfiguration } from './types';
 
 interface AutomationSettings {
@@ -62,11 +63,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   public async pushState(): Promise<void> {
+    const status = this.status();
     await this.view?.webview.postMessage({
       type: 'state',
       configuration: this.configurationStore.get(),
       automation: this.getAutomationSettings(),
-      status: this.status()
+      status: { ...status, displayPhase: displaySyncPhase(status.phase, status.lastSyncAt) }
     });
   }
 
@@ -108,11 +110,14 @@ button.secondary{background:var(--vscode-button-secondaryBackground);color:var(-
 <button id="save">保存</button><button id="sync" class="secondary">立即同步</button><button id="apply" class="secondary">安全应用</button>
 <p class="muted">Git 身份留空时使用本机配置；认证始终使用本机 SSH 或凭据管理器。AI 无法使用或结果无效时，会采用固定提交信息和本机优先的冲突兜底，保证同步继续。多窗口中只有 leader 执行 Git 与 AI 操作。</p>
 <script nonce="${nonce}">
-const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];
+const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];let lastSyncAt;
 document.getElementById('save').onclick=()=>{const configuration={};for(const id of ids)configuration[id]=document.getElementById(id).value;const automation={autoSync:document.getElementById('autoSync').checked,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};vscode.postMessage({type:'save',configuration,automation})};
 document.getElementById('sync').onclick=()=>vscode.postMessage({type:'sync'});document.getElementById('apply').onclick=()=>vscode.postMessage({type:'applyPending'});
-addEventListener('message',({data})=>{if(data.type!=='state')return;for(const id of ids)document.getElementById(id).value=data.configuration[id]??'';document.getElementById('autoSync').checked=data.automation.autoSync;document.getElementById('debounceSeconds').value=String(data.automation.debounceSeconds);document.getElementById('pollIntervalSeconds').value=String(data.automation.pollIntervalSeconds);const s=data.status;document.getElementById('phase').textContent=s.phase+' · '+s.role;document.getElementById('detail').textContent='窗口 '+s.activeWindows+' · Profiles '+s.profiles.join('、')+(s.message?' · '+s.message:'');document.getElementById('syncPhase').textContent=s.phase;const dot=document.getElementById('syncDot');dot.className='dot '+syncClass(s.phase);const last=document.getElementById('lastSyncAt');if(s.lastSyncAt){const date=new Date(s.lastSyncAt);last.textContent=Number.isNaN(date.getTime())?'时间无效':date.toLocaleString();last.title=s.lastSyncAt}else{last.textContent='尚未同步';last.removeAttribute('title')}});
-function syncClass(phase){if(phase==='失败')return'error';if(['正在扫描','正在拉取','等待 AI','正在提交','正在推送','正在同步扩展'].includes(phase))return'running';if(['等待其他窗口关闭','存在冲突'].includes(phase))return'warning';if(phase==='空闲')return'success';return''}
+addEventListener('message',({data})=>{if(data.type!=='state')return;for(const id of ids)document.getElementById(id).value=data.configuration[id]??'';document.getElementById('autoSync').checked=data.automation.autoSync;document.getElementById('debounceSeconds').value=String(data.automation.debounceSeconds);document.getElementById('pollIntervalSeconds').value=String(data.automation.pollIntervalSeconds);const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;document.getElementById('detail').textContent='窗口 '+s.activeWindows+' · Profiles '+s.profiles.join('、')+(s.message?' · '+s.message:'');document.getElementById('syncPhase').textContent=s.displayPhase;const dot=document.getElementById('syncDot');dot.className='dot '+syncClass(s.displayPhase);lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
+setInterval(renderLastSyncAt,60_000);
+function renderLastSyncAt(){const last=document.getElementById('lastSyncAt');if(!lastSyncAt){last.textContent='尚未同步';last.removeAttribute('title');return}const date=new Date(lastSyncAt);if(Number.isNaN(date.getTime())){last.textContent='时间无效';last.removeAttribute('title');return}last.textContent=date.toLocaleString()+'（'+relativeTime(date.getTime())+'）';last.title=lastSyncAt}
+function relativeTime(timestamp){const elapsed=Math.max(0,Date.now()-timestamp);if(elapsed<60_000)return'刚刚';if(elapsed<3_600_000)return Math.floor(elapsed/60_000)+'分钟前';if(elapsed<86_400_000)return Math.floor(elapsed/3_600_000)+'小时前';return Math.floor(elapsed/86_400_000)+'天前'}
+function syncClass(phase){if(phase==='失败')return'error';if(['正在扫描','正在拉取','等待 AI','正在提交','正在推送','正在同步扩展'].includes(phase))return'running';if(['等待其他窗口关闭','存在冲突'].includes(phase))return'warning';if(phase==='已同步')return'success';return''}
 </script></body></html>`;
   }
 }

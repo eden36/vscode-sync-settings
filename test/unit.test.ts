@@ -12,6 +12,7 @@ import { runProcess } from '../src/process';
 import { containsPotentialSecret } from '../src/secret-scanner';
 import { hasEmbeddedCredentials, resolveRepositoryUrl } from '../src/configuration';
 import { parseExtensionIds } from '../src/extension-manifest';
+import { displaySyncPhase, formatRelativeSyncTime } from '../src/sidebar-status';
 import { SyncConfiguration } from '../src/types';
 
 test('快照路径拒绝目录穿越', () => {
@@ -192,4 +193,20 @@ test('解析 extensions.json 中的扩展标识', () => {
 test('检测 URL 中嵌入的明文凭据', () => {
   assert.equal(hasEmbeddedCredentials('https://user:ghp_token@github.com/user/repo.git'), true);
   assert.equal(hasEmbeddedCredentials('git@github.com:user/repo.git'), false);
+});
+
+test('侧边栏仅在已有成功同步记录时显示已同步', () => {
+  assert.equal(displaySyncPhase('空闲', undefined), '未同步');
+  assert.equal(displaySyncPhase('空闲', '2026-08-09T04:44:35.000Z'), '已同步');
+  assert.equal(displaySyncPhase('正在拉取', undefined), '正在拉取');
+});
+
+test('格式化同步相对时间', () => {
+  const now = Date.UTC(2026, 7, 9, 12, 0, 0);
+  assert.equal(formatRelativeSyncTime('2026-08-09T12:00:00.000Z', now), '刚刚');
+  assert.equal(formatRelativeSyncTime('2026-08-09T11:37:00.000Z', now), '23分钟前');
+  assert.equal(formatRelativeSyncTime('2026-08-09T09:00:00.000Z', now), '3小时前');
+  assert.equal(formatRelativeSyncTime('2026-08-07T12:00:00.000Z', now), '2天前');
+  assert.equal(formatRelativeSyncTime('2026-08-09T12:01:00.000Z', now), '刚刚');
+  assert.equal(formatRelativeSyncTime('invalid', now), '时间无效');
 });
