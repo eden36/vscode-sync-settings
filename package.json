@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "local",
   "license": "MIT",
+  "icon": "media/profile-git-sync.png",
   "engines": {
     "vscode": "^1.90.0"
   },
