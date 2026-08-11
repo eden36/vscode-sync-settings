@@ -1,7 +1,15 @@
 import * as vscode from 'vscode';
 import { parseUtilityModelSetting } from './ai-model';
+import { PluginConfiguration } from './types';
 
 const AI_REQUEST_TIMEOUT_MS = 60_000;
+
+/** 模型经常无视提示词，把 JSON 包在 Markdown 代码块里，解析前先剥掉围栏。 */
+export function stripJsonFence(text: string): string {
+  const trimmed = text.trim();
+  const fenced = /^```[^\n]*\n([\s\S]*?)\n?```$/.exec(trimmed);
+  return (fenced?.[1] ?? trimmed).trim();
+}
 
 export class AiService {
   public async createCommitMessage(summary: string): Promise<string> {
@@ -26,6 +34,17 @@ export class AiService {
       `远程版本：\n${theirs}`
     ].join('\n\n');
     return this.complete(prompt);
+  }
+
+  public async resolveConfigurationConflict(local: PluginConfiguration, cloud: PluginConfiguration): Promise<string> {
+    const prompt = [
+      '请合并两份插件同步设置，保留双方合理设置。只输出完整 JSON，不要 Markdown 或解释。',
+      'repositoryUrl 和 branch 必须作为一组，完整选用本机版本或云端版本，不能交叉组合。',
+      '不得在仓库地址中加入用户名、密码、令牌或其他凭据。',
+      `本机设置：\n${JSON.stringify(local, null, 2)}`,
+      `云端设置：\n${JSON.stringify(cloud, null, 2)}`,
+    ].join('\n\n');
+    return stripJsonFence(await this.complete(prompt));
   }
 
   private async complete(prompt: string): Promise<string> {

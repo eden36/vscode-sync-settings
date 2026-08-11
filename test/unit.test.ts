@@ -7,17 +7,19 @@ import type * as vscode from 'vscode';
 import { MultiWindowCoordinator } from '../src/coordinator';
 import { ConfigurationStore } from '../src/configuration';
 import { parseUtilityModelSetting } from '../src/ai-model';
-import { chooseFallbackSide, fallbackCommitMessage } from '../src/sync-fallback';
+import { fallbackCommitMessage } from '../src/sync-fallback';
 import { ConfigurationRepositoryGitService } from '../src/git-service';
 import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
 import { containsPotentialSecret } from '../src/secret-scanner';
+import { detectSnapshotConflicts } from '../src/snapshot-conflict';
 import {
   compareConfigurationRecords,
   createConfigurationRecord,
   hasEmbeddedCredentials,
   parseConfigurationRecord,
+  relateConfigurationRecords,
   resolveRepositoryUrl,
 } from '../src/configuration-record';
 import { parseExtensionIds } from '../src/extension-manifest';
@@ -248,6 +250,26 @@ test('leader 切换后仍会恢复未完成的同步请求', async () => {
   }
 });
 
+test('follower 的冲突选择会转交给 leader', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-conflict-request-'));
+  const first = new MultiWindowCoordinator(root, { heartbeatMs: 10, leaseTtlMs: 100 });
+  const second = new MultiWindowCoordinator(root, { heartbeatMs: 10, leaseTtlMs: 100 });
+  try {
+    await Promise.all([first.start(), second.start()]);
+    const leader = first.isLeader ? first : second;
+    const follower = first.isLeader ? second : first;
+    let received: { id: string; strategy: string; applyAi: boolean } | undefined;
+    leader.on('conflictResolutionRequested', (request) => { received = request; });
+    await follower.requestConflictResolution('conflict-1', 'cloud', false);
+    await waitFor(() => received !== undefined);
+    assert.deepEqual(received, { id: 'conflict-1', strategy: 'cloud', applyAi: false });
+    await leader.completeSyncRequests();
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('扩展在启动后激活并固定运行于 UI extension host', async () => {
   const manifest = JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8')) as {
     name?: string;
@@ -397,12 +419,38 @@ test('解析 chat.utilitySmallModel 的 vendor/id 设置', () => {
   assert.equal(parseUtilityModelSetting('invalid'), undefined);
 });
 
-test('AI 不可用时使用稳定的提交和冲突兜底', () => {
+test('AI 不可用时仍可生成稳定的提交信息', () => {
   assert.equal(fallbackCommitMessage('vscode'), 'chore(sync): 同步 VS Code 配置');
   assert.equal(fallbackCommitMessage('cursor'), 'chore(sync): 同步 Cursor 配置');
-  assert.equal(chooseFallbackSide('ours', 'theirs'), 'ours');
-  assert.equal(chooseFallbackSide(undefined, 'theirs'), 'theirs');
-  assert.equal(chooseFallbackSide(undefined, undefined), undefined);
+});
+
+test('快照冲突检测覆盖文件修改、删除和 Profile 结构', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-conflict-detection-'));
+  const base = path.join(root, 'base');
+  const local = path.join(root, 'local');
+  const cloud = path.join(root, 'cloud');
+  try {
+    await Promise.all([mkdir(base), mkdir(local), mkdir(cloud)]);
+    const manifest = (profiles: string[], files: Record<string, string>) => ({
+      schemaVersion: 1,
+      host: 'vscode',
+      createdAt: '',
+      profiles: profiles.map((id) => ({ id, name: id, isDefault: id === 'default' })),
+      files,
+    });
+    await Promise.all([
+      writeFile(path.join(base, 'manifest.json'), JSON.stringify(manifest(['default'], { 'profiles/default/settings.json': 'base', 'profiles/default/keybindings.json': 'base' }))),
+      writeFile(path.join(local, 'manifest.json'), JSON.stringify(manifest(['default', 'local'], { 'profiles/default/settings.json': 'local' }))),
+      writeFile(path.join(cloud, 'manifest.json'), JSON.stringify(manifest(['default', 'cloud'], { 'profiles/default/settings.json': 'cloud', 'profiles/default/keybindings.json': 'cloud' }))),
+    ]);
+    assert.deepEqual(await detectSnapshotConflicts(base, local, cloud, 'vscode'), [
+      'profiles/default/settings.json',
+      'profiles/default/keybindings.json',
+      'Profile 结构和关联关系',
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('凭据扫描覆盖常见键名与 token 值', () => {
@@ -428,19 +476,21 @@ test('仓库地址优先从 secret 读取，并迁移 globalState 中的旧值',
   });
 });
 
-test('版本化配置按逻辑时间和稳定标识确定性收敛', () => {
+test('版本化配置区分因果更新与并发修改', () => {
   const configuration: PluginConfiguration = {
     ...DEFAULT_CONFIGURATION,
     repositoryUrl: 'git@github.com:user/settings.git',
   };
   const older = createConfigurationRecord(configuration, 'device-a', 0, 100, 'revision-a');
-  const newer = createConfigurationRecord({ ...configuration, branch: 'dev' }, 'device-b', older.logicalTime, 90, 'revision-b');
+  const newer = createConfigurationRecord({ ...configuration, branch: 'dev' }, 'device-b', older.logicalTime, 90, 'revision-b', older.clock);
   assert.equal(newer.logicalTime, 101);
+  assert.equal(relateConfigurationRecords(older, newer), 'right-newer');
   assert.equal(compareConfigurationRecords(older, newer), -1);
   assert.equal(compareConfigurationRecords(newer, older), 1);
 
-  const concurrentA = { ...older, logicalTime: 200, deviceId: 'device-a', revision: 'same-time-a' };
-  const concurrentB = { ...newer, logicalTime: 200, deviceId: 'device-b', revision: 'same-time-b' };
+  const concurrentA = createConfigurationRecord({ ...configuration, branch: 'a' }, 'device-a', 0, 200, 'same-time-a');
+  const concurrentB = createConfigurationRecord({ ...configuration, branch: 'b' }, 'device-b', 0, 200, 'same-time-b');
+  assert.equal(relateConfigurationRecords(concurrentA, concurrentB), 'concurrent');
   const records = [concurrentB, older, concurrentA, newer];
   const winner = records.reduce((left, right) => compareConfigurationRecords(left, right) >= 0 ? left : right);
   assert.equal(winner.revision, 'same-time-b');
@@ -460,7 +510,7 @@ test('同步配置记录拒绝无效结构和含凭据仓库地址', () => {
   assert.equal(parseConfigurationRecord({ ...valid, configuration: { ...valid.configuration, branch: '../main' } }), undefined);
 });
 
-test('独立 Profile 配置实例通过共享锁收敛并可恢复被替换版本', async () => {
+test('独立 Profile 配置实例通过共享锁传播因果更新', async () => {
   resetApplicationSettings();
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-shared-configuration-'));
   const firstState = new Map<string, unknown>();
@@ -485,13 +535,67 @@ test('独立 Profile 配置实例通过共享锁收敛并可恢复被替换版�
     assert.deepEqual(first.get(), secondConfiguration);
     assert.deepEqual(second.get(), secondConfiguration);
     assert.equal(first.viewState().revision, second.viewState().revision);
-    assert.equal(second.viewState().recovery?.configuration.branch, 'first');
+    assert.equal(second.viewState().conflict, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
-    assert.equal(await first.restoreRecovery(), true);
-    await second.reload();
-    assert.deepEqual(first.get(), firstConfiguration);
-    assert.deepEqual(second.get(), firstConfiguration);
-    assert.equal(first.viewState().revision, second.viewState().revision);
+test('并发同步设置保留双方并支持本机、云端和 AI 选择', async () => {
+  resetApplicationSettings();
+  const strategies = ['local', 'cloud', 'ai'] as const;
+  for (const strategy of strategies) {
+    const root = await mkdtemp(path.join(tmpdir(), `profile-git-sync-configuration-conflict-${strategy}-`));
+    const localConfiguration = {
+      ...DEFAULT_CONFIGURATION,
+      repositoryUrl: 'git@github.com:user/settings.git',
+      branch: 'local',
+    };
+    const cloudConfiguration = {
+      ...localConfiguration,
+      branch: 'cloud',
+      pollIntervalSeconds: 900,
+    };
+    const local = createConfigurationRecord(localConfiguration, 'device-local', 0, 100, 'local-revision');
+    const cloud = createConfigurationRecord(cloudConfiguration, 'device-cloud', 0, 100, 'cloud-revision');
+    const state = new Map<string, unknown>([['profileGitSync.syncedConfiguration', cloud]]);
+    const store = new ConfigurationStore(fakeExtensionContext(state), root);
+    try {
+      await writeFile(path.join(root, 'configuration.json'), JSON.stringify(local), 'utf8');
+      await store.initialize();
+      assert.equal(store.viewState().conflict?.kind, 'pluginConfiguration');
+      assert.deepEqual(store.viewState().conflict?.items, ['分支', '远程轮询间隔']);
+      const conflictId = store.viewState().conflict!.id;
+      if (strategy === 'ai') {
+        await store.setConflictAiCandidate(conflictId, { ...cloudConfiguration, repositoryUrl: localConfiguration.repositoryUrl, branch: localConfiguration.branch });
+      }
+      await assert.rejects(store.resolveConflict('other-conflict-id', strategy), /冲突已变化/);
+      assert.equal(await store.resolveConflict(conflictId, strategy), true);
+      assert.equal(store.get().branch, strategy === 'cloud' ? 'cloud' : 'local');
+      assert.equal(store.get().pollIntervalSeconds, strategy === 'local' ? 600 : 900);
+      assert.equal(store.viewState().conflict, undefined);
+      assert.equal((state.get('profileGitSync.syncedConfiguration') as { configuration: PluginConfiguration }).configuration.branch, store.get().branch);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('旧版恢复记录显示为设置备份而不是伪装成云端版本', async () => {
+  resetApplicationSettings();
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-legacy-recovery-'));
+  const current = createConfigurationRecord({ ...DEFAULT_CONFIGURATION, branch: 'current' }, 'device-a', 0, 100, 'current');
+  const backup = createConfigurationRecord({ ...DEFAULT_CONFIGURATION, branch: 'backup' }, 'device-a', 0, 90, 'backup');
+  const state = new Map<string, unknown>([['profileGitSync.syncedConfiguration', current]]);
+  const store = new ConfigurationStore(fakeExtensionContext(state), root);
+  try {
+    await writeFile(path.join(root, 'configuration.json'), JSON.stringify(current), 'utf8');
+    await writeFile(path.join(root, 'configuration-recovery.json'), JSON.stringify(backup), 'utf8');
+    await store.initialize();
+    assert.equal(store.viewState().conflict?.kind, 'legacyConfigurationBackup');
+    assert.equal(store.viewState().conflict?.title, '发现以前保留的设置备份');
+    await store.resolveConflict(store.viewState().conflict!.id, 'cloud');
+    assert.equal(store.get().branch, 'backup');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

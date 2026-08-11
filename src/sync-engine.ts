@@ -1,21 +1,38 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import * as vscode from 'vscode';
 import { parse, ParseError } from 'jsonc-parser';
-import { AiService } from './ai';
+import { AiService, stripJsonFence } from './ai';
+import { ConflictStrategy, PendingConflictView } from './conflict-types';
 import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { HostEnvironment } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
-import { chooseFallbackSide, fallbackCommitMessage } from './sync-fallback';
+import { fallbackCommitMessage } from './sync-fallback';
 import { collectExtensionIdsFromFiles, waitForExtensions } from './extension-wait';
+import { detectSnapshotConflicts } from './snapshot-conflict';
 import { RuntimeStatus, SnapshotManifest, SyncOutcome } from './types';
+
+interface PendingProfileConflict {
+  schemaVersion: 1;
+  id: string;
+  createdAt: string;
+  repositoryUrl: string;
+  branch: string;
+  remoteHead?: string;
+  localFingerprint: string;
+  conflicts: string[];
+  hasBase: boolean;
+  aiCandidateReady?: boolean;
+  aiError?: string;
+}
 
 export class SyncEngine {
   private running = false;
+  private readonly pendingConflictPath: string;
+  private readonly pendingConflictRoot: string;
 
   public constructor(
     private readonly environment: HostEnvironment,
@@ -25,7 +42,26 @@ export class SyncEngine {
     private readonly configurationStore: ConfigurationStore,
     private readonly updateStatus: (patch: Partial<RuntimeStatus>) => void,
     private readonly windowSafety: () => Promise<WindowSafetySnapshot>,
-  ) {}
+  ) {
+    this.pendingConflictPath = path.join(environment.runtimePath, 'pending-profile-conflict.json');
+    this.pendingConflictRoot = path.join(environment.runtimePath, 'pending-profile-conflict');
+  }
+
+  public async pendingConflictView(): Promise<PendingConflictView | undefined> {
+    const conflict = await this.readPendingConflict();
+    if (!conflict) return undefined;
+    return {
+      id: conflict.id,
+      kind: 'profileSnapshot',
+      title: conflict.aiCandidateReady ? 'AI 已生成合并方案' : '发现配置冲突，已暂停同步',
+      description: conflict.aiCandidateReady
+        ? `AI 已合并 ${conflict.conflicts.length} 项冲突并通过检查。确认后将同时更新本机和云端。`
+        : '云端和本机包含不同修改。请选择要保留的版本，处理前不会覆盖任何一方。',
+      items: conflict.conflicts,
+      aiCandidateReady: conflict.aiCandidateReady === true,
+      ...(conflict.aiError ? { aiError: conflict.aiError } : {}),
+    };
+  }
 
   public async synchronize(allowStructural = false): Promise<SyncOutcome | undefined> {
     if (this.running) return undefined;
@@ -35,6 +71,14 @@ export class SyncEngine {
     let recoveredPendingChanges = false;
     let temporaryRoot: string | undefined;
     try {
+      if (this.configurationStore.hasConflict()) {
+        this.updateStatus({ phase: '存在冲突', message: '请先处理同步设置冲突。' });
+        return { ok: false, blockedByConflict: true };
+      }
+      if (await this.readPendingConflict()) {
+        this.updateStatus({ phase: '存在冲突', message: '云端和本机配置存在冲突，请在同步状态中选择处理方式。' });
+        return { ok: false, blockedByConflict: true };
+      }
       if (!configuration.repositoryUrl) {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
         return { ok: false };
@@ -64,8 +108,21 @@ export class SyncEngine {
 
       let mergedRoot = localHostRoot;
       if (remoteExists) {
+        const conflicts = await detectSnapshotConflicts(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, this.environment.kind);
+        if (conflicts.length) {
+          await this.persistProfileConflict(
+            baseExists ? baseHostRoot : undefined,
+            localHostRoot,
+            repositoryHostRoot,
+            conflicts,
+            configuration.repositoryUrl,
+            configuration.branch,
+          );
+          this.updateStatus({ phase: '存在冲突', message: `发现 ${conflicts.length} 项配置冲突，已暂停同步。` });
+          return { ok: false, blockedByConflict: true };
+        }
         const merged = path.join(temporaryRoot, 'merged');
-        usedAiFallback = await this.mergeSnapshots(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, merged);
+        await this.mergeSnapshots(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, merged, false);
         mergedRoot = merged;
       }
 
@@ -139,6 +196,131 @@ export class SyncEngine {
     }
   }
 
+  public async prepareConflictAiCandidate(id: string): Promise<void> {
+    const conflict = await this.requireCurrentConflict(id);
+    const roots = this.conflictRoots(conflict.id);
+    this.updateStatus({ phase: '等待 AI', message: `正在合并 ${conflict.conflicts.length} 项冲突…` });
+    try {
+      await fs.rm(roots.candidate, { recursive: true, force: true });
+      await this.mergeSnapshots(conflict.hasBase ? roots.base : undefined, roots.local, roots.cloud, roots.candidate, true);
+      const manifest = await readManifest(roots.candidate);
+      const secrets = await findPotentialSecrets(roots.candidate, manifest);
+      if (secrets.length) throw new Error(`AI 合并结果可能包含凭据：${secrets.join('、')}`);
+      conflict.aiCandidateReady = true;
+      delete conflict.aiError;
+      await atomicWriteJson(this.pendingConflictPath, conflict);
+      this.updateStatus({ phase: '存在冲突', message: 'AI 已生成合并方案，请确认后应用。' });
+    } catch (error) {
+      conflict.aiCandidateReady = false;
+      conflict.aiError = safeErrorMessage(error);
+      await atomicWriteJson(this.pendingConflictPath, conflict);
+      this.updateStatus({ phase: '存在冲突', message: `AI 合并失败：${conflict.aiError}` });
+      throw error;
+    }
+  }
+
+  public async resolvePendingConflict(id: string, strategy: ConflictStrategy): Promise<void> {
+    const conflict = await this.requireCurrentConflict(id);
+    if (strategy === 'ai' && !conflict.aiCandidateReady) throw new Error('AI 尚未生成可应用的合并方案。');
+    const safety = await this.windowSafety();
+    if (safety.dirtyWindows > 0 || safety.unreadableWindows > 0) throw new Error('存在未保存或状态无法确认的窗口，暂时无法应用冲突选择。');
+    if (safety.activeWindows > 1) throw new Error('请关闭其他 IDE 窗口后再应用冲突选择。');
+
+    const roots = this.conflictRoots(conflict.id);
+    const selected = strategy === 'cloud' ? roots.cloud : strategy === 'local' ? roots.local : roots.candidate;
+    const configuration = this.configurationStore.get();
+    const repositoryHostRoot = path.join(this.git.repositoryPath, '.profile-git-sync', 'hosts', this.environment.kind);
+    if (strategy !== 'cloud') {
+      await fs.rm(repositoryHostRoot, { recursive: true, force: true });
+      await fs.mkdir(path.dirname(repositoryHostRoot), { recursive: true });
+      await fs.cp(selected, repositoryHostRoot, { recursive: true });
+      const changed = await this.git.stageHost(this.environment.kind);
+      if (changed.length) await this.git.commitAndPush(configuration, fallbackCommitMessage(this.environment.kind));
+    }
+    if (strategy !== 'local') await this.adapter.restoreSnapshot(selected, true);
+    await this.clearPendingConflict(conflict.id);
+    this.updateStatus({
+      phase: '空闲',
+      pendingChanges: 0,
+      lastSyncAt: new Date().toISOString(),
+      message: strategy === 'cloud' ? '已使用云端完整版本。' : strategy === 'local' ? '已使用本机完整版本。' : '已应用 AI 合并结果。',
+    });
+  }
+
+  private async persistProfileConflict(
+    baseRoot: string | undefined,
+    localRoot: string,
+    cloudRoot: string,
+    conflicts: string[],
+    repositoryUrl: string,
+    branch: string,
+  ): Promise<void> {
+    const id = randomUUID();
+    const roots = this.conflictRoots(id);
+    await fs.rm(this.pendingConflictRoot, { recursive: true, force: true });
+    await fs.mkdir(roots.root, { recursive: true });
+    await Promise.all([
+      fs.cp(localRoot, roots.local, { recursive: true }),
+      fs.cp(cloudRoot, roots.cloud, { recursive: true }),
+      ...(baseRoot ? [fs.cp(baseRoot, roots.base, { recursive: true })] : []),
+    ]);
+    const conflict: PendingProfileConflict = {
+      schemaVersion: 1,
+      id,
+      createdAt: new Date().toISOString(),
+      repositoryUrl,
+      branch,
+      remoteHead: await this.git.head(),
+      localFingerprint: await this.adapter.fingerprint(),
+      conflicts,
+      hasBase: baseRoot !== undefined,
+    };
+    await atomicWriteJson(this.pendingConflictPath, conflict);
+  }
+
+  private async requireCurrentConflict(id: string): Promise<PendingProfileConflict> {
+    const conflict = await this.readPendingConflict();
+    if (!conflict || conflict.id !== id) throw new Error('待处理的配置冲突已不存在。');
+    const configuration = this.configurationStore.get();
+    if (configuration.repositoryUrl !== conflict.repositoryUrl || configuration.branch !== conflict.branch) {
+      await this.clearPendingConflict(conflict.id);
+      throw new Error('同步仓库设置已变化，请重新同步并检测冲突。');
+    }
+    if (await this.adapter.fingerprint() !== conflict.localFingerprint) {
+      await this.clearPendingConflict(conflict.id);
+      throw new Error('本机配置已变化，请重新同步并检测冲突。');
+    }
+    await this.git.prepare(configuration);
+    await this.git.pull(configuration);
+    if (await this.git.head() !== conflict.remoteHead) {
+      await this.clearPendingConflict(conflict.id);
+      throw new Error('云端配置已变化，请重新同步并检测冲突。');
+    }
+    return conflict;
+  }
+
+  private async readPendingConflict(): Promise<PendingProfileConflict | undefined> {
+    return parsePendingProfileConflict(await readJsonFile(this.pendingConflictPath));
+  }
+
+  private conflictRoots(id: string) {
+    const root = path.join(this.pendingConflictRoot, id);
+    return {
+      root,
+      base: path.join(root, 'base'),
+      local: path.join(root, 'local'),
+      cloud: path.join(root, 'cloud'),
+      candidate: path.join(root, 'candidate'),
+    };
+  }
+
+  private async clearPendingConflict(id: string): Promise<void> {
+    await Promise.all([
+      fs.rm(this.pendingConflictPath, { force: true }),
+      fs.rm(path.join(this.pendingConflictRoot, id), { recursive: true, force: true }),
+    ]);
+  }
+
   private async ensureWindowSafety(): Promise<WindowSafetySnapshot | undefined> {
     const safety = await this.windowSafety();
     if (safety.dirtyWindows > 0) {
@@ -160,14 +342,18 @@ export class SyncEngine {
     return safety;
   }
 
-  private async mergeSnapshots(baseRoot: string | undefined, oursRoot: string, theirsRoot: string, outputRoot: string): Promise<boolean> {
+  private async mergeSnapshots(
+    baseRoot: string | undefined,
+    oursRoot: string,
+    theirsRoot: string,
+    outputRoot: string,
+    useAi: boolean,
+  ): Promise<void> {
     const base = baseRoot ? await readManifest(baseRoot) : emptyManifest(this.environment.kind);
     const ours = await readManifest(oursRoot);
     const theirs = await readManifest(theirsRoot);
     const files = new Set([...Object.keys(base.files), ...Object.keys(ours.files), ...Object.keys(theirs.files)]);
     const outputFiles: Record<string, string> = {};
-    const aiConflicts: string[] = [];
-    const fallbackConflicts: string[] = [];
     await fs.rm(outputRoot, { recursive: true, force: true });
     await fs.mkdir(outputRoot, { recursive: true });
 
@@ -180,28 +366,16 @@ export class SyncEngine {
       if (oursHash === baseHash) sourceRoot = theirsHash ? theirsRoot : undefined;
       else if (theirsHash === baseHash || oursHash === theirsHash) sourceRoot = oursHash ? oursRoot : undefined;
       else {
+        if (!useAi) throw new Error(`尚未处理配置冲突：${relative}`);
         const [baseText, oursText, theirsText] = await Promise.all([
           readOptionalText(baseRoot, relative),
           readOptionalText(oursRoot, relative),
           readOptionalText(theirsRoot, relative)
         ]);
-        let aiCandidateAccepted = false;
-        if (![baseText, oursText, theirsText].some(containsPotentialSecret)) {
-          try {
-            const candidate = await this.ai.resolveConflict(relative, baseText, oursText, theirsText);
-            validateCandidate(relative, candidate);
-            mergedContent = Buffer.from(candidate, 'utf8');
-            aiCandidateAccepted = true;
-            aiConflicts.push(relative);
-          } catch {
-            // AI 不可用或结果无效时，继续使用确定性兜底。
-          }
-        }
-        if (!aiCandidateAccepted) {
-          const fallbackSide = chooseFallbackSide(oursHash, theirsHash);
-          sourceRoot = fallbackSide === 'ours' ? oursRoot : fallbackSide === 'theirs' ? theirsRoot : undefined;
-          fallbackConflicts.push(relative);
-        }
+        if ([baseText, oursText, theirsText].some(containsPotentialSecret)) throw new Error(`冲突文件可能包含凭据，无法交给 AI：${relative}`);
+        const candidate = await this.ai.resolveConflict(relative, baseText, oursText, theirsText);
+        validateCandidate(relative, candidate);
+        mergedContent = Buffer.from(candidate, 'utf8');
       }
       if (!sourceRoot && !mergedContent) continue;
       const content = mergedContent ?? await fs.readFile(resolveSnapshotPath(sourceRoot!, relative));
@@ -211,32 +385,17 @@ export class SyncEngine {
       outputFiles[relative] = sha256(content);
     }
 
-    if (aiConflicts.length) {
-      this.updateStatus({ phase: '存在冲突', message: `AI 已生成 ${aiConflicts.length} 个冲突合并候选。` });
-      const choice = await vscode.window.showWarningMessage(
-        `AI 已合并这些配置冲突：${aiConflicts.join('、')}。是否应用并提交？`,
-        { modal: true },
-        '应用合并结果'
-      );
-      if (choice !== '应用合并结果') throw new Error('用户取消了 AI 冲突合并，远程与本机配置均未改写。');
-    }
-
-    const profiles = sameProfiles(base, ours) ? theirs.profiles : ours.profiles;
+    const structure = await mergeProfileStructure(this.ai, base, ours, theirs, useAi);
     const manifest: SnapshotManifest = {
       schemaVersion: 1,
       host: this.environment.kind,
       createdAt: '',
-      profiles,
-      profileMetadata: sameProfiles(base, ours) ? theirs.profileMetadata : ours.profileMetadata,
-      ...(sameProfiles(base, ours) && theirs.profileAssociations !== undefined
-        ? { profileAssociations: theirs.profileAssociations }
-        : ours.profileAssociations !== undefined
-          ? { profileAssociations: ours.profileAssociations }
-          : {}),
+      profiles: structure.profiles,
+      ...(structure.profileMetadata !== undefined ? { profileMetadata: structure.profileMetadata } : {}),
+      ...(structure.profileAssociations !== undefined ? { profileAssociations: structure.profileAssociations } : {}),
       files: outputFiles
     };
     await fs.writeFile(path.join(outputRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    return fallbackConflicts.length > 0;
   }
 }
 
@@ -271,8 +430,75 @@ function validateCandidate(relative: string, content: string): void {
   }
 }
 
-function sameProfiles(left: SnapshotManifest, right: SnapshotManifest): boolean {
-  return JSON.stringify(left.profiles) === JSON.stringify(right.profiles);
+async function mergeProfileStructure(
+  ai: AiService,
+  base: SnapshotManifest,
+  local: SnapshotManifest,
+  cloud: SnapshotManifest,
+  useAi: boolean,
+): Promise<ReturnType<typeof snapshotStructure>> {
+  const baseStructure = snapshotStructure(base);
+  const localStructure = snapshotStructure(local);
+  const cloudStructure = snapshotStructure(cloud);
+  if (sameValue(localStructure, baseStructure)) return cloudStructure;
+  if (sameValue(cloudStructure, baseStructure) || sameValue(localStructure, cloudStructure)) return localStructure;
+  if (!useAi) throw new Error('尚未处理 Profile 结构和关联关系冲突。');
+  const texts = [baseStructure, localStructure, cloudStructure].map((value) => JSON.stringify(value, null, 2));
+  if (texts.some(containsPotentialSecret)) throw new Error('Profile 结构可能包含凭据，无法交给 AI。');
+  const candidate = stripJsonFence(await ai.resolveConflict('Profile 结构和关联关系', texts[0]!, texts[1]!, texts[2]!));
+  validateCandidate('profile-structure.json', candidate);
+  return parseProfileStructure(JSON.parse(candidate) as unknown);
+}
+
+/** AI 返回的结构会直接写入 storage.json，必须逐项校验，避免破坏本机 Profile 存储。 */
+function parseProfileStructure(value: unknown): ReturnType<typeof snapshotStructure> {
+  if (!isRecord(value) || !Array.isArray(value.profiles)) throw new Error('AI 返回的 Profile 结构无效。');
+  const profiles = value.profiles.map((profile) => {
+    if (!isRecord(profile) || !isNonEmptyString(profile.id) || !isNonEmptyString(profile.name) || typeof profile.isDefault !== 'boolean') {
+      throw new Error('AI 返回的 Profile 清单无效。');
+    }
+    return { id: profile.id, name: profile.name, isDefault: profile.isDefault };
+  });
+  let profileMetadata: Array<Record<string, unknown>> | undefined;
+  if (value.profileMetadata !== undefined) {
+    if (!Array.isArray(value.profileMetadata)) throw new Error('AI 返回的 Profile 元数据无效。');
+    profileMetadata = value.profileMetadata.map((entry) => {
+      if (!isRecord(entry) || !isNonEmptyString(entry.location) || !isNonEmptyString(entry.name)) {
+        throw new Error('AI 返回的 Profile 元数据无效。');
+      }
+      return { ...entry };
+    });
+  }
+  if (value.profileAssociations !== undefined && !isAssociationMap(value.profileAssociations)) {
+    throw new Error('AI 返回的 Profile 关联关系无效。');
+  }
+  return {
+    profiles,
+    ...(profileMetadata ? { profileMetadata } : {}),
+    ...(value.profileAssociations !== undefined ? { profileAssociations: value.profileAssociations } : {}),
+  };
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function isAssociationMap(value: unknown): boolean {
+  return isRecord(value) && Object.values(value).every((group) => (
+    isRecord(group) && Object.values(group).every((item) => typeof item === 'string')
+  ));
+}
+
+function snapshotStructure(manifest: SnapshotManifest) {
+  return {
+    profiles: manifest.profiles,
+    ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
+    ...(manifest.profileAssociations !== undefined ? { profileAssociations: manifest.profileAssociations } : {}),
+  };
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function sha256(content: Buffer): string {
@@ -299,4 +525,47 @@ function finalSyncMessage(
 
 async function exists(filePath: string): Promise<boolean> {
   return fs.access(filePath).then(() => true, () => false);
+}
+
+async function readJsonFile(filePath: string): Promise<unknown> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+}
+
+async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+  try {
+    await fs.rename(temporary, filePath);
+  } catch (error) {
+    if (!['EEXIST', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+    await fs.rm(filePath, { force: true });
+    await fs.rename(temporary, filePath);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+function parsePendingProfileConflict(value: unknown): PendingProfileConflict | undefined {
+  if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.id !== 'string') return undefined;
+  if (typeof value.createdAt !== 'string' || typeof value.repositoryUrl !== 'string' || typeof value.branch !== 'string') return undefined;
+  if (value.remoteHead !== undefined && typeof value.remoteHead !== 'string') return undefined;
+  if (typeof value.localFingerprint !== 'string' || typeof value.hasBase !== 'boolean') return undefined;
+  if (!Array.isArray(value.conflicts) || !value.conflicts.every((item) => typeof item === 'string')) return undefined;
+  if (value.aiCandidateReady !== undefined && typeof value.aiCandidateReady !== 'boolean') return undefined;
+  if (value.aiError !== undefined && typeof value.aiError !== 'string') return undefined;
+  return value as unknown as PendingProfileConflict;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function safeErrorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, ' ').slice(0, 500);
 }

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { RuntimeStatus, SyncPhase } from './types';
+import { ConflictStrategy } from './conflict-types';
 
 interface Lease {
   schemaVersion?: 2;
@@ -49,6 +50,7 @@ interface ConfigurationRevision {
 
 interface SyncRequest {
   allowStructural?: boolean;
+  conflictResolution?: { id: string; strategy: ConflictStrategy; applyAi: boolean };
 }
 
 export interface WindowSafetySnapshot {
@@ -143,6 +145,19 @@ export class MultiWindowCoordinator extends EventEmitter {
     await atomicWriteJson(
       path.join(this.runtimePath, `sync-request-${requestId}.json`),
       { schemaVersion: 2, requestId, instanceId: this.instanceId, requestedAt: this.now(), allowStructural },
+    );
+  }
+
+  public async requestConflictResolution(id: string, strategy: ConflictStrategy, applyAi: boolean): Promise<void> {
+    const resolution = { id, strategy, applyAi };
+    if (this.leader) {
+      this.emit('conflictResolutionRequested', resolution);
+      return;
+    }
+    const requestId = randomUUID();
+    await atomicWriteJson(
+      path.join(this.runtimePath, `sync-request-${requestId}.json`),
+      { schemaVersion: 2, requestId, instanceId: this.instanceId, requestedAt: this.now(), conflictResolution: resolution },
     );
   }
 
@@ -349,8 +364,9 @@ export class MultiWindowCoordinator extends EventEmitter {
 
   private async claimSyncRequests(): Promise<void> {
     const entries = await fs.readdir(this.runtimePath).catch(() => [] as string[]);
-    let claimed = false;
+    let plainRequest = false;
     let allowStructural = false;
+    const resolutions: Array<{ id: string; strategy: ConflictStrategy; applyAi: boolean }> = [];
     for (const entry of entries) {
       if (!entry.startsWith('sync-request-') && !entry.startsWith('sync-processing-')) continue;
       if (!entry.endsWith('.json')) continue;
@@ -361,14 +377,20 @@ export class MultiWindowCoordinator extends EventEmitter {
       try {
         await fs.rename(source, target);
         this.claimedRequests.add(target);
-        claimed = true;
         const request = parseSyncRequest(await readJson(target));
+        if (request?.conflictResolution) {
+          resolutions.push(request.conflictResolution);
+          continue;
+        }
+        // 同一轮里普通同步请求和冲突处理请求都要各自触发，否则普通请求会被冲突流程的清理直接丢弃。
+        plainRequest = true;
         allowStructural ||= request?.allowStructural === true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
     }
-    if (claimed) this.emit('syncRequested', allowStructural);
+    for (const resolution of resolutions) this.emit('conflictResolutionRequested', resolution);
+    if (plainRequest) this.emit('syncRequested', allowStructural);
   }
 
   private async consumeSharedFiles(): Promise<void> {
@@ -508,6 +530,12 @@ function parseConfigurationRevision(value: unknown): ConfigurationRevision | und
 function parseSyncRequest(value: unknown): SyncRequest | undefined {
   if (!isRecord(value)) return undefined;
   if (value.allowStructural !== undefined && typeof value.allowStructural !== 'boolean') return undefined;
+  if (value.conflictResolution !== undefined) {
+    if (!isRecord(value.conflictResolution)) return undefined;
+    if (typeof value.conflictResolution.id !== 'string') return undefined;
+    if (!['cloud', 'local', 'ai'].includes(String(value.conflictResolution.strategy))) return undefined;
+    if (typeof value.conflictResolution.applyAi !== 'boolean') return undefined;
+  }
   return value as SyncRequest;
 }
 

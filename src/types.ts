@@ -15,6 +15,7 @@ export type SyncPhase =
 export interface SyncOutcome {
   ok: boolean;
   retry?: boolean;
+  blockedByConflict?: boolean;
   extensionsPending?: string[];
 }
 
