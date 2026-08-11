@@ -534,54 +534,69 @@ test('独立 Profile 配置实例通过共享锁传播因果更新', async () =>
     await Promise.all([first.reload(), second.reload()]);
     assert.deepEqual(first.get(), secondConfiguration);
     assert.deepEqual(second.get(), secondConfiguration);
-    assert.equal(first.viewState().revision, second.viewState().revision);
-    assert.equal(second.viewState().conflict, undefined);
+    assert.deepEqual(firstState.get('profileGitSync.syncedConfiguration'), secondState.get('profileGitSync.syncedConfiguration'));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('并发同步设置保留双方并支持本机、云端和 AI 选择', async () => {
+test('并发同步设置由当前机器配置胜出并合并版本向量', async () => {
   resetApplicationSettings();
-  const strategies = ['local', 'cloud', 'ai'] as const;
-  for (const strategy of strategies) {
-    const root = await mkdtemp(path.join(tmpdir(), `profile-git-sync-configuration-conflict-${strategy}-`));
-    const localConfiguration = {
-      ...DEFAULT_CONFIGURATION,
-      repositoryUrl: 'git@github.com:user/settings.git',
-      branch: 'local',
-    };
-    const cloudConfiguration = {
-      ...localConfiguration,
-      branch: 'cloud',
-      pollIntervalSeconds: 900,
-    };
-    const local = createConfigurationRecord(localConfiguration, 'device-local', 0, 100, 'local-revision');
-    const cloud = createConfigurationRecord(cloudConfiguration, 'device-cloud', 0, 100, 'cloud-revision');
-    const state = new Map<string, unknown>([['profileGitSync.syncedConfiguration', cloud]]);
-    const store = new ConfigurationStore(fakeExtensionContext(state), root);
-    try {
-      await writeFile(path.join(root, 'configuration.json'), JSON.stringify(local), 'utf8');
-      await store.initialize();
-      assert.equal(store.viewState().conflict?.kind, 'pluginConfiguration');
-      assert.deepEqual(store.viewState().conflict?.items, ['分支', '远程轮询间隔']);
-      const conflictId = store.viewState().conflict!.id;
-      if (strategy === 'ai') {
-        await store.setConflictAiCandidate(conflictId, { ...cloudConfiguration, repositoryUrl: localConfiguration.repositoryUrl, branch: localConfiguration.branch });
-      }
-      await assert.rejects(store.resolveConflict('other-conflict-id', strategy), /冲突已变化/);
-      assert.equal(await store.resolveConflict(conflictId, strategy), true);
-      assert.equal(store.get().branch, strategy === 'cloud' ? 'cloud' : 'local');
-      assert.equal(store.get().pollIntervalSeconds, strategy === 'local' ? 600 : 900);
-      assert.equal(store.viewState().conflict, undefined);
-      assert.equal((state.get('profileGitSync.syncedConfiguration') as { configuration: PluginConfiguration }).configuration.branch, store.get().branch);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-configuration-concurrent-'));
+  const localConfiguration = {
+    ...DEFAULT_CONFIGURATION,
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'local',
+  };
+  const cloudConfiguration = {
+    ...localConfiguration,
+    branch: 'cloud',
+    pollIntervalSeconds: 900,
+  };
+  const local = createConfigurationRecord(localConfiguration, 'device-local', 0, 100, 'local-revision');
+  const cloud = createConfigurationRecord(cloudConfiguration, 'device-cloud', 0, 100, 'cloud-revision');
+  const state = new Map<string, unknown>([['profileGitSync.syncedConfiguration', cloud]]);
+  const store = new ConfigurationStore(fakeExtensionContext(state), root);
+  try {
+    await writeFile(path.join(root, 'configuration.json'), JSON.stringify(local), 'utf8');
+    await store.initialize();
+    assert.deepEqual(store.get(), localConfiguration);
+    const accepted = parseConfigurationRecord(state.get('profileGitSync.syncedConfiguration'));
+    assert.ok(accepted);
+    assert.notEqual(accepted.revision, local.revision);
+    assert.equal(accepted.clock['device-local'], local.clock['device-local']);
+    assert.equal(accepted.clock['device-cloud'], cloud.clock['device-cloud']);
+    assert.deepEqual(parseConfigurationRecord(JSON.parse(await readFile(path.join(root, 'configuration.json'), 'utf8'))), accepted);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
-test('旧版恢复记录显示为设置备份而不是伪装成云端版本', async () => {
+test('内容相同的并发同步设置直接合并版本向量', async () => {
+  resetApplicationSettings();
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-configuration-same-concurrent-'));
+  const configuration = {
+    ...DEFAULT_CONFIGURATION,
+    repositoryUrl: 'git@github.com:user/settings.git',
+  };
+  const local = createConfigurationRecord(configuration, 'device-local', 0, 100, 'local-revision');
+  const cloud = createConfigurationRecord(configuration, 'device-cloud', 0, 100, 'cloud-revision');
+  const state = new Map<string, unknown>([['profileGitSync.syncedConfiguration', cloud]]);
+  const store = new ConfigurationStore(fakeExtensionContext(state), root);
+  try {
+    await writeFile(path.join(root, 'configuration.json'), JSON.stringify(local), 'utf8');
+    await store.initialize();
+    const accepted = parseConfigurationRecord(state.get('profileGitSync.syncedConfiguration'));
+    assert.ok(accepted);
+    assert.deepEqual(accepted.configuration, configuration);
+    assert.equal(accepted.clock['device-local'], local.clock['device-local']);
+    assert.equal(accepted.clock['device-cloud'], cloud.clock['device-cloud']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('初始化静默清理旧版配置冲突和恢复记录', async () => {
   resetApplicationSettings();
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-legacy-recovery-'));
   const current = createConfigurationRecord({ ...DEFAULT_CONFIGURATION, branch: 'current' }, 'device-a', 0, 100, 'current');
@@ -591,11 +606,11 @@ test('旧版恢复记录显示为设置备份而不是伪装成云端版本', as
   try {
     await writeFile(path.join(root, 'configuration.json'), JSON.stringify(current), 'utf8');
     await writeFile(path.join(root, 'configuration-recovery.json'), JSON.stringify(backup), 'utf8');
+    await writeFile(path.join(root, 'configuration-conflict.json'), '{}', 'utf8');
     await store.initialize();
-    assert.equal(store.viewState().conflict?.kind, 'legacyConfigurationBackup');
-    assert.equal(store.viewState().conflict?.title, '发现以前保留的设置备份');
-    await store.resolveConflict(store.viewState().conflict!.id, 'cloud');
-    assert.equal(store.get().branch, 'backup');
+    assert.equal(store.get().branch, 'current');
+    await assert.rejects(readFile(path.join(root, 'configuration-recovery.json')), /ENOENT/);
+    await assert.rejects(readFile(path.join(root, 'configuration-conflict.json')), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

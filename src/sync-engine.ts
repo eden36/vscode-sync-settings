@@ -52,7 +52,6 @@ export class SyncEngine {
     if (!conflict) return undefined;
     return {
       id: conflict.id,
-      kind: 'profileSnapshot',
       title: conflict.aiCandidateReady ? 'AI 已生成合并方案' : '发现配置冲突，已暂停同步',
       description: conflict.aiCandidateReady
         ? `AI 已合并 ${conflict.conflicts.length} 项冲突并通过检查。确认后将同时更新本机和云端。`
@@ -71,10 +70,6 @@ export class SyncEngine {
     let recoveredPendingChanges = false;
     let temporaryRoot: string | undefined;
     try {
-      if (this.configurationStore.hasConflict()) {
-        this.updateStatus({ phase: '存在冲突', message: '请先处理同步设置冲突。' });
-        return { ok: false, blockedByConflict: true };
-      }
       if (await this.readPendingConflict()) {
         this.updateStatus({ phase: '存在冲突', message: '云端和本机配置存在冲突，请在同步状态中选择处理方式。' });
         return { ok: false, blockedByConflict: true };

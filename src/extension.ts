@@ -29,7 +29,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const adapter = new ProfileAdapter(environment);
   const profiles = await adapter.listProfiles();
   const status: RuntimeStatus = {
-    phase: configurationStore.hasConflict() ? '存在冲突' : configurationStore.get().repositoryUrl ? '空闲' : '未配置',
+    phase: configurationStore.get().repositoryUrl ? '空闲' : '未配置',
     role: 'stopped',
     activeWindows: 1,
     profiles: profiles.map((profile) => profile.name),
@@ -78,7 +78,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   const notifyPendingConflict = async () => {
-    const conflict = configurationStore.viewState().conflict ?? await engine.pendingConflictView();
+    const conflict = await engine.pendingConflictView();
     if (!conflict || conflict.id === notifiedConflictId) return;
     notifiedConflictId = conflict.id;
     const answer = await vscode.window.showWarningMessage(`${conflict.title}。同步已暂停，请选择处理方式。`, '打开同步状态');
@@ -236,11 +236,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const refreshConfiguration = async () => {
     await configurationStore.reload();
     if (!syncRunning) applyStatus({
-      phase: configurationStore.hasConflict() ? '存在冲突' : configurationStore.get().repositoryUrl ? '空闲' : '未配置',
-      message: configurationStore.hasConflict() ? '请先处理同步设置冲突。' : undefined,
+      phase: configurationStore.get().repositoryUrl ? '空闲' : '未配置',
+      message: undefined,
     }, false);
     await sidebar?.pushState();
-    if (configurationStore.hasConflict()) void notifyPendingConflict();
     if (coordinator!.isLeader) await startLeaderSchedules();
   };
 
@@ -250,47 +249,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void vscode.window.showInformationMessage('冲突处理请求已发送给 leader 窗口。');
       return;
     }
-    const configurationConflict = configurationStore.viewState().conflict;
-    if (configurationConflict?.id === id) {
-      if (strategy === 'ai' && !applyAi) {
-        const sides = configurationStore.conflictSides();
-        if (!sides) return;
-        updateStatus({ phase: '等待 AI', message: '正在合并同步设置…' });
-        try {
-          const text = await ai.resolveConfigurationConflict(sides.local, sides.cloud);
-          await configurationStore.setConflictAiCandidate(id, JSON.parse(text) as unknown as typeof sides.local);
-          updateStatus({ phase: '存在冲突', message: 'AI 已生成同步设置合并方案，请确认后应用。' });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          // 记录失败原因本身也可能失败（冲突已消失或加锁超时），此时仍需把原始原因反馈给用户。
-          await configurationStore.setConflictAiCandidate(id, undefined, message).catch(() => undefined);
-          updateStatus({ phase: '存在冲突', message: `AI 合并失败：${message}` });
-        }
-        await coordinator!.notifyConfigurationChanged();
-        await sidebar.pushState();
-        return;
-      }
-      if (strategy !== 'ai') {
-        const label = configurationConflict.kind === 'legacyConfigurationBackup'
-          ? strategy === 'local' ? '保留当前设置' : '恢复备份'
-          : strategy === 'local' ? '使用本机设置并覆盖云端设置' : '使用云端设置并覆盖本机设置';
-        const answer = await vscode.window.showWarningMessage(`${label}会舍弃另一份设置，是否继续？`, { modal: true }, '继续');
-        if (answer !== '继续') return;
-      }
-      const applied = await configurationStore.resolveConflict(id, strategy);
-      notifiedConflictId = undefined;
-      if (!applied) await configurationStore.reload();
-      await coordinator!.notifyConfigurationChanged();
-      updateStatus({
-        phase: configurationStore.hasConflict() ? '存在冲突' : '空闲',
-        message: applied
-          ? strategy === 'ai' ? '已应用 AI 合并后的同步设置。' : '同步设置冲突已处理。'
-          : '待处理的同步设置冲突已不存在。',
-      });
-      await startLeaderSchedules();
-      return;
-    }
-
     if (strategy !== 'ai') {
       const label = strategy === 'local' ? '使用本机完整版本会覆盖云端配置' : '使用云端完整版本会覆盖本机配置';
       const answer = await vscode.window.showWarningMessage(`${label}，是否继续？`, { modal: true }, '继续');
@@ -359,11 +317,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (changed) await coordinator!.notifyConfigurationChanged();
         else await sidebar.pushState();
       }).catch((error: unknown) => {
-        // 冲突未处理时拒绝保存属于预期情况，不应当报成同步失败。
-        if (configurationStore.hasConflict()) {
-          applyStatus({ phase: '存在冲突', message: '请先处理同步设置冲突，处理后再修改设置。' }, false);
-          return;
-        }
         applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false);
       });
     }),
@@ -424,7 +377,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await coordinator.start();
   await updateWindowState();
   if (coordinator.isLeader) await startLeaderSchedules();
-  if (configurationStore.hasConflict() || await engine.pendingConflictView()) void notifyPendingConflict();
+  if (await engine.pendingConflictView()) void notifyPendingConflict();
 }
 
 export async function deactivate(): Promise<void> {
