@@ -2,13 +2,13 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { AiService } from './ai';
-import { ConflictStrategy } from './conflict-types';
 import { ConfigurationStore } from './configuration';
 import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { SidebarProvider } from './sidebar';
+import { displaySyncPhase, isBusyPhase } from './sidebar-status';
 import { SyncEngine } from './sync-engine';
 import { RuntimeStatus, SyncOutcome } from './types';
 
@@ -43,24 +43,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const ai = new AiService();
   let localFingerprint: string | undefined;
   let sidebar: SidebarProvider;
-  let activeProgress: vscode.Progress<{ message?: string }> | undefined;
   let syncRunning = false;
   let pendingSync = false;
-  let pendingAllowStructural = false;
   let retryWhenSafe = false;
   let scheduleGeneration = 0;
   let leaderSchedulesReady = false;
   let localCheckRunning = false;
   let operationRetryDelayMs = OPERATION_RETRY_MS;
   let dirtyDocumentCount = countDirtyDocuments(environment.userDataPath);
-  let notifiedConflictId: string | undefined;
+
+  // 同步全过程不弹通知，状态只落在状态栏和侧边栏，避免打断用户。
+  const statusBar = vscode.window.createStatusBarItem('profileGitSync.status', vscode.StatusBarAlignment.Right, 100);
+  statusBar.name = 'My Setting Sync';
+  statusBar.command = 'profileGitSync.openSettings';
+  const renderStatusBar = () => {
+    const phase = displaySyncPhase(status.phase, status.lastSyncAt);
+    const icon = isBusyPhase(status.phase) ? '$(sync~spin)'
+      : status.phase === '失败' ? '$(warning)'
+      : status.phase === '未配置' ? '$(gear)'
+      : status.phase === '等待其他窗口关闭' ? '$(clock)'
+      : '$(check)';
+    statusBar.text = `${icon} 配置同步`;
+    statusBar.tooltip = status.message ? `配置同步：${phase}\n${status.message}` : `配置同步：${phase}`;
+    statusBar.backgroundColor = status.phase === '失败'
+      ? new vscode.ThemeColor('statusBarItem.warningBackground')
+      : undefined;
+    statusBar.show();
+  };
 
   const applyStatus = (patch: Partial<RuntimeStatus>, publish: boolean) => {
     Object.assign(status, patch);
     if (patch.lastSyncAt) void context.globalState.update(LAST_SYNC_KEY, patch.lastSyncAt);
-    if (activeProgress && (patch.phase || patch.message)) {
-      activeProgress.report({ message: patch.message ?? patch.phase });
-    }
+    renderStatusBar();
     void sidebar?.pushState();
     if (publish && coordinator?.isLeader) {
       void coordinator.publishStatus(status).catch((error: unknown) => {
@@ -79,24 +93,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => coordinator!.windowSafety(),
   );
 
-  const notifyPendingConflict = async () => {
-    const conflict = await engine.pendingConflictView();
-    if (!conflict || conflict.id === notifiedConflictId) return;
-    notifiedConflictId = conflict.id;
-    const answer = await vscode.window.showWarningMessage(`${conflict.title}。同步已暂停，请选择处理方式。`, '打开同步状态');
-    if (answer === '打开同步状态') await vscode.commands.executeCommand('workbench.view.extension.profileGitSync');
-  };
-
+  // Profile 增删只有重载后才会出现在 IDE 界面上；其余配置文件写盘即生效，不需要重载。
   const reloadAfterSync = async (outcome: SyncOutcome | undefined) => {
-    if (!outcome?.ok || status.phase === '失败') return;
-    if (outcome.extensionsPending?.length) {
-      const answer = await vscode.window.showWarningMessage(
-        `部分扩展尚未安装完成：${outcome.extensionsPending.join('、')}。是否仍重载窗口？`,
-        { modal: true },
-        '仍要重载',
-      );
-      if (answer !== '仍要重载') return;
-    }
+    if (!outcome?.ok || !outcome.structuralApplied || status.phase === '失败') return;
     await vscode.commands.executeCommand('workbench.action.reloadWindow');
   };
 
@@ -111,15 +110,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, delayMs);
   };
 
-  const synchronize = async (allowStructural = false): Promise<SyncOutcome | undefined> => {
+  const synchronize = async (): Promise<SyncOutcome | undefined> => {
     if (!coordinator!.isLeader) {
-      await coordinator!.requestSync(allowStructural);
+      await coordinator!.requestSync();
       applyStatus({ role: 'follower', message: '同步请求已发送给 leader 窗口。' }, false);
       return undefined;
     }
     if (syncRunning) {
       pendingSync = true;
-      pendingAllowStructural ||= allowStructural;
       return undefined;
     }
 
@@ -128,31 +126,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let completed = false;
     try {
       do {
-        const cycleAllowStructural = allowStructural || pendingAllowStructural;
         pendingSync = false;
-        pendingAllowStructural = false;
         completed = false;
-        let acquired = false;
         let outcome: SyncOutcome | undefined;
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'My Setting Sync',
-            cancellable: false,
-          },
-          async (progress) => {
-            activeProgress = progress;
-            progress.report({ message: status.phase });
-            try {
-              acquired = await coordinator!.runExclusive(async () => {
-                outcome = await engine.synchronize(cycleAllowStructural);
-                localFingerprint = await adapter.fingerprint();
-              });
-            } finally {
-              activeProgress = undefined;
-            }
-          },
-        );
+        const acquired = await coordinator!.runExclusive(async () => {
+          outcome = await engine.synchronize();
+          localFingerprint = await adapter.fingerprint();
+        });
         if (!acquired) {
           applyStatus({ message: '另一窗口正在执行同步，稍后将自动重试。' }, false);
           scheduleOperationRetry();
@@ -160,20 +140,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         operationRetryDelayMs = OPERATION_RETRY_MS;
         finalOutcome = outcome;
-        if (outcome?.blockedByConflict) void notifyPendingConflict();
         if (outcome?.retry) {
           retryWhenSafe = true;
           break;
         }
         retryWhenSafe = false;
         completed = outcome !== undefined;
+        if (outcome?.structuralApplied) void reloadAfterSync(outcome);
       } while (pendingSync && coordinator!.isLeader);
 
       if (completed && !pendingSync && !retryWhenSafe) await coordinator!.completeSyncRequests();
       return finalOutcome;
     } finally {
       syncRunning = false;
-      if (pendingSync && coordinator!.isLeader && !retryWhenSafe) void synchronize(pendingAllowStructural);
+      if (pendingSync && coordinator!.isLeader && !retryWhenSafe) void synchronize();
       if (coordinator!.isLeader && !leaderSchedulesReady) void startLeaderSchedules();
     }
   };
@@ -249,48 +229,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (coordinator!.isLeader) await startLeaderSchedules();
   };
 
-  const resolveConflict = async (id: string, strategy: ConflictStrategy, applyAi: boolean): Promise<void> => {
-    if (!coordinator!.isLeader) {
-      await coordinator!.requestConflictResolution(id, strategy, applyAi);
-      void vscode.window.showInformationMessage('冲突处理请求已发送给 leader 窗口。');
-      return;
-    }
-    if (strategy !== 'ai') {
-      const label = strategy === 'local' ? '使用本机完整版本会覆盖云端配置' : '使用云端完整版本会覆盖本机配置';
-      const answer = await vscode.window.showWarningMessage(`${label}，是否继续？`, { modal: true }, '继续');
-      if (answer !== '继续') return;
-    }
-    const acquired = await coordinator!.runExclusive(async () => {
-      if (strategy === 'ai' && !applyAi) await engine.prepareConflictAiCandidate(id);
-      else await engine.resolvePendingConflict(id, strategy);
-    });
-    if (!acquired) throw new Error('另一窗口正在执行同步，请稍后重试。');
-    await coordinator!.completeSyncRequests();
-    notifiedConflictId = undefined;
-    await sidebar.pushState();
-  };
-
   sidebar = new SidebarProvider(
     configurationStore,
     () => status,
     async () => { await synchronize(); },
-    async () => {
-      if ((await coordinator!.activeWindowCount()) > 1) {
-        updateStatus({ phase: '等待其他窗口关闭', message: '请关闭其他 IDE 窗口后再安全应用。' });
-        return;
-      }
-      const answer = await vscode.window.showWarningMessage(
-        '安全应用可能新增或删除本机 Profile，并会先创建备份。是否继续？',
-        { modal: true },
-        '继续应用',
-      );
-      if (answer !== '继续应用') return;
-      const outcome = await synchronize(true);
-      await reloadAfterSync(outcome);
-    },
     async () => coordinator!.notifyConfigurationChanged(),
-    () => engine.pendingConflictView(),
-    resolveConflict,
   );
 
   const refreshDirtyDocuments = async () => {
@@ -303,21 +246,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   context.subscriptions.push(
+    statusBar,
     vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar),
-    // 命令参数由调用方决定，不能直接透传给 allowStructural。
     vscode.commands.registerCommand('profileGitSync.syncNow', () => void synchronize()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
-    vscode.commands.registerCommand('profileGitSync.applyPending', async () => {
-      if ((await coordinator!.activeWindowCount()) > 1) {
-        void vscode.window.showWarningMessage('请先关闭其他 IDE 窗口，再应用 Profile 结构变化。');
-        return;
-      }
-      const answer = await vscode.window.showWarningMessage('是否应用待处理的 Profile 结构变化？', { modal: true }, '应用');
-      if (answer === '应用') {
-        const outcome = await synchronize(true);
-        await reloadAfterSync(outcome);
-      }
-    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration('profileGitSync')) return;
       void configurationStore.saveApplicationSettings().then(async (changed) => {
@@ -343,12 +275,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     retryTimer = undefined;
     void updateWindowState();
   };
-  const onSyncRequested = (allowStructural = false) => void synchronize(allowStructural);
-  const onConflictResolutionRequested = (request: { id: string; strategy: ConflictStrategy; applyAi: boolean }) => {
-    void resolveConflict(request.id, request.strategy, request.applyAi).catch((error: unknown) => {
-      applyStatus({ phase: '存在冲突', message: error instanceof Error ? error.message : String(error) }, false);
-    }).finally(() => coordinator!.completeSyncRequests());
-  };
+  const onSyncRequested = () => void synchronize();
   const onStatusChanged = (patch: Partial<RuntimeStatus>) => applyStatus(patch, false);
   const onConfigurationChanged = () => void refreshConfiguration();
   const onWindowsChanged = (safety: WindowSafetySnapshot) => {
@@ -362,7 +289,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   coordinator.on('becameLeader', onBecameLeader);
   coordinator.on('becameFollower', onBecameFollower);
   coordinator.on('syncRequested', onSyncRequested);
-  coordinator.on('conflictResolutionRequested', onConflictResolutionRequested);
   coordinator.on('statusChanged', onStatusChanged);
   coordinator.on('configurationChanged', onConfigurationChanged);
   coordinator.on('windowsChanged', onWindowsChanged);
@@ -372,7 +298,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       coordinator?.off('becameLeader', onBecameLeader);
       coordinator?.off('becameFollower', onBecameFollower);
       coordinator?.off('syncRequested', onSyncRequested);
-      coordinator?.off('conflictResolutionRequested', onConflictResolutionRequested);
       coordinator?.off('statusChanged', onStatusChanged);
       coordinator?.off('configurationChanged', onConfigurationChanged);
       coordinator?.off('windowsChanged', onWindowsChanged);
@@ -384,7 +309,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await coordinator.start();
   await updateWindowState();
   if (coordinator.isLeader) await startLeaderSchedules();
-  if (await engine.pendingConflictView()) void notifyPendingConflict();
+  renderStatusBar();
 }
 
 export async function deactivate(): Promise<void> {

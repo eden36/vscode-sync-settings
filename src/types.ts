@@ -9,14 +9,21 @@ export type SyncPhase =
   | '正在同步扩展'
   | '等待其他窗口关闭'
   | '等待 AI'
-  | '存在冲突'
   | '失败';
 
 export interface SyncOutcome {
   ok: boolean;
   retry?: boolean;
-  blockedByConflict?: boolean;
   extensionsPending?: string[];
+  structuralApplied?: boolean;
+}
+
+/** 一轮自动合并的结果，仅用于状态提示，不参与后续判定。 */
+export interface MergeReport {
+  conflicts: string[];
+  aiMerged: string[];
+  autoMerged: string[];
+  aiError?: string;
 }
 
 export interface SyncConfiguration {
@@ -67,7 +74,7 @@ export const DEFAULT_CONFIGURATION: PluginConfiguration = {
   gitUserName: '',
   gitUserEmail: '',
   autoSync: true,
-  pollIntervalSeconds: 600,
-  debounceSeconds: 60,
+  pollIntervalSeconds: 300,
+  debounceSeconds: 10,
   includeProfileAssociations: false,
 };

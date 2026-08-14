@@ -1,46 +1,33 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { parse, ParseError } from 'jsonc-parser';
 import { AiService, stripJsonFence } from './ai';
-import { ConflictStrategy, PendingConflictView } from './conflict-types';
 import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { HostEnvironment } from './host';
-import { atomicWriteJson, readJsonFile } from './json-store';
 import { ProfileAdapter } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
 import { fallbackCommitMessage } from './sync-fallback';
 import { collectExtensionIdsFromFiles, waitForExtensions } from './extension-wait';
 import {
   classifyThreeWay,
-  detectSnapshotConflicts,
   emptyManifest,
   readManifest,
+  resolveConflictFallback,
   snapshotStructure,
   SnapshotStructure,
 } from './snapshot-conflict';
-import { RuntimeStatus, SnapshotManifest, SyncOutcome } from './types';
+import { MergeReport, RuntimeStatus, SnapshotManifest, SyncOutcome } from './types';
 
-interface PendingProfileConflict {
-  schemaVersion: 1;
-  id: string;
-  createdAt: string;
-  repositoryUrl: string;
-  branch: string;
-  remoteHead?: string;
-  localFingerprint: string;
-  conflicts: string[];
-  hasBase: boolean;
-  aiCandidateReady?: boolean;
-  aiError?: string;
-}
+// 冲突备份保留份数：既能回溯最近几次自动合并，又不会让运行目录无限增长。
+const MAX_CONFLICT_BACKUPS = 5;
+const STRUCTURE_LABEL = 'Profile 结构和关联关系';
 
 export class SyncEngine {
   private running = false;
-  private readonly pendingConflictPath: string;
-  private readonly pendingConflictRoot: string;
+  private readonly conflictBackupRoot: string;
 
   public constructor(
     private readonly environment: HostEnvironment,
@@ -51,26 +38,11 @@ export class SyncEngine {
     private readonly updateStatus: (patch: Partial<RuntimeStatus>) => void,
     private readonly windowSafety: () => Promise<WindowSafetySnapshot>,
   ) {
-    this.pendingConflictPath = path.join(environment.runtimePath, 'pending-profile-conflict.json');
-    this.pendingConflictRoot = path.join(environment.runtimePath, 'pending-profile-conflict');
+    // 与 ProfileAdapter 的 backups 目录分开存放，避免被那边的保留策略清理。
+    this.conflictBackupRoot = path.join(environment.runtimePath, 'conflict-backups');
   }
 
-  public async pendingConflictView(): Promise<PendingConflictView | undefined> {
-    const conflict = await this.readPendingConflict();
-    if (!conflict) return undefined;
-    return {
-      id: conflict.id,
-      title: conflict.aiCandidateReady ? 'AI 已生成合并方案' : '发现配置冲突，已暂停同步',
-      description: conflict.aiCandidateReady
-        ? `AI 已合并 ${conflict.conflicts.length} 项冲突并通过检查。确认后将同时更新本机和云端。`
-        : '云端和本机包含不同修改。请选择要保留的版本，处理前不会覆盖任何一方。',
-      items: conflict.conflicts,
-      aiCandidateReady: conflict.aiCandidateReady === true,
-      ...(conflict.aiError ? { aiError: conflict.aiError } : {}),
-    };
-  }
-
-  public async synchronize(allowStructural = false): Promise<SyncOutcome | undefined> {
+  public async synchronize(): Promise<SyncOutcome | undefined> {
     if (this.running) return undefined;
     this.running = true;
     const configuration = this.configurationStore.get();
@@ -78,11 +50,8 @@ export class SyncEngine {
     let recoveredPendingChanges = false;
     let recoveredFromDivergence = false;
     let temporaryRoot: string | undefined;
+    let merge: MergeReport | undefined;
     try {
-      if (await this.readPendingConflict()) {
-        this.updateStatus({ phase: '存在冲突', message: '云端和本机配置存在冲突，请在同步状态中选择处理方式。' });
-        return { ok: false, blockedByConflict: true };
-      }
       if (!configuration.repositoryUrl) {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
         return { ok: false };
@@ -116,21 +85,10 @@ export class SyncEngine {
 
       let mergedRoot = localHostRoot;
       if (remoteExists) {
-        const conflicts = await detectSnapshotConflicts(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, this.environment.kind);
-        if (conflicts.length) {
-          await this.persistProfileConflict(
-            baseExists ? baseHostRoot : undefined,
-            localHostRoot,
-            repositoryHostRoot,
-            conflicts,
-            configuration.repositoryUrl,
-            configuration.branch,
-          );
-          this.updateStatus({ phase: '存在冲突', message: `发现 ${conflicts.length} 项配置冲突，已暂停同步。` });
-          return { ok: false, blockedByConflict: true };
-        }
         const merged = path.join(temporaryRoot, 'merged');
-        await this.mergeSnapshots(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, merged, false);
+        merge = await this.mergeSnapshots(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, merged);
+        // 自动合并会覆盖某一方的内容，先留存两份原始快照，用户事后仍可人工找回。
+        if (merge.conflicts.length) await this.backupConflictSnapshots(localHostRoot, repositoryHostRoot);
         mergedRoot = merged;
       }
 
@@ -164,7 +122,8 @@ export class SyncEngine {
 
       const safety = await this.ensureWindowSafety();
       if (!safety) return { ok: false, retry: true };
-      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, allowStructural && safety.activeWindows <= 1);
+      // Profile 增删会重建磁盘上的 Profile 列表，只在本机仅剩一个窗口时应用，避免影响其他窗口正在使用的 Profile。
+      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, safety.activeWindows <= 1);
       let extensionsPending: string[] | undefined;
       const extensionFiles = restore.changedFiles.filter((file) => path.basename(file) === 'extensions.json');
       if (extensionFiles.length) {
@@ -177,23 +136,23 @@ export class SyncEngine {
           extensionsPending = extensionResult.pending;
         }
       }
-      if (restore.structuralChange) {
-        this.updateStatus({ phase: '等待其他窗口关闭', activeWindows: safety.activeWindows, message: restore.message });
-      }
+      const waitingForWindows = restore.structuralChange && !restore.structuralApplied;
       this.updateStatus({
-        phase: restore.structuralChange ? '等待其他窗口关闭' : '空闲',
+        phase: waitingForWindows ? '等待其他窗口关闭' : '空闲',
+        activeWindows: safety.activeWindows,
         pendingChanges: 0,
         lastSyncAt: new Date().toISOString(),
-        message: finalSyncMessage(
-          restore.message,
-          changed.length > 0,
+        message: finalSyncMessage({
+          structuralMessage: restore.message,
+          changed: changed.length > 0,
           usedAiFallback,
           recoveredPendingChanges,
           recoveredFromDivergence,
-          extensionsPending
-        )
+          extensionsPending,
+          merge,
+        })
       });
-      return { ok: true, extensionsPending };
+      return { ok: true, extensionsPending, structuralApplied: restore.structuralApplied };
     } catch (error) {
       this.updateStatus({ phase: '失败', message: error instanceof Error ? error.message : String(error) });
       return { ok: false };
@@ -205,129 +164,17 @@ export class SyncEngine {
     }
   }
 
-  public async prepareConflictAiCandidate(id: string): Promise<void> {
-    const conflict = await this.requireCurrentConflict(id);
-    const roots = this.conflictRoots(conflict.id);
-    this.updateStatus({ phase: '等待 AI', message: `正在合并 ${conflict.conflicts.length} 项冲突…` });
-    try {
-      await fs.rm(roots.candidate, { recursive: true, force: true });
-      await this.mergeSnapshots(conflict.hasBase ? roots.base : undefined, roots.local, roots.cloud, roots.candidate, true);
-      const manifest = await readManifest(roots.candidate);
-      const secrets = await findPotentialSecrets(roots.candidate, manifest);
-      if (secrets.length) throw new Error(`AI 合并结果可能包含凭据：${secrets.join('、')}`);
-      conflict.aiCandidateReady = true;
-      delete conflict.aiError;
-      await atomicWriteJson(this.pendingConflictPath, conflict);
-      this.updateStatus({ phase: '存在冲突', message: 'AI 已生成合并方案，请确认后应用。' });
-    } catch (error) {
-      conflict.aiCandidateReady = false;
-      conflict.aiError = safeErrorMessage(error);
-      await atomicWriteJson(this.pendingConflictPath, conflict);
-      this.updateStatus({ phase: '存在冲突', message: `AI 合并失败：${conflict.aiError}` });
-      throw error;
-    }
-  }
-
-  public async resolvePendingConflict(id: string, strategy: ConflictStrategy): Promise<void> {
-    const conflict = await this.requireCurrentConflict(id);
-    if (strategy === 'ai' && !conflict.aiCandidateReady) throw new Error('AI 尚未生成可应用的合并方案。');
-    const safety = await this.windowSafety();
-    if (safety.dirtyWindows > 0 || safety.unreadableWindows > 0) throw new Error('存在未保存或状态无法确认的窗口，暂时无法应用冲突选择。');
-    if (safety.activeWindows > 1) throw new Error('请关闭其他 IDE 窗口后再应用冲突选择。');
-
-    const roots = this.conflictRoots(conflict.id);
-    const selected = strategy === 'cloud' ? roots.cloud : strategy === 'local' ? roots.local : roots.candidate;
-    const configuration = this.configurationStore.get();
-    const repositoryHostRoot = path.join(this.git.repositoryPath, '.profile-git-sync', 'hosts', this.environment.kind);
-    if (strategy !== 'cloud') {
-      await fs.rm(repositoryHostRoot, { recursive: true, force: true });
-      await fs.mkdir(path.dirname(repositoryHostRoot), { recursive: true });
-      await fs.cp(selected, repositoryHostRoot, { recursive: true });
-      const changed = await this.git.stageHost(this.environment.kind);
-      if (changed.length) await this.git.commitAndPush(configuration, fallbackCommitMessage(this.environment.kind));
-    }
-    if (strategy !== 'local') await this.adapter.restoreSnapshot(selected, true);
-    await this.clearPendingConflict(conflict.id);
-    this.updateStatus({
-      phase: '空闲',
-      pendingChanges: 0,
-      lastSyncAt: new Date().toISOString(),
-      message: strategy === 'cloud' ? '已使用云端完整版本。' : strategy === 'local' ? '已使用本机完整版本。' : '已应用 AI 合并结果。',
-    });
-  }
-
-  private async persistProfileConflict(
-    baseRoot: string | undefined,
-    localRoot: string,
-    cloudRoot: string,
-    conflicts: string[],
-    repositoryUrl: string,
-    branch: string,
-  ): Promise<void> {
-    const id = randomUUID();
-    const roots = this.conflictRoots(id);
-    await fs.rm(this.pendingConflictRoot, { recursive: true, force: true });
-    await fs.mkdir(roots.root, { recursive: true });
+  private async backupConflictSnapshots(localRoot: string, cloudRoot: string): Promise<void> {
+    const target = path.join(this.conflictBackupRoot, new Date().toISOString().replaceAll(':', '-'));
+    await fs.mkdir(target, { recursive: true });
     await Promise.all([
-      fs.cp(localRoot, roots.local, { recursive: true }),
-      fs.cp(cloudRoot, roots.cloud, { recursive: true }),
-      ...(baseRoot ? [fs.cp(baseRoot, roots.base, { recursive: true })] : []),
+      fs.cp(localRoot, path.join(target, 'local'), { recursive: true }),
+      fs.cp(cloudRoot, path.join(target, 'cloud'), { recursive: true }),
     ]);
-    const conflict: PendingProfileConflict = {
-      schemaVersion: 1,
-      id,
-      createdAt: new Date().toISOString(),
-      repositoryUrl,
-      branch,
-      remoteHead: await this.git.head(),
-      localFingerprint: await this.adapter.fingerprint(),
-      conflicts,
-      hasBase: baseRoot !== undefined,
-    };
-    await atomicWriteJson(this.pendingConflictPath, conflict);
-  }
-
-  private async requireCurrentConflict(id: string): Promise<PendingProfileConflict> {
-    const conflict = await this.readPendingConflict();
-    if (!conflict || conflict.id !== id) throw new Error('待处理的配置冲突已不存在。');
-    const configuration = this.configurationStore.get();
-    if (configuration.repositoryUrl !== conflict.repositoryUrl || configuration.branch !== conflict.branch) {
-      await this.clearPendingConflict(conflict.id);
-      throw new Error('同步仓库设置已变化，请重新同步并检测冲突。');
+    const entries = (await fs.readdir(this.conflictBackupRoot).catch(() => [] as string[])).sort();
+    for (const name of entries.slice(0, Math.max(0, entries.length - MAX_CONFLICT_BACKUPS))) {
+      await fs.rm(path.join(this.conflictBackupRoot, name), { recursive: true, force: true }).catch(() => undefined);
     }
-    if (await this.adapter.fingerprint() !== conflict.localFingerprint) {
-      await this.clearPendingConflict(conflict.id);
-      throw new Error('本机配置已变化，请重新同步并检测冲突。');
-    }
-    await this.git.prepare(configuration);
-    await this.git.pull(configuration);
-    if (await this.git.head() !== conflict.remoteHead) {
-      await this.clearPendingConflict(conflict.id);
-      throw new Error('云端配置已变化，请重新同步并检测冲突。');
-    }
-    return conflict;
-  }
-
-  private async readPendingConflict(): Promise<PendingProfileConflict | undefined> {
-    return parsePendingProfileConflict(await readJsonFile(this.pendingConflictPath));
-  }
-
-  private conflictRoots(id: string) {
-    const root = path.join(this.pendingConflictRoot, id);
-    return {
-      root,
-      base: path.join(root, 'base'),
-      local: path.join(root, 'local'),
-      cloud: path.join(root, 'cloud'),
-      candidate: path.join(root, 'candidate'),
-    };
-  }
-
-  private async clearPendingConflict(id: string): Promise<void> {
-    await Promise.all([
-      fs.rm(this.pendingConflictPath, { force: true }),
-      fs.rm(path.join(this.pendingConflictRoot, id), { recursive: true, force: true }),
-    ]);
   }
 
   private async ensureWindowSafety(): Promise<WindowSafetySnapshot | undefined> {
@@ -351,40 +198,48 @@ export class SyncEngine {
     return safety;
   }
 
+  /** 冲突一律自动收敛：优先 AI 合并，AI 不可用或结果无效时按确定性规则择一，绝不中断同步。 */
   private async mergeSnapshots(
     baseRoot: string | undefined,
-    oursRoot: string,
-    theirsRoot: string,
+    localRoot: string,
+    cloudRoot: string,
     outputRoot: string,
-    useAi: boolean,
-  ): Promise<void> {
+  ): Promise<MergeReport> {
     const base = baseRoot ? await readManifest(baseRoot) : emptyManifest(this.environment.kind);
-    const ours = await readManifest(oursRoot);
-    const theirs = await readManifest(theirsRoot);
-    const files = new Set([...Object.keys(base.files), ...Object.keys(ours.files), ...Object.keys(theirs.files)]);
+    const local = await readManifest(localRoot);
+    const cloud = await readManifest(cloudRoot);
+    const files = new Set([...Object.keys(base.files), ...Object.keys(local.files), ...Object.keys(cloud.files)]);
     const outputFiles: Record<string, string> = {};
+    const report: MergeReport = { conflicts: [], aiMerged: [], autoMerged: [] };
+    let aiAvailable = true;
     await fs.rm(outputRoot, { recursive: true, force: true });
     await fs.mkdir(outputRoot, { recursive: true });
 
     for (const relative of files) {
-      const oursHash = ours.files[relative];
-      const theirsHash = theirs.files[relative];
-      const choice = classifyThreeWay(base.files[relative], oursHash, theirsHash);
+      const localHash = local.files[relative];
+      const cloudHash = cloud.files[relative];
+      const choice = classifyThreeWay(base.files[relative], localHash, cloudHash);
       let sourceRoot: string | undefined;
       let mergedContent: Buffer | undefined;
-      if (choice === 'cloud') sourceRoot = theirsHash ? theirsRoot : undefined;
-      else if (choice === 'local') sourceRoot = oursHash ? oursRoot : undefined;
+      if (choice === 'cloud') sourceRoot = cloudHash ? cloudRoot : undefined;
+      else if (choice === 'local') sourceRoot = localHash ? localRoot : undefined;
       else {
-        if (!useAi) throw new Error(`尚未处理配置冲突：${relative}`);
-        const [baseText, oursText, theirsText] = await Promise.all([
-          readOptionalText(baseRoot, relative),
-          readOptionalText(oursRoot, relative),
-          readOptionalText(theirsRoot, relative)
-        ]);
-        if ([baseText, oursText, theirsText].some(containsPotentialSecret)) throw new Error(`冲突文件可能包含凭据，无法交给 AI：${relative}`);
-        const candidate = await this.ai.resolveConflict(relative, baseText, oursText, theirsText);
-        validateCandidate(relative, candidate);
-        mergedContent = Buffer.from(candidate, 'utf8');
+        report.conflicts.push(relative);
+        if (aiAvailable) {
+          this.updateStatus({ phase: '等待 AI', message: `正在自动合并：${relative}` });
+          try {
+            mergedContent = await this.aiMergeFile(baseRoot, localRoot, cloudRoot, relative);
+            report.aiMerged.push(relative);
+          } catch (error) {
+            // 模型不可用、无授权或超时属于整轮同步的共性问题，一次失败后不再让后续文件重复等待。
+            aiAvailable = false;
+            report.aiError ??= safeErrorMessage(error);
+          }
+        }
+        if (!mergedContent) {
+          sourceRoot = resolveConflictFallback(localHash, cloudHash) === 'local' ? localRoot : cloudRoot;
+          report.autoMerged.push(relative);
+        }
       }
       if (!sourceRoot && !mergedContent) continue;
       const content = mergedContent ?? await fs.readFile(resolveSnapshotPath(sourceRoot!, relative));
@@ -394,7 +249,7 @@ export class SyncEngine {
       outputFiles[relative] = sha256(content);
     }
 
-    const structure = await mergeProfileStructure(this.ai, base, ours, theirs, useAi);
+    const structure = await this.mergeStructure(base, local, cloud, aiAvailable, report);
     const manifest: SnapshotManifest = {
       schemaVersion: 1,
       host: this.environment.kind,
@@ -405,6 +260,54 @@ export class SyncEngine {
       files: outputFiles
     };
     await fs.writeFile(path.join(outputRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    return report;
+  }
+
+  private async aiMergeFile(baseRoot: string | undefined, localRoot: string, cloudRoot: string, relative: string): Promise<Buffer> {
+    const [baseText, localText, cloudText] = await Promise.all([
+      readOptionalText(baseRoot, relative),
+      readOptionalText(localRoot, relative),
+      readOptionalText(cloudRoot, relative)
+    ]);
+    if ([baseText, localText, cloudText].some(containsPotentialSecret)) throw new Error(`冲突文件可能包含凭据，无法交给 AI：${relative}`);
+    const candidate = await this.ai.resolveConflict(relative, baseText, localText, cloudText);
+    validateCandidate(relative, candidate);
+    return Buffer.from(candidate, 'utf8');
+  }
+
+  private async mergeStructure(
+    base: SnapshotManifest,
+    local: SnapshotManifest,
+    cloud: SnapshotManifest,
+    aiAvailable: boolean,
+    report: MergeReport,
+  ): Promise<SnapshotStructure> {
+    const baseStructure = snapshotStructure(base);
+    const localStructure = snapshotStructure(local);
+    const cloudStructure = snapshotStructure(cloud);
+    const texts = [baseStructure, localStructure, cloudStructure].map((value) => JSON.stringify(value, null, 2));
+    const choice = classifyThreeWay(
+      JSON.stringify(baseStructure),
+      JSON.stringify(localStructure),
+      JSON.stringify(cloudStructure),
+    );
+    if (choice === 'cloud') return cloudStructure;
+    if (choice === 'local') return localStructure;
+    report.conflicts.push(STRUCTURE_LABEL);
+    if (aiAvailable && !texts.some(containsPotentialSecret)) {
+      try {
+        this.updateStatus({ phase: '等待 AI', message: `正在自动合并：${STRUCTURE_LABEL}` });
+        const candidate = stripJsonFence(await this.ai.resolveConflict(STRUCTURE_LABEL, texts[0]!, texts[1]!, texts[2]!));
+        validateCandidate('profile-structure.json', candidate);
+        report.aiMerged.push(STRUCTURE_LABEL);
+        return parseProfileStructure(JSON.parse(candidate) as unknown);
+      } catch (error) {
+        report.aiError ??= safeErrorMessage(error);
+      }
+    }
+    // 结构冲突回退到本机：宁可保留多余的 Profile，也不删除本机正在使用的 Profile。
+    report.autoMerged.push(STRUCTURE_LABEL);
+    return localStructure;
   }
 }
 
@@ -429,31 +332,6 @@ function validateCandidate(relative: string, content: string): void {
     parse(content, errors, { allowTrailingComma: true, disallowComments: false });
     if (errors.length) throw new Error(`AI 为 ${relative} 生成的 JSON/JSONC 无法解析。`);
   }
-}
-
-async function mergeProfileStructure(
-  ai: AiService,
-  base: SnapshotManifest,
-  local: SnapshotManifest,
-  cloud: SnapshotManifest,
-  useAi: boolean,
-): Promise<SnapshotStructure> {
-  const baseStructure = snapshotStructure(base);
-  const localStructure = snapshotStructure(local);
-  const cloudStructure = snapshotStructure(cloud);
-  const choice = classifyThreeWay(
-    JSON.stringify(baseStructure),
-    JSON.stringify(localStructure),
-    JSON.stringify(cloudStructure),
-  );
-  if (choice === 'cloud') return cloudStructure;
-  if (choice === 'local') return localStructure;
-  if (!useAi) throw new Error('尚未处理 Profile 结构和关联关系冲突。');
-  const texts = [baseStructure, localStructure, cloudStructure].map((value) => JSON.stringify(value, null, 2));
-  if (texts.some(containsPotentialSecret)) throw new Error('Profile 结构可能包含凭据，无法交给 AI。');
-  const candidate = stripJsonFence(await ai.resolveConflict('Profile 结构和关联关系', texts[0]!, texts[1]!, texts[2]!));
-  validateCandidate('profile-structure.json', candidate);
-  return parseProfileStructure(JSON.parse(candidate) as unknown);
 }
 
 /** AI 返回的结构会直接写入 storage.json，必须逐项校验，避免破坏本机 Profile 存储。 */
@@ -499,42 +377,42 @@ function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
-function finalSyncMessage(
-  structuralMessage: string | undefined,
-  changed: boolean,
-  usedAiFallback: boolean,
-  recoveredPendingChanges: boolean,
-  recoveredFromDivergence: boolean,
-  extensionsPending?: string[]
-): string {
-  if (structuralMessage) return structuralMessage;
-  if (!changed) {
-    if (recoveredFromDivergence) return '已重新对齐上次未推送成功的提交，配置已是最新。';
-    return recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
-  }
+interface SyncMessageDetails {
+  structuralMessage?: string;
+  changed: boolean;
+  usedAiFallback: boolean;
+  recoveredPendingChanges: boolean;
+  recoveredFromDivergence: boolean;
+  extensionsPending?: string[];
+  merge?: MergeReport;
+}
+
+export function finalSyncMessage(details: SyncMessageDetails): string {
   const notes: string[] = [];
-  if (usedAiFallback) notes.push('AI 不可用或结果无效，已使用兜底策略');
-  if (recoveredPendingChanges) notes.push('已清理上次中断的暂存状态');
-  if (recoveredFromDivergence) notes.push('已重新对齐上次未推送成功的提交');
-  if (extensionsPending?.length) {
-    notes.push(`部分扩展尚未安装完成：${extensionsPending.join('、')}`);
+  const merge = details.merge;
+  if (merge?.conflicts.length) {
+    if (merge.aiMerged.length) notes.push(`AI 已自动合并 ${merge.aiMerged.length} 项冲突`);
+    if (merge.autoMerged.length) notes.push(`${merge.autoMerged.length} 项冲突按本机优先自动处理`);
+    notes.push('冲突前的两份配置已备份到扩展运行目录');
+  }
+  if (details.structuralMessage) {
+    return `${[details.structuralMessage.replace(/。$/, ''), ...notes].join('；')}。`;
+  }
+  if (!details.changed && !notes.length) {
+    if (details.recoveredFromDivergence) return '已重新对齐上次未推送成功的提交，配置已是最新。';
+    return details.recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
+  }
+  if (details.usedAiFallback) notes.push('AI 不可用或结果无效，已使用兜底策略');
+  if (details.recoveredPendingChanges) notes.push('已清理上次中断的暂存状态');
+  if (details.recoveredFromDivergence) notes.push('已重新对齐上次未推送成功的提交');
+  if (details.extensionsPending?.length) {
+    notes.push(`部分扩展尚未安装完成：${details.extensionsPending.join('、')}`);
   }
   return notes.length ? `同步完成（${notes.join('；')}）。` : '同步完成。';
 }
 
 async function exists(filePath: string): Promise<boolean> {
   return fs.access(filePath).then(() => true, () => false);
-}
-
-function parsePendingProfileConflict(value: unknown): PendingProfileConflict | undefined {
-  if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.id !== 'string') return undefined;
-  if (typeof value.createdAt !== 'string' || typeof value.repositoryUrl !== 'string' || typeof value.branch !== 'string') return undefined;
-  if (value.remoteHead !== undefined && typeof value.remoteHead !== 'string') return undefined;
-  if (typeof value.localFingerprint !== 'string' || typeof value.hasBase !== 'boolean') return undefined;
-  if (!Array.isArray(value.conflicts) || !value.conflicts.every((item) => typeof item === 'string')) return undefined;
-  if (value.aiCandidateReady !== undefined && typeof value.aiCandidateReady !== 'boolean') return undefined;
-  if (value.aiError !== undefined && typeof value.aiError !== 'string') return undefined;
-  return value as unknown as PendingProfileConflict;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

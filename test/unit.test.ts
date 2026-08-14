@@ -14,7 +14,7 @@ import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
 import { containsPotentialSecret } from '../src/secret-scanner';
 import { atomicWriteJson, readJsonFile } from '../src/json-store';
-import { classifyThreeWay, detectSnapshotConflicts } from '../src/snapshot-conflict';
+import { classifyThreeWay, resolveConflictFallback } from '../src/snapshot-conflict';
 import {
   compareConfigurationRecords,
   createConfigurationRecord,
@@ -24,7 +24,8 @@ import {
   resolveRepositoryUrl,
 } from '../src/configuration-record';
 import { parseExtensionIds } from '../src/extension-manifest';
-import { displaySyncPhase, formatRelativeSyncTime } from '../src/sidebar-status';
+import { displaySyncPhase, formatRelativeSyncTime, isBusyPhase } from '../src/sidebar-status';
+import { finalSyncMessage } from '../src/sync-engine';
 import { DEFAULT_CONFIGURATION, PluginConfiguration, SyncConfiguration } from '../src/types';
 import { resetApplicationSettings } from './vscode-stub';
 
@@ -231,40 +232,12 @@ test('leader 切换后仍会恢复未完成的同步请求', async () => {
     const follower = first.isLeader ? second : first;
     let leaderRequests = 0;
     let followerRequests = 0;
-    let structuralRequestPreserved = false;
-    leader.on('syncRequested', (allowStructural) => {
-      leaderRequests += 1;
-      structuralRequestPreserved ||= allowStructural === true;
-    });
-    follower.on('syncRequested', (allowStructural) => {
-      followerRequests += 1;
-      structuralRequestPreserved ||= allowStructural === true;
-    });
-    await follower.requestSync(true);
+    leader.on('syncRequested', () => { leaderRequests += 1; });
+    follower.on('syncRequested', () => { followerRequests += 1; });
+    await follower.requestSync();
     await waitFor(() => leaderRequests > 0);
     await leader.dispose();
     await waitFor(() => follower.isLeader && followerRequests > 0);
-    assert.equal(structuralRequestPreserved, true);
-  } finally {
-    await Promise.all([first.dispose(), second.dispose()]);
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('follower 的冲突选择会转交给 leader', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-conflict-request-'));
-  const first = new MultiWindowCoordinator(root, { heartbeatMs: 10, leaseTtlMs: 100 });
-  const second = new MultiWindowCoordinator(root, { heartbeatMs: 10, leaseTtlMs: 100 });
-  try {
-    await Promise.all([first.start(), second.start()]);
-    const leader = first.isLeader ? first : second;
-    const follower = first.isLeader ? second : first;
-    let received: { id: string; strategy: string; applyAi: boolean } | undefined;
-    leader.on('conflictResolutionRequested', (request) => { received = request; });
-    await follower.requestConflictResolution('conflict-1', 'cloud', false);
-    await waitFor(() => received !== undefined);
-    assert.deepEqual(received, { id: 'conflict-1', strategy: 'cloud', applyAi: false });
-    await leader.completeSyncRequests();
   } finally {
     await Promise.all([first.dispose(), second.dispose()]);
     await rm(root, { recursive: true, force: true });
@@ -425,33 +398,50 @@ test('AI 不可用时仍可生成稳定的提交信息', () => {
   assert.equal(fallbackCommitMessage('cursor'), 'chore(sync): 同步 Cursor 配置');
 });
 
-test('快照冲突检测覆盖文件修改、删除和 Profile 结构', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-conflict-detection-'));
-  const base = path.join(root, 'base');
-  const local = path.join(root, 'local');
-  const cloud = path.join(root, 'cloud');
-  try {
-    await Promise.all([mkdir(base), mkdir(local), mkdir(cloud)]);
-    const manifest = (profiles: string[], files: Record<string, string>) => ({
-      schemaVersion: 1,
-      host: 'vscode',
-      createdAt: '',
-      profiles: profiles.map((id) => ({ id, name: id, isDefault: id === 'default' })),
-      files,
-    });
-    await Promise.all([
-      writeFile(path.join(base, 'manifest.json'), JSON.stringify(manifest(['default'], { 'profiles/default/settings.json': 'base', 'profiles/default/keybindings.json': 'base' }))),
-      writeFile(path.join(local, 'manifest.json'), JSON.stringify(manifest(['default', 'local'], { 'profiles/default/settings.json': 'local' }))),
-      writeFile(path.join(cloud, 'manifest.json'), JSON.stringify(manifest(['default', 'cloud'], { 'profiles/default/settings.json': 'cloud', 'profiles/default/keybindings.json': 'cloud' }))),
-    ]);
-    assert.deepEqual(await detectSnapshotConflicts(base, local, cloud, 'vscode'), [
-      'profiles/default/settings.json',
-      'profiles/default/keybindings.json',
-      'Profile 结构和关联关系',
-    ]);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+test('冲突回退按本机优先并保证收敛到实际存在的一方', () => {
+  assert.equal(resolveConflictFallback('local', 'cloud'), 'local');
+  assert.equal(resolveConflictFallback(undefined, 'cloud'), 'cloud');
+  assert.equal(resolveConflictFallback('local', undefined), 'local');
+  assert.throws(() => resolveConflictFallback(undefined, undefined), /无法自动合并/);
+});
+
+test('自动合并后的状态文案说明处理方式并提示备份', () => {
+  assert.equal(
+    finalSyncMessage({
+      changed: true,
+      usedAiFallback: false,
+      recoveredPendingChanges: false,
+      recoveredFromDivergence: false,
+      merge: { conflicts: ['a', 'b'], aiMerged: ['a'], autoMerged: ['b'] },
+    }),
+    '同步完成（AI 已自动合并 1 项冲突；1 项冲突按本机优先自动处理；冲突前的两份配置已备份到扩展运行目录）。',
+  );
+  assert.equal(
+    finalSyncMessage({
+      changed: false,
+      usedAiFallback: false,
+      recoveredPendingChanges: false,
+      recoveredFromDivergence: false,
+    }),
+    '配置已是最新。',
+  );
+  assert.equal(
+    finalSyncMessage({
+      structuralMessage: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
+      changed: true,
+      usedAiFallback: false,
+      recoveredPendingChanges: false,
+      recoveredFromDivergence: false,
+    }),
+    '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
+  );
+});
+
+test('状态栏只在同步执行阶段显示忙碌', () => {
+  assert.equal(isBusyPhase('正在拉取'), true);
+  assert.equal(isBusyPhase('等待 AI'), true);
+  assert.equal(isBusyPhase('空闲'), false);
+  assert.equal(isBusyPhase('等待其他窗口关闭'), false);
 });
 
 test('凭据扫描覆盖常见键名与 token 值', () => {

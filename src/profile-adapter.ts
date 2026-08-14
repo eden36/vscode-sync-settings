@@ -26,6 +26,7 @@ interface StorageFile {
 export interface RestoreResult {
   changedFiles: string[];
   structuralChange: boolean;
+  structuralApplied: boolean;
   message?: string;
 }
 
@@ -134,7 +135,12 @@ export class ProfileAdapter {
     const remoteIds = new Set(manifest.profiles.map((profile) => profile.id));
     const structuralChange = !setsEqual(localIds, remoteIds);
     if (structuralChange && !allowStructural) {
-      return { changedFiles: [], structuralChange, message: '远程包含 Profile 增删，请关闭其他窗口后安全应用。' };
+      return {
+        changedFiles: [],
+        structuralChange,
+        structuralApplied: false,
+        message: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
+      };
     }
 
     if (structuralChange) {
@@ -191,7 +197,7 @@ export class ProfileAdapter {
       changedFiles.push(target);
     }
     await pruneBackups(backupsRoot);
-    return { changedFiles, structuralChange };
+    return { changedFiles, structuralChange, structuralApplied: structuralChange };
   }
 
   private async restoreProfileStructure(manifest: SnapshotManifest): Promise<void> {

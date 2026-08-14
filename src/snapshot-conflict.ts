@@ -20,6 +20,16 @@ export function classifyThreeWay(base: string | undefined, local: string | undef
   return 'conflict';
 }
 
+/**
+ * AI 合并不可用时的确定性回退：本机版本存在就保留本机，否则采用云端，
+ * 保证任一冲突都能收敛到实际存在的一份内容。
+ */
+export function resolveConflictFallback(local: string | undefined, cloud: string | undefined): 'local' | 'cloud' {
+  if (local !== undefined) return 'local';
+  if (cloud !== undefined) return 'cloud';
+  throw new Error('冲突双方均不存在内容，无法自动合并。');
+}
+
 export function snapshotStructure(manifest: SnapshotManifest): SnapshotStructure {
   return {
     profiles: manifest.profiles,
@@ -34,28 +44,4 @@ export function emptyManifest(host: HostKind): SnapshotManifest {
 
 export async function readManifest(root: string): Promise<SnapshotManifest> {
   return JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as SnapshotManifest;
-}
-
-export async function detectSnapshotConflicts(
-  baseRoot: string | undefined,
-  localRoot: string,
-  cloudRoot: string,
-  host: HostKind,
-): Promise<string[]> {
-  const base = baseRoot ? await readManifest(baseRoot) : emptyManifest(host);
-  const local = await readManifest(localRoot);
-  const cloud = await readManifest(cloudRoot);
-  const conflicts: string[] = [];
-  for (const relative of new Set([...Object.keys(base.files), ...Object.keys(local.files), ...Object.keys(cloud.files)])) {
-    if (classifyThreeWay(base.files[relative], local.files[relative], cloud.files[relative]) === 'conflict') {
-      conflicts.push(relative);
-    }
-  }
-  const structure = classifyThreeWay(
-    JSON.stringify(snapshotStructure(base)),
-    JSON.stringify(snapshotStructure(local)),
-    JSON.stringify(snapshotStructure(cloud)),
-  );
-  if (structure === 'conflict') conflicts.push('Profile 结构和关联关系');
-  return conflicts;
 }

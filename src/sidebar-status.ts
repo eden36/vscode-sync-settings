@@ -5,6 +5,11 @@ export function displaySyncPhase(phase: SyncPhase, lastSyncAt: string | undefine
   return phase;
 }
 
+/** 状态栏据此决定是否显示旋转图标。 */
+export function isBusyPhase(phase: SyncPhase): boolean {
+  return ['正在扫描', '正在拉取', '正在提交', '正在推送', '正在同步扩展', '等待 AI'].includes(phase);
+}
+
 export function formatRelativeSyncTime(value: string, now = Date.now()): string {
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) return '时间无效';

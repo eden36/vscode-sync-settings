@@ -2,7 +2,7 @@
   "name": "my-setting-sync",
   "displayName": "My Setting Sync",
   "description": "在 VS Code 与 Cursor 中通过 Git 自动同步全部用户配置文件。",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "publisher": "saltcoreyan",
   "license": "MIT",
   "icon": "media/profile-git-sync.png",
@@ -32,10 +32,6 @@
       {
         "command": "profileGitSync.openSettings",
         "title": "My Setting Sync: 打开设置"
-      },
-      {
-        "command": "profileGitSync.applyPending",
-        "title": "My Setting Sync: 应用待处理的远程配置"
       }
     ],
     "viewsContainers": {
@@ -70,7 +66,7 @@
           "type": "number",
           "scope": "application",
           "ignoreSync": true,
-          "default": 600,
+          "default": 300,
           "minimum": 30,
           "description": "远程仓库轮询间隔（秒）。"
         },
@@ -78,7 +74,7 @@
           "type": "number",
           "scope": "application",
           "ignoreSync": true,
-          "default": 60,
+          "default": 10,
           "minimum": 5,
           "description": "本机配置变化合并等待时间（秒）。"
         },
