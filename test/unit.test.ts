@@ -25,7 +25,7 @@ import {
 } from '../src/configuration-record';
 import { parseExtensionIds } from '../src/extension-manifest';
 import { displaySyncPhase, formatRelativeSyncTime, isBusyPhase } from '../src/sidebar-status';
-import { finalSyncMessage } from '../src/sync-engine';
+import { decideCloudAdopt, finalSyncMessage } from '../src/sync-engine';
 import { DEFAULT_CONFIGURATION, PluginConfiguration, SyncConfiguration } from '../src/types';
 import { resetApplicationSettings } from './vscode-stub';
 
@@ -296,6 +296,90 @@ test('按 location 枚举命名 Profile，并恢复文件修改和删除', async
   }
 });
 
+test('结构变化且不允许应用时默认不写回任何文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-blocked-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const namedPath = path.join(userDataPath, 'profiles', 'abc123');
+  await Promise.all([mkdir(runtimePath, { recursive: true }), mkdir(namedPath, { recursive: true })]);
+  await writeFile(path.join(userDataPath, 'globalStorage', 'storage.json'), JSON.stringify({
+    userDataProfiles: [{ location: 'abc123', name: '开发' }]
+  }));
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 15}');
+  await writeFile(path.join(namedPath, 'settings.json'), '{"editor.fontSize": 16}');
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    await adapter.createSnapshot(snapshot);
+    await writeFile(path.join(userDataPath, 'globalStorage', 'storage.json'), JSON.stringify({
+      userDataProfiles: [
+        { location: 'abc123', name: '开发' },
+        { location: 'extra456', name: '额外' },
+      ]
+    }));
+    await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 99}');
+    const restored = await adapter.restoreSnapshot(snapshot, false);
+    assert.equal(restored.structuralChange, true);
+    assert.equal(restored.structuralApplied, false);
+    assert.equal(restored.changedFiles.length, 0);
+    assert.equal(await readFile(path.join(userDataPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 99}');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('结构变化被窗口拦住时仍可覆盖共有 Profile 的文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-matching-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const namedPath = path.join(userDataPath, 'profiles', 'abc123');
+  const extraPath = path.join(userDataPath, 'profiles', 'extra456');
+  await Promise.all([
+    mkdir(runtimePath, { recursive: true }),
+    mkdir(namedPath, { recursive: true }),
+    mkdir(extraPath, { recursive: true }),
+  ]);
+  await writeFile(path.join(userDataPath, 'globalStorage', 'storage.json'), JSON.stringify({
+    userDataProfiles: [{ location: 'abc123', name: '开发' }]
+  }));
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 15}');
+  await writeFile(path.join(namedPath, 'settings.json'), '{"editor.fontSize": 16}');
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    await adapter.createSnapshot(snapshot);
+    await writeFile(path.join(userDataPath, 'globalStorage', 'storage.json'), JSON.stringify({
+      userDataProfiles: [
+        { location: 'abc123', name: '开发' },
+        { location: 'extra456', name: '额外' },
+      ]
+    }));
+    await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 99}');
+    await writeFile(path.join(namedPath, 'settings.json'), '{"editor.fontSize": 99}');
+    await writeFile(path.join(extraPath, 'settings.json'), '{"editor.fontSize": 42}');
+    const restored = await adapter.restoreSnapshot(snapshot, false, true);
+    assert.equal(restored.structuralChange, true);
+    assert.equal(restored.structuralApplied, false);
+    assert.equal(await readFile(path.join(userDataPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 15}');
+    assert.equal(await readFile(path.join(namedPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 16}');
+    assert.equal(await readFile(path.join(extraPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 42}');
+    const storage = JSON.parse(await readFile(path.join(userDataPath, 'globalStorage', 'storage.json'), 'utf8')) as {
+      userDataProfiles: Array<{ location: string }>;
+    };
+    assert.deepEqual(storage.userDataProfiles.map((profile) => profile.location), ['abc123', 'extra456']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('强制采用云端时缺快照不得回退为本机推送', () => {
+  assert.equal(decideCloudAdopt(true, 'synced', true), 'adopt');
+  assert.equal(decideCloudAdopt(true, 'cloned', false), 'missing-cloud');
+  assert.equal(decideCloudAdopt(false, 'cloned', true), 'adopt');
+  assert.equal(decideCloudAdopt(false, 'cloned', false), 'seed-local');
+  assert.equal(decideCloudAdopt(false, 'synced', true), 'merge');
+});
+
 test('Git 服务通过普通快进推送同步宿主目录', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-git-'));
   const remote = path.join(root, 'remote.git');
@@ -437,7 +521,7 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
   );
 });
 
-test('首次接入的状态文案说明已采用云端并提示备份', () => {
+test('首次接入的状态文案说明已按云端覆盖并提示备份', () => {
   assert.equal(
     finalSyncMessage({
       changed: false,
@@ -446,7 +530,18 @@ test('首次接入的状态文案说明已采用云端并提示备份', () => {
       recoveredFromDivergence: false,
       adoptedCloud: true,
     }),
-    '同步完成（本机首次接入，已采用云端配置；本机原配置已备份到扩展运行目录）。',
+    '同步完成（已按云端配置覆盖本机；本机原配置已备份到扩展运行目录）。',
+  );
+  assert.equal(
+    finalSyncMessage({
+      structuralMessage: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。',
+      changed: false,
+      usedAiFallback: false,
+      recoveredPendingChanges: false,
+      recoveredFromDivergence: false,
+      adoptedCloud: true,
+    }),
+    '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用；已按云端配置覆盖本机；本机原配置已备份到扩展运行目录。',
   );
 });
 

@@ -101,7 +101,7 @@ button.secondary{background:var(--vscode-button-secondaryBackground);color:var(-
 <label class="check-label" for="includeProfileAssociations"><input id="includeProfileAssociations" type="checkbox">同步工作区与 Profile 关联关系</label>
 <div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div>
 <button id="save">保存</button><button id="sync" class="secondary">立即同步</button><button id="rebuild" class="secondary">重建本地仓库</button>
-<p class="muted">配置变化会自动同步，冲突优先交给 AI 合并，AI 不可用时按本机优先自动处理，合并前的两份配置保留在扩展运行目录的 conflict-backups 中。本机首次接入时直接采用云端配置，原有配置会先备份。若提示本地仓库与远端不同源，点击「重建本地仓库」重新克隆即可。Profile 增删在只剩一个窗口时自动应用并重载。配置同步仓库位于扩展全局存储中，不会操作当前项目的 Git 仓库。</p>
+<p class="muted">配置变化会自动同步，冲突优先交给 AI 合并，AI 不可用时按本机优先自动处理，合并前的两份配置保留在扩展运行目录的 conflict-backups 中。本机首次接入或点击「重建本地仓库」时以云端配置覆盖本机，本轮不会把本机配置推到云端，原有配置会先备份。若提示本地仓库与远端不同源，点击「重建本地仓库」重新克隆即可。Profile 增删在只剩一个窗口时自动应用并重载。配置同步仓库位于扩展全局存储中，不会操作当前项目的 Git 仓库。</p>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];let lastSyncAt;
 document.getElementById('save').onclick=()=>{const configuration={};for(const id of ids)configuration[id]=document.getElementById(id).value;const automation={autoSync:document.getElementById('autoSync').checked,includeProfileAssociations:document.getElementById('includeProfileAssociations').checked,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};vscode.postMessage({type:'save',configuration,automation})};

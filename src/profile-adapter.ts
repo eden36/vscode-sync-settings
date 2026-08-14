@@ -123,7 +123,7 @@ export class ProfileAdapter {
     return manifest;
   }
 
-  public async restoreSnapshot(hostRoot: string, allowStructural: boolean): Promise<RestoreResult> {
+  public async restoreSnapshot(hostRoot: string, allowStructural: boolean, applyMatchingFiles = false): Promise<RestoreResult> {
     const manifestPath = path.join(hostRoot, 'manifest.json');
     const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as SnapshotManifest;
     if (manifest.schemaVersion !== 1 || manifest.host !== this.environment.kind) {
@@ -134,7 +134,7 @@ export class ProfileAdapter {
     const localIds = new Set(localProfiles.map((profile) => profile.id));
     const remoteIds = new Set(manifest.profiles.map((profile) => profile.id));
     const structuralChange = !setsEqual(localIds, remoteIds);
-    if (structuralChange && !allowStructural) {
+    if (structuralChange && !allowStructural && !applyMatchingFiles) {
       return {
         changedFiles: [],
         structuralChange,
@@ -143,16 +143,21 @@ export class ProfileAdapter {
       };
     }
 
-    if (structuralChange) {
+    const applyStructure = structuralChange && allowStructural;
+    if (applyStructure) {
       await this.restoreProfileStructure(manifest);
     }
 
-    const refreshedProfiles = structuralChange ? await this.listProfiles() : localProfiles;
-    const localById = new Map(refreshedProfiles.map((profile) => [profile.id, profile]));
+    const refreshedProfiles = applyStructure ? await this.listProfiles() : localProfiles;
+    // 多窗口无法增删 Profile 时只动共有 Profile，避免随后合并把本机旧文件推回云端。
+    const targetProfiles = structuralChange && !allowStructural
+      ? refreshedProfiles.filter((profile) => remoteIds.has(profile.id))
+      : refreshedProfiles;
+    const localById = new Map(targetProfiles.map((profile) => [profile.id, profile]));
     const changedFiles: string[] = [];
     const backupsRoot = path.join(this.environment.runtimePath, 'backups');
     const backupRoot = path.join(backupsRoot, new Date().toISOString().replaceAll(':', '-'));
-    for (const profile of refreshedProfiles) {
+    for (const profile of targetProfiles) {
       for (const resource of FILE_RESOURCES) {
         const relative = `profiles/${profile.id}/${resource}`;
         const target = path.join(profile.location, resource);
@@ -197,7 +202,14 @@ export class ProfileAdapter {
       changedFiles.push(target);
     }
     await pruneBackups(backupsRoot);
-    return { changedFiles, structuralChange, structuralApplied: structuralChange };
+    return {
+      changedFiles,
+      structuralChange,
+      structuralApplied: applyStructure,
+      ...(structuralChange && !applyStructure
+        ? { message: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。' }
+        : {}),
+    };
   }
 
   private async restoreProfileStructure(manifest: SnapshotManifest): Promise<void> {

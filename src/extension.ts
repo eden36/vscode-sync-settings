@@ -110,7 +110,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, delayMs);
   };
 
-  const synchronize = async (): Promise<SyncOutcome | undefined> => {
+  const synchronize = async (options: { adoptCloud?: boolean } = {}): Promise<SyncOutcome | undefined> => {
     if (!coordinator!.isLeader) {
       await coordinator!.requestSync();
       applyStatus({ role: 'follower', message: '同步请求已发送给 leader 窗口。' }, false);
@@ -130,7 +130,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         completed = false;
         let outcome: SyncOutcome | undefined;
         const acquired = await coordinator!.runExclusive(async () => {
-          outcome = await engine.synchronize();
+          outcome = await engine.synchronize(options);
           localFingerprint = await adapter.fingerprint();
         });
         if (!acquired) {
@@ -158,7 +158,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
-  // 本地仓库只是缓存，与远端不同源时无法安全合并，删除后会按首次接入重新克隆并采用云端配置。
+  // 本地仓库只是缓存；删除后带标记同步，强制按云端覆盖本机且本轮不推送。
   const rebuildRepository = async () => {
     if (!coordinator!.isLeader) {
       applyStatus({ role: 'follower', message: '请在 leader 窗口执行重建本地仓库。' }, false);
@@ -166,19 +166,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     const confirmed = await vscode.window.showWarningMessage(
       '重建本地配置同步仓库？',
-      { modal: true, detail: '将删除扩展全局存储中的本地仓库缓存并重新从远端克隆，随后以云端配置为准覆盖本机配置，本机原配置会备份到扩展运行目录。' },
+      { modal: true, detail: '将删除本地仓库缓存并重新从远端克隆，随后以云端配置覆盖本机，本轮不会把本机配置推到云端。本机原配置会备份到扩展运行目录。若存在 Profile 增删，需只剩一个窗口才能完整应用。' },
       '重建',
     );
     if (confirmed !== '重建') return;
     const acquired = await coordinator!.runExclusive(async () => {
+      await engine.beginCloudAdopt();
       await configurationRepository.removeRepository();
     });
     if (!acquired) {
       applyStatus({ message: '另一窗口正在执行同步，请稍后重试重建。' }, false);
       return;
     }
-    applyStatus({ phase: '空闲', message: '本地仓库已删除，正在重新克隆。' }, false);
-    await synchronize();
+    applyStatus({ phase: '空闲', message: '本地仓库已删除，正在按云端配置覆盖本机。' }, false);
+    await synchronize({ adoptCloud: true });
   };
 
   const clearLeaderSchedules = () => {
@@ -305,9 +306,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const onConfigurationChanged = () => void refreshConfiguration();
   const onWindowsChanged = (safety: WindowSafetySnapshot) => {
     applyStatus({ activeWindows: safety.activeWindows }, coordinator!.isLeader);
-    if (safety.dirtyWindows === 0 && safety.unreadableWindows === 0 && retryWhenSafe && coordinator!.isLeader) {
+    if (!coordinator!.isLeader) return;
+    if (safety.dirtyWindows === 0 && safety.unreadableWindows === 0 && retryWhenSafe) {
       void synchronize();
+      return;
     }
+    if (safety.activeWindows <= 1 && status.phase === '等待其他窗口关闭') void synchronize();
   };
   const onCoordinationError = (error: Error) => applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false);
 

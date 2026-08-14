@@ -5,7 +5,7 @@ import { parse, ParseError } from 'jsonc-parser';
 import { AiService, stripJsonFence } from './ai';
 import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
-import { ConfigurationRepositoryGitService } from './git-service';
+import { ConfigurationRepositoryGitService, PullState } from './git-service';
 import { HostEnvironment } from './host';
 import { ProfileAdapter, RestoreResult } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
@@ -24,6 +24,20 @@ import { MergeReport, RuntimeStatus, SnapshotManifest, SyncOutcome } from './typ
 // 冲突备份保留份数：既能回溯最近几次自动合并，又不会让运行目录无限增长。
 const MAX_CONFLICT_BACKUPS = 5;
 const STRUCTURE_LABEL = 'Profile 结构和关联关系';
+const PENDING_CLOUD_ADOPT_FILE = 'pending-cloud-adopt';
+
+export interface SynchronizeOptions {
+  adoptCloud?: boolean;
+}
+
+export type CloudAdoptDecision = 'adopt' | 'seed-local' | 'merge' | 'missing-cloud';
+
+/** 重建或首次接入必须整包采用云端；缺云端快照时禁止把本机推上去。 */
+export function decideCloudAdopt(adoptCloud: boolean, pullState: PullState, remoteExists: boolean): CloudAdoptDecision {
+  if (adoptCloud) return remoteExists ? 'adopt' : 'missing-cloud';
+  if (pullState === 'cloned') return remoteExists ? 'adopt' : 'seed-local';
+  return 'merge';
+}
 
 interface LocalApplyResult {
   safety: WindowSafetySnapshot;
@@ -48,7 +62,11 @@ export class SyncEngine {
     this.conflictBackupRoot = path.join(environment.runtimePath, 'conflict-backups');
   }
 
-  public async synchronize(): Promise<SyncOutcome | undefined> {
+  public async beginCloudAdopt(): Promise<void> {
+    await fs.writeFile(this.pendingCloudAdoptPath(), '');
+  }
+
+  public async synchronize(options: SynchronizeOptions = {}): Promise<SyncOutcome | undefined> {
     if (this.running) return undefined;
     this.running = true;
     const configuration = this.configurationStore.get();
@@ -62,7 +80,10 @@ export class SyncEngine {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
         return { ok: false };
       }
+      if (options.adoptCloud) await this.beginCloudAdopt();
       if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
+
+      const adoptCloud = options.adoptCloud === true || await this.hasPendingCloudAdopt();
 
       this.updateStatus({ phase: '正在扫描', message: undefined });
       // 同步在独占锁内执行，进程异常退出残留的临时快照可以安全清空。
@@ -71,9 +92,11 @@ export class SyncEngine {
       temporaryRoot = path.join(snapshotRoot, `local-${process.pid}-${Date.now()}`);
       const localHostRoot = path.join(temporaryRoot, this.environment.kind);
       const localManifest = await this.adapter.createSnapshot(localHostRoot, configuration.includeProfileAssociations);
-      const secretFiles = await findPotentialSecrets(localHostRoot, localManifest);
-      if (secretFiles.length) {
-        throw new Error(`检测到可能包含凭据的配置，已拒绝提交：${secretFiles.join('、')}`);
+      if (!adoptCloud) {
+        const secretFiles = await findPotentialSecrets(localHostRoot, localManifest);
+        if (secretFiles.length) {
+          throw new Error(`检测到可能包含凭据的配置，已拒绝提交：${secretFiles.join('、')}`);
+        }
       }
 
       await this.git.prepare(configuration);
@@ -95,15 +118,25 @@ export class SyncEngine {
       if (pull.mergeBase) await this.git.exportHostTree(pull.mergeBase, this.environment.kind, baseHostRoot);
       const remoteExists = await exists(path.join(repositoryHostRoot, 'manifest.json'));
       const baseExists = await exists(path.join(baseHostRoot, 'manifest.json'));
+      const cloudAdopt = decideCloudAdopt(adoptCloud, pull.state, remoteExists);
 
-      // 本机首次接入时与云端不存在共同同步点，三方合并没有可信基准，会把本机旧配置当成新改动推上去。
-      // 此处直接采纳云端并备份本机原配置，本轮不写入远端，从下一轮起才进入正常合并。
-      if (pull.state === 'cloned' && remoteExists) {
+      if (cloudAdopt === 'missing-cloud') {
+        await this.clearPendingCloudAdopt();
+        const hostLabel = this.environment.kind === 'cursor' ? 'Cursor' : 'VS Code';
+        throw new Error(`云端没有 ${hostLabel} 的配置快照，无法覆盖本机。本机配置未被推送。如需用本机初始化该宿主，请使用立即同步。`);
+      }
+
+      // 首次接入或重建后没有可信合并基准，必须整包采用云端，本轮不写入远端。
+      if (cloudAdopt === 'adopt') {
+        await this.beginCloudAdopt();
         await this.backupConflictSnapshots(localHostRoot, repositoryHostRoot);
-        const applied = await this.applyToLocal(repositoryHostRoot);
+        const applied = await this.applyToLocal(repositoryHostRoot, true);
         if (!applied) return { ok: false, retry: true };
+        const waitingForWindows = applied.restore.structuralChange && !applied.restore.structuralApplied;
+        if (waitingForWindows) await this.beginCloudAdopt();
+        else await this.clearPendingCloudAdopt();
         this.updateStatus({
-          phase: applied.restore.structuralChange && !applied.restore.structuralApplied ? '等待其他窗口关闭' : '空闲',
+          phase: waitingForWindows ? '等待其他窗口关闭' : '空闲',
           activeWindows: applied.safety.activeWindows,
           pendingChanges: 0,
           lastSyncAt: new Date().toISOString(),
@@ -188,11 +221,11 @@ export class SyncEngine {
   }
 
   /** 把仓库中的快照写回本机并等待扩展安装；窗口不安全时返回 undefined，由调用方安排重试。 */
-  private async applyToLocal(hostRoot: string): Promise<LocalApplyResult | undefined> {
+  private async applyToLocal(hostRoot: string, applyMatchingFiles = false): Promise<LocalApplyResult | undefined> {
     const safety = await this.ensureWindowSafety();
     if (!safety) return undefined;
     // Profile 增删会重建磁盘上的 Profile 列表，只在本机仅剩一个窗口时应用，避免影响其他窗口正在使用的 Profile。
-    const restore = await this.adapter.restoreSnapshot(hostRoot, safety.activeWindows <= 1);
+    const restore = await this.adapter.restoreSnapshot(hostRoot, safety.activeWindows <= 1, applyMatchingFiles);
     let extensionsPending: string[] | undefined;
     const extensionFiles = restore.changedFiles.filter((file) => path.basename(file) === 'extensions.json');
     if (extensionFiles.length) {
@@ -206,6 +239,18 @@ export class SyncEngine {
       }
     }
     return { safety, restore, extensionsPending };
+  }
+
+  private pendingCloudAdoptPath(): string {
+    return path.join(this.environment.runtimePath, PENDING_CLOUD_ADOPT_FILE);
+  }
+
+  private async hasPendingCloudAdopt(): Promise<boolean> {
+    return exists(this.pendingCloudAdoptPath());
+  }
+
+  private async clearPendingCloudAdopt(): Promise<void> {
+    await fs.rm(this.pendingCloudAdoptPath(), { force: true });
   }
 
   private async backupConflictSnapshots(localRoot: string, cloudRoot: string): Promise<void> {
@@ -436,7 +481,7 @@ export function finalSyncMessage(details: SyncMessageDetails): string {
   const notes: string[] = [];
   const merge = details.merge;
   if (details.adoptedCloud) {
-    notes.push('本机首次接入，已采用云端配置', '本机原配置已备份到扩展运行目录');
+    notes.push('已按云端配置覆盖本机', '本机原配置已备份到扩展运行目录');
   }
   if (merge?.conflicts.length) {
     if (merge.aiMerged.length) notes.push(`AI 已自动合并 ${merge.aiMerged.length} 项冲突`);
