@@ -7,7 +7,7 @@ import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { HostEnvironment } from './host';
-import { ProfileAdapter } from './profile-adapter';
+import { ProfileAdapter, RestoreResult } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
 import { fallbackCommitMessage } from './sync-fallback';
 import { collectExtensionIdsFromFiles, waitForExtensions } from './extension-wait';
@@ -24,6 +24,12 @@ import { MergeReport, RuntimeStatus, SnapshotManifest, SyncOutcome } from './typ
 // 冲突备份保留份数：既能回溯最近几次自动合并，又不会让运行目录无限增长。
 const MAX_CONFLICT_BACKUPS = 5;
 const STRUCTURE_LABEL = 'Profile 结构和关联关系';
+
+interface LocalApplyResult {
+  safety: WindowSafetySnapshot;
+  restore: RestoreResult;
+  extensionsPending?: string[];
+}
 
 export class SyncEngine {
   private running = false;
@@ -77,11 +83,42 @@ export class SyncEngine {
 
       this.updateStatus({ phase: '正在拉取' });
       const pull = await this.git.pull(configuration);
+      if (pull.state === 'unrelated') {
+        this.updateStatus({
+          phase: '失败',
+          message: '本地配置同步仓库与远端仓库不同源，已停止同步，避免覆盖云端配置。请在侧边栏点击「重建本地仓库」后重试。',
+        });
+        return { ok: false };
+      }
       recoveredFromDivergence = pull.recoveredFromDivergence;
       // 基准必须取本地与远端的共同祖先，否则本机上次的改动会被当成共同基础，导致误判冲突。
       if (pull.mergeBase) await this.git.exportHostTree(pull.mergeBase, this.environment.kind, baseHostRoot);
       const remoteExists = await exists(path.join(repositoryHostRoot, 'manifest.json'));
       const baseExists = await exists(path.join(baseHostRoot, 'manifest.json'));
+
+      // 本机首次接入时与云端不存在共同同步点，三方合并没有可信基准，会把本机旧配置当成新改动推上去。
+      // 此处直接采纳云端并备份本机原配置，本轮不写入远端，从下一轮起才进入正常合并。
+      if (pull.state === 'cloned' && remoteExists) {
+        await this.backupConflictSnapshots(localHostRoot, repositoryHostRoot);
+        const applied = await this.applyToLocal(repositoryHostRoot);
+        if (!applied) return { ok: false, retry: true };
+        this.updateStatus({
+          phase: applied.restore.structuralChange && !applied.restore.structuralApplied ? '等待其他窗口关闭' : '空闲',
+          activeWindows: applied.safety.activeWindows,
+          pendingChanges: 0,
+          lastSyncAt: new Date().toISOString(),
+          message: finalSyncMessage({
+            structuralMessage: applied.restore.message,
+            changed: false,
+            usedAiFallback: false,
+            recoveredPendingChanges,
+            recoveredFromDivergence,
+            adoptedCloud: true,
+            extensionsPending: applied.extensionsPending,
+          })
+        });
+        return { ok: true, extensionsPending: applied.extensionsPending, structuralApplied: applied.restore.structuralApplied };
+      }
 
       let mergedRoot = localHostRoot;
       if (remoteExists) {
@@ -120,39 +157,25 @@ export class SyncEngine {
         await this.git.pushIfAhead(configuration);
       }
 
-      const safety = await this.ensureWindowSafety();
-      if (!safety) return { ok: false, retry: true };
-      // Profile 增删会重建磁盘上的 Profile 列表，只在本机仅剩一个窗口时应用，避免影响其他窗口正在使用的 Profile。
-      const restore = await this.adapter.restoreSnapshot(repositoryHostRoot, safety.activeWindows <= 1);
-      let extensionsPending: string[] | undefined;
-      const extensionFiles = restore.changedFiles.filter((file) => path.basename(file) === 'extensions.json');
-      if (extensionFiles.length) {
-        const targetIds = await collectExtensionIdsFromFiles(extensionFiles);
-        this.updateStatus({ phase: '正在同步扩展', message: '等待 IDE 安装扩展…' });
-        const extensionResult = await waitForExtensions(targetIds, {
-          onProgress: (message) => this.updateStatus({ phase: '正在同步扩展', message })
-        });
-        if (!extensionResult.converged) {
-          extensionsPending = extensionResult.pending;
-        }
-      }
-      const waitingForWindows = restore.structuralChange && !restore.structuralApplied;
+      const applied = await this.applyToLocal(repositoryHostRoot);
+      if (!applied) return { ok: false, retry: true };
+      const waitingForWindows = applied.restore.structuralChange && !applied.restore.structuralApplied;
       this.updateStatus({
         phase: waitingForWindows ? '等待其他窗口关闭' : '空闲',
-        activeWindows: safety.activeWindows,
+        activeWindows: applied.safety.activeWindows,
         pendingChanges: 0,
         lastSyncAt: new Date().toISOString(),
         message: finalSyncMessage({
-          structuralMessage: restore.message,
+          structuralMessage: applied.restore.message,
           changed: changed.length > 0,
           usedAiFallback,
           recoveredPendingChanges,
           recoveredFromDivergence,
-          extensionsPending,
+          extensionsPending: applied.extensionsPending,
           merge,
         })
       });
-      return { ok: true, extensionsPending, structuralApplied: restore.structuralApplied };
+      return { ok: true, extensionsPending: applied.extensionsPending, structuralApplied: applied.restore.structuralApplied };
     } catch (error) {
       this.updateStatus({ phase: '失败', message: error instanceof Error ? error.message : String(error) });
       return { ok: false };
@@ -162,6 +185,27 @@ export class SyncEngine {
         await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
       }
     }
+  }
+
+  /** 把仓库中的快照写回本机并等待扩展安装；窗口不安全时返回 undefined，由调用方安排重试。 */
+  private async applyToLocal(hostRoot: string): Promise<LocalApplyResult | undefined> {
+    const safety = await this.ensureWindowSafety();
+    if (!safety) return undefined;
+    // Profile 增删会重建磁盘上的 Profile 列表，只在本机仅剩一个窗口时应用，避免影响其他窗口正在使用的 Profile。
+    const restore = await this.adapter.restoreSnapshot(hostRoot, safety.activeWindows <= 1);
+    let extensionsPending: string[] | undefined;
+    const extensionFiles = restore.changedFiles.filter((file) => path.basename(file) === 'extensions.json');
+    if (extensionFiles.length) {
+      const targetIds = await collectExtensionIdsFromFiles(extensionFiles);
+      this.updateStatus({ phase: '正在同步扩展', message: '等待 IDE 安装扩展…' });
+      const extensionResult = await waitForExtensions(targetIds, {
+        onProgress: (message) => this.updateStatus({ phase: '正在同步扩展', message })
+      });
+      if (!extensionResult.converged) {
+        extensionsPending = extensionResult.pending;
+      }
+    }
+    return { safety, restore, extensionsPending };
   }
 
   private async backupConflictSnapshots(localRoot: string, cloudRoot: string): Promise<void> {
@@ -383,6 +427,7 @@ interface SyncMessageDetails {
   usedAiFallback: boolean;
   recoveredPendingChanges: boolean;
   recoveredFromDivergence: boolean;
+  adoptedCloud?: boolean;
   extensionsPending?: string[];
   merge?: MergeReport;
 }
@@ -390,6 +435,9 @@ interface SyncMessageDetails {
 export function finalSyncMessage(details: SyncMessageDetails): string {
   const notes: string[] = [];
   const merge = details.merge;
+  if (details.adoptedCloud) {
+    notes.push('本机首次接入，已采用云端配置', '本机原配置已备份到扩展运行目录');
+  }
   if (merge?.conflicts.length) {
     if (merge.aiMerged.length) notes.push(`AI 已自动合并 ${merge.aiMerged.length} 项冲突`);
     if (merge.autoMerged.length) notes.push(`${merge.autoMerged.length} 项冲突按本机优先自动处理`);

@@ -15,7 +15,8 @@ interface AutomationSettings {
 type IncomingMessage =
   | { type: 'ready' }
   | { type: 'save'; configuration: SyncConfiguration; automation: AutomationSettings }
-  | { type: 'sync' };
+  | { type: 'sync' }
+  | { type: 'rebuild' };
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -25,6 +26,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     private readonly status: () => RuntimeStatus,
     private readonly onSync: () => Promise<void>,
     private readonly onConfigurationSaved: () => Promise<void>,
+    private readonly onRebuild: () => Promise<void>,
   ) {}
 
   public resolveWebviewView(view: vscode.WebviewView): void {
@@ -48,6 +50,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           await this.configurationStore.save({ ...message.configuration, ...message.automation });
           await this.onConfigurationSaved();
           await this.pushState();
+        } else if (message.type === 'rebuild') {
+          await this.onRebuild();
         } else {
           await this.onSync();
         }
@@ -96,12 +100,13 @@ button.secondary{background:var(--vscode-button-secondaryBackground);color:var(-
 <label class="check-label" for="autoSync"><input id="autoSync" type="checkbox">启用自动同步</label>
 <label class="check-label" for="includeProfileAssociations"><input id="includeProfileAssociations" type="checkbox">同步工作区与 Profile 关联关系</label>
 <div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div>
-<button id="save">保存</button><button id="sync" class="secondary">立即同步</button>
-<p class="muted">配置变化会自动同步，冲突优先交给 AI 合并，AI 不可用时按本机优先自动处理，合并前的两份配置保留在扩展运行目录的 conflict-backups 中。Profile 增删在只剩一个窗口时自动应用并重载。配置同步仓库位于扩展全局存储中，不会操作当前项目的 Git 仓库。</p>
+<button id="save">保存</button><button id="sync" class="secondary">立即同步</button><button id="rebuild" class="secondary">重建本地仓库</button>
+<p class="muted">配置变化会自动同步，冲突优先交给 AI 合并，AI 不可用时按本机优先自动处理，合并前的两份配置保留在扩展运行目录的 conflict-backups 中。本机首次接入时直接采用云端配置，原有配置会先备份。若提示本地仓库与远端不同源，点击「重建本地仓库」重新克隆即可。Profile 增删在只剩一个窗口时自动应用并重载。配置同步仓库位于扩展全局存储中，不会操作当前项目的 Git 仓库。</p>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];let lastSyncAt;
 document.getElementById('save').onclick=()=>{const configuration={};for(const id of ids)configuration[id]=document.getElementById(id).value;const automation={autoSync:document.getElementById('autoSync').checked,includeProfileAssociations:document.getElementById('includeProfileAssociations').checked,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};vscode.postMessage({type:'save',configuration,automation})};
 document.getElementById('sync').onclick=()=>vscode.postMessage({type:'sync'});
+document.getElementById('rebuild').onclick=()=>vscode.postMessage({type:'rebuild'});
 addEventListener('message',({data})=>{if(data.type!=='state')return;for(const id of ids)document.getElementById(id).value=data.configuration[id]??'';document.getElementById('autoSync').checked=data.configuration.autoSync;document.getElementById('includeProfileAssociations').checked=data.configuration.includeProfileAssociations;document.getElementById('debounceSeconds').value=String(data.configuration.debounceSeconds);document.getElementById('pollIntervalSeconds').value=String(data.configuration.pollIntervalSeconds);const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;document.getElementById('detail').textContent='窗口 '+s.activeWindows+' · Profiles '+s.profiles.join('、')+(s.message?' · '+s.message:'');document.getElementById('syncPhase').textContent=s.displayPhase;const dot=document.getElementById('syncDot');dot.className='dot '+syncClass(s.displayPhase);lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
 vscode.postMessage({type:'ready'});
 setInterval(renderLastSyncAt,60_000);
@@ -117,6 +122,7 @@ function parseMessage(raw: unknown): IncomingMessage | undefined {
   const value = raw as Record<string, unknown>;
   if (value.type === 'ready') return { type: 'ready' };
   if (value.type === 'sync') return { type: 'sync' };
+  if (value.type === 'rebuild') return { type: 'rebuild' };
   if (value.type !== 'save' || !value.configuration || typeof value.configuration !== 'object' || !value.automation || typeof value.automation !== 'object') return undefined;
   const configuration = value.configuration as Record<string, unknown>;
   const strings = ['repositoryUrl', 'branch', 'gitUserName', 'gitUserEmail'];

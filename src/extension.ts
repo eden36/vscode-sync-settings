@@ -158,6 +158,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  // 本地仓库只是缓存，与远端不同源时无法安全合并，删除后会按首次接入重新克隆并采用云端配置。
+  const rebuildRepository = async () => {
+    if (!coordinator!.isLeader) {
+      applyStatus({ role: 'follower', message: '请在 leader 窗口执行重建本地仓库。' }, false);
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      '重建本地配置同步仓库？',
+      { modal: true, detail: '将删除扩展全局存储中的本地仓库缓存并重新从远端克隆，随后以云端配置为准覆盖本机配置，本机原配置会备份到扩展运行目录。' },
+      '重建',
+    );
+    if (confirmed !== '重建') return;
+    const acquired = await coordinator!.runExclusive(async () => {
+      await configurationRepository.removeRepository();
+    });
+    if (!acquired) {
+      applyStatus({ message: '另一窗口正在执行同步，请稍后重试重建。' }, false);
+      return;
+    }
+    applyStatus({ phase: '空闲', message: '本地仓库已删除，正在重新克隆。' }, false);
+    await synchronize();
+  };
+
   const clearLeaderSchedules = () => {
     scheduleGeneration += 1;
     leaderSchedulesReady = false;
@@ -234,6 +257,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => status,
     async () => { await synchronize(); },
     async () => coordinator!.notifyConfigurationChanged(),
+    rebuildRepository,
   );
 
   const refreshDirtyDocuments = async () => {
@@ -249,6 +273,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     statusBar,
     vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar),
     vscode.commands.registerCommand('profileGitSync.syncNow', () => void synchronize()),
+    vscode.commands.registerCommand('profileGitSync.rebuildRepository', () => void rebuildRepository()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration('profileGitSync')) return;

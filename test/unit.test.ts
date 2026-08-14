@@ -437,6 +437,19 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
   );
 });
 
+test('首次接入的状态文案说明已采用云端并提示备份', () => {
+  assert.equal(
+    finalSyncMessage({
+      changed: false,
+      usedAiFallback: false,
+      recoveredPendingChanges: false,
+      recoveredFromDivergence: false,
+      adoptedCloud: true,
+    }),
+    '同步完成（本机首次接入，已采用云端配置；本机原配置已备份到扩展运行目录）。',
+  );
+});
+
 test('状态栏只在同步执行阶段显示忙碌', () => {
   assert.equal(isBusyPhase('正在拉取'), true);
   assert.equal(isBusyPhase('等待 AI'), true);
@@ -694,6 +707,97 @@ test('推送失败留下的本地提交会被重新对齐并保留共同基准',
     await writeFile(manifestPath(second), '{"schemaVersion":1,"files":{"a":"merged"}}');
     await second.stageHost('vscode');
     await second.commitAndPush(configuration, 'chore(sync): 合并结果');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('本地没有历史时拉取判定为首次克隆且没有共同基准', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-clone-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const first = new ConfigurationRepositoryGitService(path.join(root, 'first'));
+    await first.prepare(configuration);
+    const manifestPath = path.join(first.repositoryPath, '.profile-git-sync', 'hosts', 'vscode', 'manifest.json');
+    await mkdir(path.dirname(manifestPath), { recursive: true });
+    await writeFile(manifestPath, '{"schemaVersion":1,"files":{"a":"cloud"}}');
+    await first.stageHost('vscode');
+    await first.commitAndPush(configuration, 'chore(sync): 初始配置');
+
+    // 远端分支还不存在时不能算首次克隆，否则本机第一次推送会被当成采纳云端。
+    const empty = new ConfigurationRepositoryGitService(path.join(root, 'empty'));
+    await empty.prepare({ ...configuration, branch: 'other' });
+    assert.equal((await empty.pull({ ...configuration, branch: 'other' })).state, 'synced');
+
+    const second = new ConfigurationRepositoryGitService(path.join(root, 'second'));
+    await second.prepare(configuration);
+    const pull = await second.pull(configuration);
+    assert.equal(pull.state, 'cloned');
+    assert.equal(pull.mergeBase, undefined);
+    assert.equal(
+      await readFile(path.join(second.repositoryPath, '.profile-git-sync', 'hosts', 'vscode', 'manifest.json'), 'utf8'),
+      '{"schemaVersion":1,"files":{"a":"cloud"}}',
+    );
+
+    // 克隆完成后再次拉取即视为同源，从这一轮起才允许三方合并。
+    assert.equal((await second.pull(configuration)).state, 'synced');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('本地仓库与远端没有共同祖先时拒绝合并且不改写本地历史', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-unrelated-'));
+  const remote = path.join(root, 'remote.git');
+  const other = path.join(root, 'other.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    assert.equal((await runProcess('git', ['init', '--bare', other])).exitCode, 0);
+    const manifestPath = (service: ConfigurationRepositoryGitService) => path.join(
+      service.repositoryPath, '.profile-git-sync', 'hosts', 'vscode', 'manifest.json'
+    );
+
+    const cloud = new ConfigurationRepositoryGitService(path.join(root, 'cloud'));
+    await cloud.prepare(configuration);
+    await mkdir(path.dirname(manifestPath(cloud)), { recursive: true });
+    await writeFile(manifestPath(cloud), '{"schemaVersion":1,"files":{"a":"cloud"}}');
+    await cloud.stageHost('vscode');
+    await cloud.commitAndPush(configuration, 'chore(sync): 云端配置');
+
+    // 本机曾经同步到另一个仓库，改仓库地址后两边历史互不相关。
+    const local = new ConfigurationRepositoryGitService(path.join(root, 'local'));
+    await local.prepare({ ...configuration, repositoryUrl: other });
+    await mkdir(path.dirname(manifestPath(local)), { recursive: true });
+    await writeFile(manifestPath(local), '{"schemaVersion":1,"files":{"a":"local"}}');
+    await local.stageHost('vscode');
+    await local.commitAndPush({ ...configuration, repositoryUrl: other }, 'chore(sync): 本机配置');
+    const head = await local.head();
+
+    await local.prepare(configuration);
+    const pull = await local.pull(configuration);
+    assert.equal(pull.state, 'unrelated');
+    assert.equal(pull.mergeBase, undefined);
+    assert.equal(await local.head(), head);
+    assert.equal(await readFile(manifestPath(local), 'utf8'), '{"schemaVersion":1,"files":{"a":"local"}}');
+
+    // 重建后按首次接入处理，本机内容不会再被推到云端。
+    await local.removeRepository();
+    await local.prepare(configuration);
+    assert.equal((await local.pull(configuration)).state, 'cloned');
+    assert.equal(await readFile(manifestPath(local), 'utf8'), '{"schemaVersion":1,"files":{"a":"cloud"}}');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
