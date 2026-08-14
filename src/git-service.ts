@@ -1,7 +1,14 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { runProcess } from './process';
+import { runProcess, runProcessBinary } from './process';
 import { SyncConfiguration } from './types';
+
+export interface PullResult {
+  /** 本地与远端的共同祖先，作为三方合并的基准；无共同历史时为 undefined。 */
+  mergeBase?: string;
+  /** 本地未推送提交与远端冲突，已丢弃本地提交并改由快照三方合并恢复。 */
+  recoveredFromDivergence: boolean;
+}
 
 export class ConfigurationRepositoryGitService {
   public readonly repositoryPath: string;
@@ -39,22 +46,47 @@ export class ConfigurationRepositoryGitService {
     }
   }
 
-  public async pull(configuration: SyncConfiguration): Promise<{ before?: string; after?: string }> {
+  public async pull(configuration: SyncConfiguration): Promise<PullResult> {
     const before = await this.head();
     const remote = await this.git(['ls-remote', '--exit-code', '--heads', 'origin', configuration.branch], true);
-    if (remote.exitCode === 2) return { before, after: before };
+    if (remote.exitCode === 2) return { ...(before ? { mergeBase: before } : {}), recoveredFromDivergence: false };
     if (remote.exitCode !== 0) throw new Error(formatRemoteError(remote.stderr, configuration.repositoryUrl));
     await this.git(['fetch', '--prune', 'origin', configuration.branch]);
     if (!before) {
       await this.git(['switch', '-C', configuration.branch, `origin/${configuration.branch}`]);
-    } else {
-      const pull = await this.git(['rebase', `origin/${configuration.branch}`], true);
-      if (pull.exitCode !== 0) {
-        await this.git(['rebase', '--abort'], true);
-        throw new Error(`远程更新无法快进合并：${pull.stderr}`);
-      }
+      return { recoveredFromDivergence: false };
     }
-    return { before, after: await this.head() };
+    const base = await this.git(['merge-base', 'HEAD', `origin/${configuration.branch}`], true);
+    const mergeBase = base.exitCode === 0 && base.stdout ? { mergeBase: base.stdout } : {};
+    const rebase = await this.git(['rebase', `origin/${configuration.branch}`], true);
+    if (rebase.exitCode === 0) return { ...mergeBase, recoveredFromDivergence: false };
+
+    // 上次推送失败时本地会留下未推送提交，与远端改动冲突后 rebase 无法自动完成。
+    // 本机配置仍完整保存在磁盘上，丢弃这些提交后由快照三方合并重新生成，避免同步永久卡死。
+    await this.git(['rebase', '--abort'], true);
+    await this.git(['reset', '--hard', `origin/${configuration.branch}`]);
+    return { ...mergeBase, recoveredFromDivergence: true };
+  }
+
+  /** 把指定提交里的宿主目录导出到独立目录，用作三方合并的共同基准。 */
+  public async exportHostTree(commit: string, host: string, targetRoot: string): Promise<boolean> {
+    const prefix = `.profile-git-sync/hosts/${host}`;
+    const listed = await this.git(['ls-tree', '-r', '-z', '--name-only', commit, '--', prefix], true);
+    if (listed.exitCode !== 0) return false;
+    const files = listed.stdout.split('\0').filter(Boolean);
+    if (!files.length) return false;
+    const resolvedRoot = path.resolve(targetRoot);
+    await fs.mkdir(resolvedRoot, { recursive: true });
+    for (const file of files) {
+      const relative = file.slice(prefix.length + 1);
+      const target = path.resolve(resolvedRoot, ...relative.split('/'));
+      if (!relative || !target.startsWith(`${resolvedRoot}${path.sep}`)) return false;
+      const blob = await runProcessBinary('git', ['show', `${commit}:${file}`], this.repositoryPath);
+      if (blob.exitCode !== 0) return false;
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, blob.stdout);
+    }
+    return true;
   }
 
   public async discardPendingHostChanges(host: string): Promise<boolean> {

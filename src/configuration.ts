@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { atomicWriteJson, readJsonFile as readJson } from './json-store';
 import {
   createConfigurationRecord,
   mergedClock,
@@ -227,29 +228,6 @@ function isStaleLock(value: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-async function readJson(filePath: string): Promise<unknown> {
-  try {
-    return JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
-    throw error;
-  }
-}
-
-async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
-  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
-  try {
-    await fs.rename(temporary, filePath);
-  } catch (error) {
-    if (!['EEXIST', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-    await fs.rm(filePath, { force: true });
-    await fs.rename(temporary, filePath);
-  } finally {
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
-  }
 }
 
 function delay(milliseconds: number): Promise<void> {

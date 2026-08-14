@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { atomicWriteJson, readJsonFile as readJson } from './json-store';
 import { RuntimeStatus, SyncPhase } from './types';
 import { ConflictStrategy } from './conflict-types';
 
@@ -70,6 +71,7 @@ export interface CoordinatorOptions {
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_LEASE_TTL_MS = 20_000;
 const DEFAULT_STALE_CONFIRMATION_MS = 10_000;
+const MAX_OPERATION_ACQUIRE_ATTEMPTS = 3;
 const SYNC_PHASES = new Set<SyncPhase>([
   '未配置',
   '空闲',
@@ -413,7 +415,9 @@ export class MultiWindowCoordinator extends EventEmitter {
     }
   }
 
-  private async acquireOperation(token: string, startedAt: number): Promise<boolean> {
+  private async acquireOperation(token: string, startedAt: number, attempt = 0): Promise<boolean> {
+    // 抢占失效锁后需要重新创建，限制次数避免与其他窗口持续互相抢占时无限递归。
+    if (attempt >= MAX_OPERATION_ACQUIRE_ATTEMPTS) return false;
     try {
       const handle = await fs.open(this.operationPath, 'wx');
       try {
@@ -446,14 +450,14 @@ export class MultiWindowCoordinator extends EventEmitter {
     }
 
     if (operation && !this.processAlive(operation.pid)) {
-      if (await quarantineIfUnchanged(this.operationPath, before)) return this.acquireOperation(token, startedAt);
+      if (await quarantineIfUnchanged(this.operationPath, before)) return this.acquireOperation(token, startedAt, attempt + 1);
       return false;
     }
 
     await delay(this.staleConfirmationMs);
     const after = await this.operationSignature();
     if (!after || after !== before) return false;
-    if (await quarantineIfUnchanged(this.operationPath, after)) return this.acquireOperation(token, startedAt);
+    if (await quarantineIfUnchanged(this.operationPath, after)) return this.acquireOperation(token, startedAt, attempt + 1);
     return false;
   }
 
@@ -558,29 +562,6 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-async function readJson(filePath: string): Promise<unknown> {
-  try {
-    return JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
-    throw error;
-  }
-}
-
-async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
-  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
-  try {
-    await fs.rename(temporary, filePath);
-  } catch (error) {
-    if (!['EEXIST', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-    await fs.rm(filePath, { force: true });
-    await fs.rename(temporary, filePath);
-  } finally {
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
   }
 }
 

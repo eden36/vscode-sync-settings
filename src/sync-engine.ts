@@ -8,11 +8,19 @@ import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { HostEnvironment } from './host';
+import { atomicWriteJson, readJsonFile } from './json-store';
 import { ProfileAdapter } from './profile-adapter';
 import { containsPotentialSecret, findPotentialSecrets } from './secret-scanner';
 import { fallbackCommitMessage } from './sync-fallback';
 import { collectExtensionIdsFromFiles, waitForExtensions } from './extension-wait';
-import { detectSnapshotConflicts } from './snapshot-conflict';
+import {
+  classifyThreeWay,
+  detectSnapshotConflicts,
+  emptyManifest,
+  readManifest,
+  snapshotStructure,
+  SnapshotStructure,
+} from './snapshot-conflict';
 import { RuntimeStatus, SnapshotManifest, SyncOutcome } from './types';
 
 interface PendingProfileConflict {
@@ -68,6 +76,7 @@ export class SyncEngine {
     const configuration = this.configurationStore.get();
     let usedAiFallback = false;
     let recoveredPendingChanges = false;
+    let recoveredFromDivergence = false;
     let temporaryRoot: string | undefined;
     try {
       if (await this.readPendingConflict()) {
@@ -81,7 +90,10 @@ export class SyncEngine {
       if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
 
       this.updateStatus({ phase: '正在扫描', message: undefined });
-      temporaryRoot = path.join(this.environment.runtimePath, 'snapshots', `local-${process.pid}-${Date.now()}`);
+      // 同步在独占锁内执行，进程异常退出残留的临时快照可以安全清空。
+      const snapshotRoot = path.join(this.environment.runtimePath, 'snapshots');
+      await fs.rm(snapshotRoot, { recursive: true, force: true }).catch(() => undefined);
+      temporaryRoot = path.join(snapshotRoot, `local-${process.pid}-${Date.now()}`);
       const localHostRoot = path.join(temporaryRoot, this.environment.kind);
       const localManifest = await this.adapter.createSnapshot(localHostRoot, configuration.includeProfileAssociations);
       const secretFiles = await findPotentialSecrets(localHostRoot, localManifest);
@@ -93,11 +105,12 @@ export class SyncEngine {
       const repositoryHostRoot = path.join(this.git.repositoryPath, '.profile-git-sync', 'hosts', this.environment.kind);
       const baseHostRoot = path.join(temporaryRoot, 'base');
       recoveredPendingChanges = await this.git.discardPendingHostChanges(this.environment.kind);
-      await fs.rm(baseHostRoot, { recursive: true, force: true });
-      if (await exists(repositoryHostRoot)) await fs.cp(repositoryHostRoot, baseHostRoot, { recursive: true });
 
       this.updateStatus({ phase: '正在拉取' });
-      await this.git.pull(configuration);
+      const pull = await this.git.pull(configuration);
+      recoveredFromDivergence = pull.recoveredFromDivergence;
+      // 基准必须取本地与远端的共同祖先，否则本机上次的改动会被当成共同基础，导致误判冲突。
+      if (pull.mergeBase) await this.git.exportHostTree(pull.mergeBase, this.environment.kind, baseHostRoot);
       const remoteExists = await exists(path.join(repositoryHostRoot, 'manifest.json'));
       const baseExists = await exists(path.join(baseHostRoot, 'manifest.json'));
 
@@ -176,6 +189,7 @@ export class SyncEngine {
           changed.length > 0,
           usedAiFallback,
           recoveredPendingChanges,
+          recoveredFromDivergence,
           extensionsPending
         )
       });
@@ -353,13 +367,13 @@ export class SyncEngine {
     await fs.mkdir(outputRoot, { recursive: true });
 
     for (const relative of files) {
-      const baseHash = base.files[relative];
       const oursHash = ours.files[relative];
       const theirsHash = theirs.files[relative];
+      const choice = classifyThreeWay(base.files[relative], oursHash, theirsHash);
       let sourceRoot: string | undefined;
       let mergedContent: Buffer | undefined;
-      if (oursHash === baseHash) sourceRoot = theirsHash ? theirsRoot : undefined;
-      else if (theirsHash === baseHash || oursHash === theirsHash) sourceRoot = oursHash ? oursRoot : undefined;
+      if (choice === 'cloud') sourceRoot = theirsHash ? theirsRoot : undefined;
+      else if (choice === 'local') sourceRoot = oursHash ? oursRoot : undefined;
       else {
         if (!useAi) throw new Error(`尚未处理配置冲突：${relative}`);
         const [baseText, oursText, theirsText] = await Promise.all([
@@ -394,14 +408,6 @@ export class SyncEngine {
   }
 }
 
-async function readManifest(root: string): Promise<SnapshotManifest> {
-  return JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as SnapshotManifest;
-}
-
-function emptyManifest(host: 'vscode' | 'cursor'): SnapshotManifest {
-  return { schemaVersion: 1, host, createdAt: '', profiles: [], files: {} };
-}
-
 async function readOptionalText(root: string | undefined, relative: string): Promise<string> {
   if (!root) return '';
   return fs.readFile(resolveSnapshotPath(root, relative), 'utf8').catch(() => '');
@@ -431,12 +437,17 @@ async function mergeProfileStructure(
   local: SnapshotManifest,
   cloud: SnapshotManifest,
   useAi: boolean,
-): Promise<ReturnType<typeof snapshotStructure>> {
+): Promise<SnapshotStructure> {
   const baseStructure = snapshotStructure(base);
   const localStructure = snapshotStructure(local);
   const cloudStructure = snapshotStructure(cloud);
-  if (sameValue(localStructure, baseStructure)) return cloudStructure;
-  if (sameValue(cloudStructure, baseStructure) || sameValue(localStructure, cloudStructure)) return localStructure;
+  const choice = classifyThreeWay(
+    JSON.stringify(baseStructure),
+    JSON.stringify(localStructure),
+    JSON.stringify(cloudStructure),
+  );
+  if (choice === 'cloud') return cloudStructure;
+  if (choice === 'local') return localStructure;
   if (!useAi) throw new Error('尚未处理 Profile 结构和关联关系冲突。');
   const texts = [baseStructure, localStructure, cloudStructure].map((value) => JSON.stringify(value, null, 2));
   if (texts.some(containsPotentialSecret)) throw new Error('Profile 结构可能包含凭据，无法交给 AI。');
@@ -446,7 +457,7 @@ async function mergeProfileStructure(
 }
 
 /** AI 返回的结构会直接写入 storage.json，必须逐项校验，避免破坏本机 Profile 存储。 */
-function parseProfileStructure(value: unknown): ReturnType<typeof snapshotStructure> {
+function parseProfileStructure(value: unknown): SnapshotStructure {
   if (!isRecord(value) || !Array.isArray(value.profiles)) throw new Error('AI 返回的 Profile 结构无效。');
   const profiles = value.profiles.map((profile) => {
     if (!isRecord(profile) || !isNonEmptyString(profile.id) || !isNonEmptyString(profile.name) || typeof profile.isDefault !== 'boolean') {
@@ -484,18 +495,6 @@ function isAssociationMap(value: unknown): boolean {
   ));
 }
 
-function snapshotStructure(manifest: SnapshotManifest) {
-  return {
-    profiles: manifest.profiles,
-    ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
-    ...(manifest.profileAssociations !== undefined ? { profileAssociations: manifest.profileAssociations } : {}),
-  };
-}
-
-function sameValue(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
 function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
 }
@@ -505,13 +504,18 @@ function finalSyncMessage(
   changed: boolean,
   usedAiFallback: boolean,
   recoveredPendingChanges: boolean,
+  recoveredFromDivergence: boolean,
   extensionsPending?: string[]
 ): string {
   if (structuralMessage) return structuralMessage;
-  if (!changed) return recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
+  if (!changed) {
+    if (recoveredFromDivergence) return '已重新对齐上次未推送成功的提交，配置已是最新。';
+    return recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
+  }
   const notes: string[] = [];
   if (usedAiFallback) notes.push('AI 不可用或结果无效，已使用兜底策略');
   if (recoveredPendingChanges) notes.push('已清理上次中断的暂存状态');
+  if (recoveredFromDivergence) notes.push('已重新对齐上次未推送成功的提交');
   if (extensionsPending?.length) {
     notes.push(`部分扩展尚未安装完成：${extensionsPending.join('、')}`);
   }
@@ -520,30 +524,6 @@ function finalSyncMessage(
 
 async function exists(filePath: string): Promise<boolean> {
   return fs.access(filePath).then(() => true, () => false);
-}
-
-async function readJsonFile(filePath: string): Promise<unknown> {
-  try {
-    return JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
-    throw error;
-  }
-}
-
-async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
-  try {
-    await fs.rename(temporary, filePath);
-  } catch (error) {
-    if (!['EEXIST', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-    await fs.rm(filePath, { force: true });
-    await fs.rename(temporary, filePath);
-  } finally {
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
-  }
 }
 
 function parsePendingProfileConflict(value: unknown): PendingProfileConflict | undefined {

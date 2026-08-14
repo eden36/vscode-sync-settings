@@ -20,6 +20,7 @@ let retryTimer: NodeJS.Timeout | undefined;
 let configurationTimer: NodeJS.Timeout | undefined;
 const LAST_SYNC_KEY = 'profileGitSync.lastSyncAt';
 const OPERATION_RETRY_MS = 5_000;
+const MAX_OPERATION_RETRY_MS = 60_000;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const environment = detectHost(context);
@@ -50,6 +51,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let scheduleGeneration = 0;
   let leaderSchedulesReady = false;
   let localCheckRunning = false;
+  let operationRetryDelayMs = OPERATION_RETRY_MS;
   let dirtyDocumentCount = countDirtyDocuments(environment.userDataPath);
   let notifiedConflictId: string | undefined;
 
@@ -100,10 +102,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const scheduleOperationRetry = () => {
     if (retryTimer) clearTimeout(retryTimer);
+    // 另一窗口可能长时间持有独占锁，逐步退避避免空转重试。
+    const delayMs = Math.min(operationRetryDelayMs, MAX_OPERATION_RETRY_MS);
+    operationRetryDelayMs = Math.min(delayMs * 2, MAX_OPERATION_RETRY_MS);
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
       void synchronize();
-    }, OPERATION_RETRY_MS);
+    }, delayMs);
   };
 
   const synchronize = async (allowStructural = false): Promise<SyncOutcome | undefined> => {
@@ -153,6 +158,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           scheduleOperationRetry();
           break;
         }
+        operationRetryDelayMs = OPERATION_RETRY_MS;
         finalOutcome = outcome;
         if (outcome?.blockedByConflict) void notifyPendingConflict();
         if (outcome?.retry) {
@@ -298,7 +304,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar),
-    vscode.commands.registerCommand('profileGitSync.syncNow', synchronize),
+    // 命令参数由调用方决定，不能直接透传给 allowStructural。
+    vscode.commands.registerCommand('profileGitSync.syncNow', () => void synchronize()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
     vscode.commands.registerCommand('profileGitSync.applyPending', async () => {
       if ((await coordinator!.activeWindowCount()) > 1) {

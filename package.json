@@ -6,6 +6,10 @@
   "publisher": "saltcoreyan",
   "license": "MIT",
   "icon": "media/profile-git-sync.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eden36/vscode-sync-settings.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -13,11 +17,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onView:profileGitSync.sidebar",
-    "onCommand:profileGitSync.syncNow",
-    "onCommand:profileGitSync.openSettings",
-    "onCommand:profileGitSync.applyPending"
+    "onStartupFinished"
   ],
   "extensionKind": [
     "ui"
@@ -97,7 +97,7 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "test": "npm run build && node esbuild.test.mjs && node --test dist/test.cjs",
-    "package": "npm run check && npm run test && vsce package --no-dependencies --allow-missing-repository"
+    "package": "npm run check && npm run test && vsce package --no-dependencies"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1"

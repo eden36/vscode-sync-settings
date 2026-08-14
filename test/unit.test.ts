@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
@@ -13,7 +13,8 @@ import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
 import { containsPotentialSecret } from '../src/secret-scanner';
-import { detectSnapshotConflicts } from '../src/snapshot-conflict';
+import { atomicWriteJson, readJsonFile } from '../src/json-store';
+import { classifyThreeWay, detectSnapshotConflicts } from '../src/snapshot-conflict';
 import {
   compareConfigurationRecords,
   createConfigurationRecord,
@@ -645,6 +646,159 @@ test('格式化同步相对时间', () => {
   assert.equal(formatRelativeSyncTime('2026-08-07T12:00:00.000Z', now), '2天前');
   assert.equal(formatRelativeSyncTime('2026-08-09T12:01:00.000Z', now), '刚刚');
   assert.equal(formatRelativeSyncTime('invalid', now), '时间无效');
+});
+
+test('三方判定在冲突检测与合并中给出一致结果', () => {
+  assert.equal(classifyThreeWay('base', 'base', 'cloud'), 'cloud');
+  assert.equal(classifyThreeWay('base', 'local', 'base'), 'local');
+  assert.equal(classifyThreeWay('base', 'same', 'same'), 'local');
+  assert.equal(classifyThreeWay('base', 'local', 'cloud'), 'conflict');
+  assert.equal(classifyThreeWay('base', undefined, 'base'), 'local');
+  assert.equal(classifyThreeWay(undefined, 'local', undefined), 'local');
+  assert.equal(classifyThreeWay('base', undefined, 'cloud'), 'conflict');
+});
+
+test('推送失败留下的本地提交会被重新对齐并保留共同基准', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-divergence-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  const manifestPath = (service: ConfigurationRepositoryGitService) => path.join(
+    service.repositoryPath, '.profile-git-sync', 'hosts', 'vscode', 'manifest.json'
+  );
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const first = new ConfigurationRepositoryGitService(path.join(root, 'first'));
+    await first.prepare(configuration);
+    await mkdir(path.dirname(manifestPath(first)), { recursive: true });
+    await writeFile(manifestPath(first), '{"schemaVersion":1,"files":{"a":"base"}}');
+    await first.stageHost('vscode');
+    await first.commitAndPush(configuration, 'chore(sync): 初始配置');
+
+    const second = new ConfigurationRepositoryGitService(path.join(root, 'second'));
+    await second.prepare(configuration);
+    await second.pull(configuration);
+
+    await writeFile(manifestPath(first), '{"schemaVersion":1,"files":{"a":"cloud"}}');
+    await first.stageHost('vscode');
+    await first.commitAndPush(configuration, 'chore(sync): 云端修改');
+
+    await writeFile(manifestPath(second), '{"schemaVersion":1,"files":{"a":"local"}}');
+    await second.stageHost('vscode');
+    await assert.rejects(second.commitAndPush(configuration, 'chore(sync): 本机修改'), /推送失败/);
+
+    const pull = await second.pull(configuration);
+    assert.equal(pull.recoveredFromDivergence, true);
+    assert.equal(await readFile(manifestPath(second), 'utf8'), '{"schemaVersion":1,"files":{"a":"cloud"}}');
+    assert.ok(pull.mergeBase);
+
+    const baseRoot = path.join(root, 'base');
+    assert.equal(await second.exportHostTree(pull.mergeBase, 'vscode', baseRoot), true);
+    assert.equal(await readFile(path.join(baseRoot, 'manifest.json'), 'utf8'), '{"schemaVersion":1,"files":{"a":"base"}}');
+
+    // 恢复后必须能继续正常推送，同步不会停留在失败状态。
+    await writeFile(manifestPath(second), '{"schemaVersion":1,"files":{"a":"merged"}}');
+    await second.stageHost('vscode');
+    await second.commitAndPush(configuration, 'chore(sync): 合并结果');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照剥离插件自身设置并在写回本机时保留原值', () => {
+  const text = '{\n  // 编辑器\n  "editor.fontSize": 14,\n  "profileGitSync.autoSync": false\n}';
+  const stripped = testing.stripPluginSettings(text);
+  assert.match(stripped, /\/\/ 编辑器/);
+  assert.doesNotMatch(stripped, /profileGitSync/);
+  const restored = testing.restorePluginSettings(stripped, '{"profileGitSync.autoSync": true}');
+  assert.match(restored, /"profileGitSync.autoSync":\s*true/);
+  assert.match(restored, /"editor.fontSize":\s*14/);
+  assert.equal(testing.stripPluginSettings('not-json'), 'not-json');
+  assert.equal(testing.restorePluginSettings('{}', 'not-json'), '{}');
+});
+
+test('本机专属的插件设置变化不会改变同步指纹', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-fingerprint-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  try {
+    await mkdir(runtimePath, { recursive: true });
+    const settingsPath = path.join(userDataPath, 'settings.json');
+    await writeFile(settingsPath, '{"editor.fontSize": 14}');
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const before = await adapter.fingerprint();
+    await writeFile(settingsPath, '{"editor.fontSize": 14, "profileGitSync.pollIntervalSeconds": 900}');
+    assert.equal(await adapter.fingerprint(), before);
+    await writeFile(settingsPath, '{"editor.fontSize": 16}');
+    assert.notEqual(await adapter.fingerprint(), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('写回配置不会在 Profile 目录留下临时文件，残留文件也不进入快照', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-staging-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const snippetsPath = path.join(userDataPath, 'snippets');
+  try {
+    await mkdir(runtimePath, { recursive: true });
+    await mkdir(snippetsPath, { recursive: true });
+    await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 14}');
+    await writeFile(path.join(snippetsPath, 'zh.code-snippets'), '{}');
+    await writeFile(path.join(snippetsPath, 'zh.code-snippets.profile-git-sync-1234'), '残留内容');
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const snapshot = path.join(root, 'snapshot');
+    const manifest = await adapter.createSnapshot(snapshot);
+    assert.deepEqual(Object.keys(manifest.files).filter((file) => file.includes('.profile-git-sync-')), []);
+
+    await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 99}');
+    await adapter.restoreSnapshot(snapshot, false);
+    assert.equal(await readFile(path.join(userDataPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 14}');
+    assert.deepEqual((await readdir(userDataPath)).filter((name) => name.includes('.profile-git-sync-')), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('配置备份只保留最近若干份', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-backups-'));
+  try {
+    for (let index = 0; index < 13; index += 1) {
+      const backup = path.join(root, `backup-${index}`);
+      await mkdir(backup);
+      const time = new Date(Date.UTC(2026, 0, 1) + index * 60_000);
+      await utimes(backup, time, time);
+    }
+    await testing.pruneBackups(root);
+    const remaining = (await readdir(root)).sort((left, right) => left.localeCompare(right));
+    assert.equal(remaining.length, 10);
+    assert.equal(remaining.includes('backup-0'), false);
+    assert.equal(remaining.includes('backup-12'), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('共享 JSON 存储写入完整内容并忽略损坏文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-json-store-'));
+  const target = path.join(root, 'nested', 'state.json');
+  try {
+    await atomicWriteJson(target, { schemaVersion: 2, branch: 'main' });
+    assert.deepEqual(await readJsonFile(target), { schemaVersion: 2, branch: 'main' });
+    await atomicWriteJson(target, { schemaVersion: 2, branch: 'dev' });
+    assert.deepEqual(await readJsonFile(target), { schemaVersion: 2, branch: 'dev' });
+    assert.deepEqual((await readdir(path.dirname(target))), ['state.json']);
+    assert.equal(await readJsonFile(path.join(root, 'missing.json')), undefined);
+    await writeFile(path.join(root, 'broken.json'), '{');
+    assert.equal(await readJsonFile(path.join(root, 'broken.json')), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {

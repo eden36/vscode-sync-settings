@@ -2,6 +2,40 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { HostKind, SnapshotManifest } from './types';
 
+export type ThreeWayChoice = 'local' | 'cloud' | 'conflict';
+
+export interface SnapshotStructure {
+  profiles: SnapshotManifest['profiles'];
+  profileMetadata?: SnapshotManifest['profileMetadata'];
+  profileAssociations?: unknown;
+}
+
+/**
+ * 三方比较的唯一判定入口：冲突检测与实际合并必须共用，避免两处规则出现分歧。
+ * 取值可为 undefined，表示该版本中文件不存在。
+ */
+export function classifyThreeWay(base: string | undefined, local: string | undefined, cloud: string | undefined): ThreeWayChoice {
+  if (local === base) return 'cloud';
+  if (cloud === base || local === cloud) return 'local';
+  return 'conflict';
+}
+
+export function snapshotStructure(manifest: SnapshotManifest): SnapshotStructure {
+  return {
+    profiles: manifest.profiles,
+    ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
+    ...(manifest.profileAssociations !== undefined ? { profileAssociations: manifest.profileAssociations } : {}),
+  };
+}
+
+export function emptyManifest(host: HostKind): SnapshotManifest {
+  return { schemaVersion: 1, host, createdAt: '', profiles: [], files: {} };
+}
+
+export async function readManifest(root: string): Promise<SnapshotManifest> {
+  return JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as SnapshotManifest;
+}
+
 export async function detectSnapshotConflicts(
   baseRoot: string | undefined,
   localRoot: string,
@@ -13,37 +47,15 @@ export async function detectSnapshotConflicts(
   const cloud = await readManifest(cloudRoot);
   const conflicts: string[] = [];
   for (const relative of new Set([...Object.keys(base.files), ...Object.keys(local.files), ...Object.keys(cloud.files)])) {
-    const baseHash = base.files[relative];
-    const localHash = local.files[relative];
-    const cloudHash = cloud.files[relative];
-    if (localHash !== baseHash && cloudHash !== baseHash && localHash !== cloudHash) conflicts.push(relative);
+    if (classifyThreeWay(base.files[relative], local.files[relative], cloud.files[relative]) === 'conflict') {
+      conflicts.push(relative);
+    }
   }
-  const baseStructure = snapshotStructure(base);
-  const localStructure = snapshotStructure(local);
-  const cloudStructure = snapshotStructure(cloud);
-  if (!sameValue(localStructure, baseStructure) && !sameValue(cloudStructure, baseStructure) && !sameValue(localStructure, cloudStructure)) {
-    conflicts.push('Profile 结构和关联关系');
-  }
+  const structure = classifyThreeWay(
+    JSON.stringify(snapshotStructure(base)),
+    JSON.stringify(snapshotStructure(local)),
+    JSON.stringify(snapshotStructure(cloud)),
+  );
+  if (structure === 'conflict') conflicts.push('Profile 结构和关联关系');
   return conflicts;
 }
-
-function readManifest(root: string): Promise<SnapshotManifest> {
-  return fs.readFile(path.join(root, 'manifest.json'), 'utf8').then((content) => JSON.parse(content) as SnapshotManifest);
-}
-
-function emptyManifest(host: HostKind): SnapshotManifest {
-  return { schemaVersion: 1, host, createdAt: '', profiles: [], files: {} };
-}
-
-function snapshotStructure(manifest: SnapshotManifest) {
-  return {
-    profiles: manifest.profiles,
-    ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
-    ...(manifest.profileAssociations !== undefined ? { profileAssociations: manifest.profileAssociations } : {}),
-  };
-}
-
-function sameValue(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-

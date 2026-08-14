@@ -33,7 +33,8 @@ export function waitForExtensions(
   options: WaitForExtensionsOptions = {}
 ): Promise<WaitForExtensionsResult> {
   const unique = [...new Set(targetIds)];
-  const timeoutMs = options.timeoutMs ?? 300_000;
+  // 等待过程占用跨窗口独占锁，超时不能太长，否则其他窗口的同步会长时间被阻塞。
+  const timeoutMs = options.timeoutMs ?? 60_000;
   const pollIntervalMs = options.pollIntervalMs ?? 2_000;
   const onProgress = options.onProgress;
 
