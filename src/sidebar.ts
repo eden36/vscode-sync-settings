@@ -54,10 +54,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             includeProfileAssociations: true,
           });
           await this.onConfigurationSaved();
+          await this.view?.webview.postMessage({ type: 'configuration-saved' });
           await this.pushState();
         }
       } catch (error) {
         // 处理失败时必须回显并刷新，否则侧边栏会一直停在中间态。
+        if (message.type === 'save') await this.view?.webview.postMessage({ type: 'save-failed' });
         void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
         await this.pushState();
       }
@@ -89,32 +91,35 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font-family:var(--vscode-font-family);padding:12px;color:var(--vscode-foreground)}label{display:block;margin:10px 0 4px}
-input,select{box-sizing:border-box;width:100%;padding:6px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border)}input[type=checkbox]{width:auto;margin:0 7px 0 0}.check-label{display:flex;align-items:center;margin-top:12px}
+input,select{box-sizing:border-box;width:100%;padding:6px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border)}
 button{margin:12px 6px 0 0;padding:7px 11px;border:0;background:var(--vscode-button-background);color:var(--vscode-button-foreground);cursor:pointer}
 button.secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+button:disabled{cursor:default;opacity:.6}
+button.toggle-switch{position:relative;width:38px;height:22px;margin:12px 0 0;padding:0;border-radius:11px;background:var(--vscode-button-secondaryBackground);transition:background .15s ease}
+button.toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--vscode-button-foreground);transition:transform .15s ease}
+button.toggle-switch.enabled{background:var(--vscode-testing-iconPassed)}button.toggle-switch.enabled::after{transform:translateX(16px)}
 .sync-summary{display:grid;grid-template-columns:1fr 1fr;gap:1px;margin-bottom:10px;background:var(--vscode-panel-border)}
 .sync-metric{min-width:0;padding:10px;background:var(--vscode-sideBar-background)}.metric-label{display:block;margin-bottom:5px;opacity:.7;font-size:11px}.metric-value{display:flex;align-items:center;gap:6px;font-weight:600;overflow-wrap:anywhere}
 .dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--vscode-descriptionForeground)}.dot.muted{background:var(--vscode-descriptionForeground)}.dot.success{background:var(--vscode-testing-iconPassed)}.dot.running{background:var(--vscode-progressBar-background)}.dot.warning{background:var(--vscode-editorWarning-foreground)}.dot.error{background:var(--vscode-testing-iconFailed)}
-.status{padding:10px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-focusBorder)}.muted{opacity:.75;font-size:12px}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.status{padding:10px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-focusBorder)}.muted{opacity:.75;font-size:12px}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.repository-details{display:grid;gap:8px;margin-top:14px}.repository-item{display:grid;gap:3px}.repository-item span{opacity:.7;font-size:11px}.repository-item strong{font-weight:400;overflow-wrap:anywhere}.configuration-dialog{max-width:calc(100vw - 32px);width:420px;padding:16px;border:1px solid var(--vscode-editorWidget-border);background:var(--vscode-editorWidget-background);color:var(--vscode-editorWidget-foreground)}.configuration-dialog::backdrop{background:rgba(0,0,0,.45)}.configuration-dialog h2{margin:0 0 8px;font-size:15px}.dialog-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:4px}.dialog-actions button{margin:0}
 </style></head><body>
 <div class="sync-summary">
   <div class="sync-metric"><span class="metric-label">同步状态</span><span class="metric-value"><span id="syncDot" class="dot"></span><span id="syncPhase">正在加载</span></span></div>
   <div class="sync-metric"><span class="metric-label">上次同步</span><span id="lastSyncAt" class="metric-value">尚未同步</span></div>
 </div>
 <div class="status"><strong id="phase">正在加载</strong><div id="detail" class="muted"></div></div>
-<label class="check-label" for="enabled"><input type="checkbox" id="enabled">启用配置同步</label>
+<button id="toggleEnabled" class="toggle-switch" type="button" role="switch" aria-checked="false" aria-label="正在加载"></button>
 <p class="muted">关闭后不创建本地仓库、不访问远程仓库，也不写回本机配置。</p>
-<label for="repositoryUrl">配置同步仓库地址</label><input id="repositoryUrl" placeholder="git@github.com:user/settings.git">
-<label for="branch">分支</label><input id="branch">
-<div class="row"><div><label for="gitUserName">Git 用户名（可选）</label><input id="gitUserName" placeholder="留空使用本机配置"></div><div><label for="gitUserEmail">Git 邮箱（可选）</label><input id="gitUserEmail" type="email" placeholder="留空使用本机配置"></div></div>
-<div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div>
-<button id="save">保存</button>
-<p class="muted">保存后自动同步，冲突优先交给 AI 合并，AI 不可用时按本机优先自动处理，合并前的两份配置保留在扩展运行目录的 conflict-backups 中。本机首次接入时以云端配置覆盖本机，本轮不会把本机配置推到云端，原有配置会先备份。若本地缓存与远端不同源，会询问是否废弃缓存并按云端覆盖。Profile 增删在只剩一个窗口时自动应用并重载。配置同步仓库位于扩展全局存储中，不会操作当前项目的 Git 仓库。</p>
+<div class="repository-details"><div class="repository-item"><span>远程仓库</span><strong id="repositorySummary">正在加载</strong></div><div class="repository-item"><span>分支</span><strong id="branchSummary">正在加载</strong></div></div>
+<button id="editRepository" type="button">修改远程仓库</button>
+<dialog id="configurationDialog" class="configuration-dialog"><form id="configurationForm" novalidate><h2>配置同步仓库</h2><label for="repositoryUrl">配置同步仓库地址</label><input id="repositoryUrl" placeholder="git@github.com:user/settings.git"><label for="branch">分支</label><input id="branch"><div class="row"><div><label for="gitUserName">Git 用户名（可选）</label><input id="gitUserName" placeholder="留空使用本机配置"></div><div><label for="gitUserEmail">Git 邮箱（可选）</label><input id="gitUserEmail" type="email" placeholder="留空使用本机配置"></div></div><div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div><p class="muted">保存后会自动同步。首次接入时以云端配置覆盖本机，原有配置会先备份。</p><div class="dialog-actions"><button id="cancelConfiguration" class="secondary" type="button">取消</button><button id="saveConfiguration" type="submit">保存更改</button></div></form></dialog>
 <script nonce="${nonce}">
-const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];let lastSyncAt;
-document.getElementById('save').onclick=()=>{const configuration={};for(const id of ids)configuration[id]=document.getElementById(id).value;const automation={includeProfileAssociations:true,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};vscode.postMessage({type:'save',configuration,automation})};
-document.getElementById('enabled').onchange=(event)=>vscode.postMessage({type:'toggleEnabled',enabled:event.target.checked});
-addEventListener('message',({data})=>{if(data.type!=='state')return;document.getElementById('enabled').checked=data.enabled===true;for(const id of ids)document.getElementById(id).value=data.configuration[id]??'';document.getElementById('debounceSeconds').value=String(data.configuration.debounceSeconds);document.getElementById('pollIntervalSeconds').value=String(data.configuration.pollIntervalSeconds);const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
+const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];const toggleEnabled=document.getElementById('toggleEnabled');const editRepository=document.getElementById('editRepository');const configurationDialog=document.getElementById('configurationDialog');const configurationForm=document.getElementById('configurationForm');const cancelConfiguration=document.getElementById('cancelConfiguration');const saveConfiguration=document.getElementById('saveConfiguration');let configuration={};let enabled=false;let lastSyncAt;
+toggleEnabled.onclick=()=>{toggleEnabled.disabled=true;vscode.postMessage({type:'toggleEnabled',enabled:!enabled})};
+editRepository.onclick=()=>{for(const id of ids)document.getElementById(id).value=configuration[id]??'';document.getElementById('debounceSeconds').value=String(configuration.debounceSeconds??'');document.getElementById('pollIntervalSeconds').value=String(configuration.pollIntervalSeconds??'');configurationDialog.showModal()};
+cancelConfiguration.onclick=()=>configurationDialog.close();
+configurationForm.onsubmit=(event)=>{event.preventDefault();const next={};for(const id of ids)next[id]=document.getElementById(id).value;const automation={includeProfileAssociations:true,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};saveConfiguration.disabled=true;cancelConfiguration.disabled=true;vscode.postMessage({type:'save',configuration:next,automation})};
+addEventListener('message',({data})=>{if(data.type==='configuration-saved'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;configurationDialog.close();return}if(data.type==='save-failed'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;return}if(data.type!=='state')return;configuration=data.configuration;enabled=data.enabled===true;toggleEnabled.className=enabled?'toggle-switch enabled':'toggle-switch';toggleEnabled.setAttribute('aria-checked',String(enabled));toggleEnabled.setAttribute('aria-label',enabled?'停止同步':'开启同步');toggleEnabled.disabled=false;document.getElementById('repositorySummary').textContent=configuration.repositoryUrl||'未配置远程仓库';document.getElementById('branchSummary').textContent=configuration.branch||'未配置分支';const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
 vscode.postMessage({type:'ready'});
 setInterval(renderLastSyncAt,60_000);
 function renderLastSyncAt(){const last=document.getElementById('lastSyncAt');if(!lastSyncAt){last.textContent='尚未同步';last.removeAttribute('title');return}const date=new Date(lastSyncAt);if(Number.isNaN(date.getTime())){last.textContent='时间无效';last.removeAttribute('title');return}last.textContent=date.toLocaleString()+'（'+relativeTime(date.getTime())+'）';last.title=lastSyncAt}

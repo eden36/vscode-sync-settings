@@ -37,7 +37,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     enabled: vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', false),
   });
   const adapter = new ProfileAdapter(environment);
-  const profiles = await adapter.listProfiles();
+  // Profile 枚举可能需要扫描多个目录，不能阻塞侧边栏首次渲染。
+  const profilesTask = adapter.listProfiles();
 
   const persisted = runtimeState.get();
   // 共享文件是权威来源，启动时把它镜像回宿主设置，避免多个 Profile 显示的开关不一致。
@@ -55,7 +56,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     link: machine.link,
     role: 'stopped',
     activeWindows: 1,
-    profiles: profiles.map((profile) => profile.name),
+    profiles: [],
     pendingChanges: 0,
     ...(persisted.lastSyncAt ? { lastSyncAt: persisted.lastSyncAt } : {}),
   };
@@ -138,7 +139,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let outcome: SyncOutcome | undefined;
     const acquired = await coordinator!.runExclusive(async () => {
       outcome = await engine.synchronize(adoptCloud ? { adoptCloud } : {});
-      localFingerprint = await adapter.fingerprint();
+      if (!outcome?.cancelled) localFingerprint = await adapter.fingerprint();
     });
     if (!acquired) {
       applyStatus({ message: '另一窗口正在执行同步，稍后将自动重试。' }, false);
@@ -189,8 +190,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const setEnabled = async (enabled: boolean) => {
     if (machine.enabled === enabled) return;
     await runtimeState.update({ enabled });
+    const stopping = !enabled && machine.sync.kind === 'running';
+    if (stopping) engine.requestStop();
     // 必须先落到调度状态：写宿主设置会触发配置变更事件，此时 machine 若还是旧值就会再次调用本函数。
     dispatch({ type: 'enabled-changed', enabled });
+    if (stopping) applyStatus({ message: '正在停止同步，当前操作完成后将停止。' }, false);
     const settings = vscode.workspace.getConfiguration('profileGitSync');
     if (settings.get<boolean>('enabled') !== enabled) {
       await settings.update('enabled', enabled, vscode.ConfigurationTarget.Global);
@@ -366,6 +370,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.onDidSaveTextDocument(() => void refreshDirtyDocuments()),
     vscode.workspace.onDidCloseTextDocument(() => void refreshDirtyDocuments()),
   );
+
+  const profiles = await profilesTask;
+  status.profiles = profiles.map((profile) => profile.name);
+  await sidebar.pushState();
 
   const onBecameLeader = () => {
     void updateWindowState();

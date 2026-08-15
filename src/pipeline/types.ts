@@ -23,6 +23,7 @@ export interface SyncDependencies {
   ai: AiService;
   runtimeState: RuntimeStateStore;
   windowSafety: () => Promise<WindowSafetySnapshot>;
+  isCancellationRequested: () => boolean;
   updateStatus: (patch: Partial<RuntimeStatus>) => void;
   conflictBackupRoot: string;
 }

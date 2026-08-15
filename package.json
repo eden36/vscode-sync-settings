@@ -17,6 +17,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onView:profileGitSync.sidebar",
     "onStartupFinished"
   ],
   "extensionKind": [

@@ -22,6 +22,7 @@ export interface SynchronizeOptions {
  */
 export class SyncEngine {
   private running = false;
+  private cancellationRequested = false;
   private readonly dependencies: SyncDependencies;
 
   public constructor(
@@ -41,6 +42,7 @@ export class SyncEngine {
       ai,
       runtimeState,
       windowSafety,
+      isCancellationRequested: () => this.cancellationRequested,
       updateStatus,
       // 与 ProfileAdapter 的 backups 目录分开存放，避免被那边的保留策略清理。
       conflictBackupRoot: path.join(environment.runtimePath, 'conflict-backups'),
@@ -51,9 +53,15 @@ export class SyncEngine {
     await this.runtimeState.update({ cloudAdoptPending: true });
   }
 
+  /** 当前安全操作结束后停止，不强制终止 Git 或扩展安装进程。 */
+  public requestStop(): void {
+    if (this.running) this.cancellationRequested = true;
+  }
+
   public async synchronize(options: SynchronizeOptions = {}): Promise<SyncOutcome | undefined> {
     if (this.running) return undefined;
     this.running = true;
+    this.cancellationRequested = false;
     const configuration = this.configurationStore.get();
     let temporaryRoot: string | undefined;
     try {

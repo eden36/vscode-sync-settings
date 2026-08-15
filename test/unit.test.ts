@@ -1573,6 +1573,23 @@ test('同步顺利结束时报告完成并给出状态说明', async () => {
   assert.equal(patches.at(-1)?.message, '配置已是最新。');
 });
 
+test('请求停止后当前阶段结束且不再执行后续阶段', async () => {
+  let cancellationRequested = false;
+  const executed: string[] = [];
+  const context = stageContext({
+    dependencies: stageDependencies({ isCancellationRequested: () => cancellationRequested }),
+  });
+  const stages: Stage[] = [
+    { name: 'snapshot', run: async () => { executed.push('snapshot'); cancellationRequested = true; return { kind: 'continue' }; } },
+    { name: 'scan-secrets', run: async () => { executed.push('scan-secrets'); return { kind: 'continue' }; } },
+  ];
+
+  const outcome = await runPipeline(context, stages);
+
+  assert.deepEqual(executed, ['snapshot']);
+  assert.deepEqual(outcome, { ok: false, cancelled: true });
+});
+
 test('关闭同步开关后不再发起任何同步', () => {
   const machine = { ...leaderMachine(), enabled: false, sync: { kind: 'disabled' } as SyncState };
   for (const event of [
@@ -1586,10 +1603,10 @@ test('关闭同步开关后不再发起任何同步', () => {
   }
 });
 
-test('同步进行中关闭开关不打断当前这一轮', () => {
+test('同步进行中关闭开关后等待当前安全操作完成再停止', () => {
   const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
   const closed = reduce(running, { type: 'enabled-changed', enabled: false });
-  // 仍在 running：已经提交但未推送的中间态不能被切断。
+  // 仍在 running：已经提交但未推送的安全操作不能被切断。
   assert.deepEqual(closed.next.sync, { kind: 'running', stage: 'push' });
   assert.deepEqual(closed.commands.map((command) => command.type), ['stop-schedules', 'cancel-retry']);
 
@@ -1732,6 +1749,7 @@ function stageDependencies(overrides: Partial<SyncDependencies> = {}): SyncDepen
     ai: {} as unknown as AiService,
     runtimeState: { update: async () => undefined } as unknown as RuntimeStateStore,
     windowSafety: async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    isCancellationRequested: () => false,
     updateStatus: () => undefined,
     conflictBackupRoot: '/runtime/conflict-backups',
     ...overrides,
