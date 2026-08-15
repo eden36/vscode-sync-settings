@@ -42,6 +42,40 @@ export function emptyManifest(host: HostKind): SnapshotManifest {
   return { schemaVersion: 1, host, createdAt: '', profiles: [], files: {} };
 }
 
+/** 快照清单可能来自远端仓库，必须校验后再使用，否则字段缺失会以难以定位的运行时错误暴露。 */
 export async function readManifest(root: string): Promise<SnapshotManifest> {
-  return JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as SnapshotManifest;
+  const parsed = parseManifest(JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as unknown);
+  if (!parsed) throw new Error('快照清单格式无效，无法继续同步。');
+  return parsed;
+}
+
+export function parseManifest(value: unknown): SnapshotManifest | undefined {
+  if (!isRecord(value) || value.schemaVersion !== 1) return undefined;
+  if (value.host !== 'vscode' && value.host !== 'cursor') return undefined;
+  if (typeof value.createdAt !== 'string') return undefined;
+  if (!Array.isArray(value.profiles)) return undefined;
+  const profiles = value.profiles.map((profile) => {
+    if (!isRecord(profile) || typeof profile.id !== 'string' || !profile.id) return undefined;
+    if (typeof profile.name !== 'string' || typeof profile.isDefault !== 'boolean') return undefined;
+    return { id: profile.id, name: profile.name, isDefault: profile.isDefault };
+  });
+  if (profiles.some((profile) => profile === undefined)) return undefined;
+  if (!isRecord(value.files) || Object.values(value.files).some((hash) => typeof hash !== 'string')) return undefined;
+  if (value.profileMetadata !== undefined && !Array.isArray(value.profileMetadata)) return undefined;
+  if (value.profileMetadata?.some((entry: unknown) => !isRecord(entry))) return undefined;
+  return {
+    schemaVersion: 1,
+    host: value.host,
+    createdAt: value.createdAt,
+    profiles: profiles as SnapshotManifest['profiles'],
+    files: value.files as Record<string, string>,
+    ...(value.profileMetadata !== undefined
+      ? { profileMetadata: value.profileMetadata as Array<Record<string, unknown>> }
+      : {}),
+    ...(value.profileAssociations !== undefined ? { profileAssociations: value.profileAssociations } : {}),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

@@ -4,9 +4,12 @@ import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
 import { parseExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
+import { parseManifest } from './snapshot-conflict';
 import { ProfileDescriptor, SnapshotManifest } from './types';
 
-const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'extensions.json', 'mcp.json'];
+// Profile 目录下的 extensions.json 是 IDE 维护的启用状态，跨机器同步会引用本机没有的扩展；
+// 扩展改由快照根目录的宿主级清单统一处理。
+const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'mcp.json'];
 const DIRECTORY_RESOURCES = ['snippets', 'prompts'];
 /** 宿主级的已安装扩展清单，放在快照根目录，不属于任何 Profile。 */
 export const HOST_EXTENSIONS_FILE = 'extensions.json';
@@ -137,8 +140,8 @@ export class ProfileAdapter {
 
   public async restoreSnapshot(hostRoot: string, allowStructural: boolean, applyMatchingFiles = false): Promise<RestoreResult> {
     const manifestPath = path.join(hostRoot, 'manifest.json');
-    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as SnapshotManifest;
-    if (manifest.schemaVersion !== 1 || manifest.host !== this.environment.kind) {
+    const manifest = parseManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')) as unknown);
+    if (!manifest || manifest.host !== this.environment.kind) {
       throw new Error('远程快照格式或宿主类型不兼容。');
     }
 

@@ -13,9 +13,9 @@ import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
 import { parseRuntimeState, RuntimeStateStore } from '../src/runtime-state';
-import { containsPotentialSecret } from '../src/secret-scanner';
+import { containsPotentialSecret, findPotentialSecrets } from '../src/secret-scanner';
 import { atomicWriteJson, readJsonFile } from '../src/json-store';
-import { classifyThreeWay, resolveConflictFallback } from '../src/snapshot-conflict';
+import { classifyThreeWay, parseManifest, resolveConflictFallback } from '../src/snapshot-conflict';
 import {
   compareConfigurationRecords,
   createConfigurationRecord,
@@ -997,6 +997,60 @@ test('扩展卸载失败时记录未完成项且本进程不再重试', async ()
   const retry = await uninstallRemovedExtensions(['keep.one'], ['stuck.one'], { timeoutMs: 1_000 });
   assert.deepEqual(retry, []);
   assert.deepEqual(uninstallCommandCalls, []);
+});
+
+test('凭据扫描覆盖环境变量风格的键名且不误伤配置项', () => {
+  // mcp.json 里的 MCP 服务器凭据是这种形态，键名带业务前缀。
+  assert.equal(containsPotentialSecret('{"env":{"BRAVE_API_KEY":"BSAxxx"}}'), true);
+  assert.equal(containsPotentialSecret('{"env":{"ANTHROPIC_API_KEY":"xyz"}}'), true);
+  assert.equal(containsPotentialSecret('{"DATABASE_PASSWORD":"p"}'), true);
+  assert.equal(containsPotentialSecret('{"MY_SECRET_VALUE":"s"}'), true);
+  // 驼峰写法的编辑器配置不能被误判，否则用户根本无法同步。
+  assert.equal(containsPotentialSecret('{"editor.tokenColorCustomizations":{}}'), false);
+  assert.equal(containsPotentialSecret('{"editor.semanticTokenColorCustomizations":{}}'), false);
+  assert.equal(containsPotentialSecret('{"editor.fontSize":14}'), false);
+});
+
+test('凭据扫描覆盖快照中的所有文件而不限扩展名', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-scan-'));
+  try {
+    await mkdir(path.join(root, 'profiles', 'default', 'prompts'), { recursive: true });
+    await writeFile(path.join(root, 'profiles', 'default', 'prompts', 'review.prompt.md'), '使用 ghp_0123456789abcdefghijklmnop 调用接口');
+    const manifest = {
+      schemaVersion: 1 as const, host: 'vscode' as const, createdAt: '', profiles: [],
+      files: { 'profiles/default/prompts/review.prompt.md': 'x' },
+    };
+    assert.deepEqual(await findPotentialSecrets(root, manifest), ['profiles/default/prompts/review.prompt.md']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('清单中越界的路径按可疑处理，不读取快照目录之外的文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-escape-'));
+  try {
+    await mkdir(path.join(root, 'inside'), { recursive: true });
+    const manifest = {
+      schemaVersion: 1 as const, host: 'vscode' as const, createdAt: '', profiles: [],
+      files: { '../../outside.json': 'x' },
+    };
+    assert.deepEqual(await findPotentialSecrets(path.join(root, 'inside'), manifest), ['../../outside.json']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照清单缺字段或类型不符时拒绝解析', () => {
+  const valid = {
+    schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [{ id: 'default', name: '默认', isDefault: true }], files: {},
+  };
+  assert.equal(parseManifest(valid)?.host, 'vscode');
+  assert.equal(parseManifest({ ...valid, schemaVersion: 2 }), undefined);
+  assert.equal(parseManifest({ ...valid, host: 'sublime' }), undefined);
+  assert.equal(parseManifest({ ...valid, profiles: [{ id: 'x' }] }), undefined);
+  assert.equal(parseManifest({ ...valid, files: { 'a.json': 12 } }), undefined);
+  assert.equal(parseManifest({ ...valid, files: null }), undefined);
+  assert.equal(parseManifest(undefined), undefined);
 });
 
 test('检测 URL 中嵌入的明文凭据', () => {
