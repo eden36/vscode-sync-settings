@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { atomicWriteJson, readJsonFile as readJson } from './json-store';
-import { RuntimeStatus, SyncPhase } from './types';
+import { BlockReason, LinkState, RuntimeStatus, StageName, SyncState } from './types';
 
 interface Lease {
   schemaVersion?: 2;
@@ -31,10 +31,11 @@ interface WindowPresence {
 }
 
 interface SharedStatus {
-  schemaVersion: 2;
+  schemaVersion: 3;
   revision: string;
   updatedAt: number;
-  phase: SyncPhase;
+  sync: SyncState;
+  link: LinkState;
   profiles: string[];
   pendingChanges: number;
   lastSyncAt?: string;
@@ -66,17 +67,14 @@ const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_LEASE_TTL_MS = 20_000;
 const DEFAULT_STALE_CONFIRMATION_MS = 10_000;
 const MAX_OPERATION_ACQUIRE_ATTEMPTS = 3;
-const SYNC_PHASES = new Set<SyncPhase>([
-  '未配置',
-  '空闲',
-  '正在扫描',
-  '正在拉取',
-  '正在提交',
-  '正在推送',
-  '正在同步扩展',
-  '等待其他窗口关闭',
-  '等待 AI',
-  '失败',
+const STAGE_NAMES = new Set<StageName>([
+  'snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'merge', 'ai', 'push', 'apply', 'extensions',
+]);
+const BLOCK_REASONS = new Set<BlockReason>([
+  'dirty-windows', 'unreadable-windows', 'other-windows', 'unrelated', 'exclusive-lock',
+]);
+const LINK_STATES = new Set<LinkState>([
+  'no-repository', 'never-synced', 'in-sync', 'diverged', 'unrelated',
 ]);
 
 export class MultiWindowCoordinator extends EventEmitter {
@@ -164,10 +162,11 @@ export class MultiWindowCoordinator extends EventEmitter {
   public async publishStatus(status: RuntimeStatus): Promise<void> {
     if (!this.leader) return;
     const shared: SharedStatus = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: randomUUID(),
       updatedAt: this.now(),
-      phase: status.phase,
+      sync: status.sync,
+      link: status.link,
       profiles: status.profiles,
       pendingChanges: status.pendingChanges,
       ...(status.lastSyncAt ? { lastSyncAt: status.lastSyncAt } : {}),
@@ -376,7 +375,8 @@ export class MultiWindowCoordinator extends EventEmitter {
     if (sharedStatus && sharedStatus.revision !== this.lastStatusRevision) {
       this.lastStatusRevision = sharedStatus.revision;
       this.emit('statusChanged', {
-        phase: sharedStatus.phase,
+        sync: sharedStatus.sync,
+        link: sharedStatus.link,
         profiles: sharedStatus.profiles,
         pendingChanges: sharedStatus.pendingChanges,
         lastSyncAt: sharedStatus.lastSyncAt,
@@ -486,13 +486,36 @@ function parsePresence(value: unknown): WindowPresence | undefined {
 }
 
 function parseSharedStatus(value: unknown): SharedStatus | undefined {
-  if (!isRecord(value) || value.schemaVersion !== 2 || typeof value.revision !== 'string' || typeof value.updatedAt !== 'number') return undefined;
-  if (typeof value.phase !== 'string' || !SYNC_PHASES.has(value.phase as SyncPhase)) return undefined;
+  if (!isRecord(value) || value.schemaVersion !== 3 || typeof value.revision !== 'string' || typeof value.updatedAt !== 'number') return undefined;
+  const sync = parseSyncState(value.sync);
+  if (!sync) return undefined;
+  if (typeof value.link !== 'string' || !LINK_STATES.has(value.link as LinkState)) return undefined;
   if (!Array.isArray(value.profiles) || !value.profiles.every((profile) => typeof profile === 'string')) return undefined;
   if (typeof value.pendingChanges !== 'number' || !Number.isInteger(value.pendingChanges) || value.pendingChanges < 0) return undefined;
   if (value.lastSyncAt !== undefined && typeof value.lastSyncAt !== 'string') return undefined;
   if (value.message !== undefined && typeof value.message !== 'string') return undefined;
-  return value as unknown as SharedStatus;
+  return { ...(value as unknown as SharedStatus), sync };
+}
+
+function parseSyncState(value: unknown): SyncState | undefined {
+  if (!isRecord(value) || typeof value.kind !== 'string') return undefined;
+  switch (value.kind) {
+    case 'disabled':
+    case 'unconfigured':
+    case 'idle':
+    case 'failed':
+      return { kind: value.kind };
+    case 'running':
+      return typeof value.stage === 'string' && STAGE_NAMES.has(value.stage as StageName)
+        ? { kind: 'running', stage: value.stage as StageName }
+        : undefined;
+    case 'blocked':
+      return typeof value.reason === 'string' && BLOCK_REASONS.has(value.reason as BlockReason)
+        ? { kind: 'blocked', reason: value.reason as BlockReason }
+        : undefined;
+    default:
+      return undefined;
+  }
 }
 
 function parseConfigurationRevision(value: unknown): ConfigurationRevision | undefined {

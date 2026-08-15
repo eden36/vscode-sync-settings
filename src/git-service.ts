@@ -80,6 +80,11 @@ export class ConfigurationRepositoryGitService {
     await fs.rm(this.repositoryPath, { recursive: true, force: true });
   }
 
+  /** 只去掉本机配置同步目录的 .git，不推远端、不改工作区文件。 */
+  public async removeGitDirectory(): Promise<void> {
+    await fs.rm(path.join(this.repositoryPath, '.git'), { recursive: true, force: true });
+  }
+
   /** 把指定提交里的宿主目录导出到独立目录，用作三方合并的共同基准。 */
   public async exportHostTree(commit: string, host: string, targetRoot: string): Promise<boolean> {
     const prefix = `.profile-git-sync/hosts/${host}`;

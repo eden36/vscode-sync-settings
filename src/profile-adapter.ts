@@ -2,11 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
+import { parseExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
 import { ProfileDescriptor, SnapshotManifest } from './types';
 
 const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'extensions.json', 'mcp.json'];
 const DIRECTORY_RESOURCES = ['snippets', 'prompts'];
+/** 宿主级的已安装扩展清单，放在快照根目录，不属于任何 Profile。 */
+export const HOST_EXTENSIONS_FILE = 'extensions.json';
 const TEMPORARY_MARKER = '.profile-git-sync-';
 const PLUGIN_SETTING_PREFIX = 'profileGitSync.';
 const BACKUP_RETENTION = 10;
@@ -57,6 +60,9 @@ export class ProfileAdapter {
   public async fingerprint(): Promise<string> {
     const profiles = (await this.listProfiles()).sort((left, right) => left.id.localeCompare(right.id));
     const hash = createHash('sha256');
+    // 安装或卸载扩展也要触发同步，但只认标识变化，扩展升级不算。
+    const installedExtensions = await this.readInstalledExtensions();
+    if (installedExtensions) hash.update(HOST_EXTENSIONS_FILE).update(sha256(installedExtensions));
     for (const profile of profiles) {
       hash.update(`${profile.id}\0${profile.name}\0${profile.isDefault ? '1' : '0'}\0`);
       for (const resource of FILE_RESOURCES) {
@@ -105,6 +111,12 @@ export class ProfileAdapter {
       for (const resource of DIRECTORY_RESOURCES) {
         await this.snapshotDirectory(profile.location, resource, targetRoot, files, profile.id);
       }
+    }
+
+    const installedExtensions = await this.readInstalledExtensions();
+    if (installedExtensions) {
+      await fs.writeFile(path.join(staging, HOST_EXTENSIONS_FILE), installedExtensions);
+      files[HOST_EXTENSIONS_FILE] = sha256(installedExtensions);
     }
 
     const manifest: SnapshotManifest = {
@@ -180,6 +192,8 @@ export class ProfileAdapter {
     }
     for (const relative of Object.keys(manifest.files)) {
       const normalized = normalizeRelative(relative);
+      // 扩展清单由 IDE 自己维护，只用来决定装哪些扩展，绝不能写回本机。
+      if (normalized === HOST_EXTENSIONS_FILE) continue;
       const parts = normalized.split('/');
       if (parts[0] !== 'profiles' || parts.length < 3) {
         throw new Error(`快照包含非法路径：${relative}`);
@@ -277,6 +291,32 @@ export class ProfileAdapter {
       await fs.writeFile(target, content);
       files[`profiles/${profileId}/${resource}/${relative.split(path.sep).join('/')}`] = sha256(content);
     }
+  }
+
+  /**
+   * 本机用户安装的扩展标识，来自扩展目录的清单文件。
+   * 内置扩展不在该文件中，因此这份列表可以安全地用于判断哪些扩展需要卸载。
+   */
+  public async listInstalledExtensionIds(): Promise<string[]> {
+    const manifestPath = this.environment.extensionsManifestPath;
+    if (!manifestPath) return [];
+    const content = await stableRead(manifestPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (!content) return [];
+    return [...new Set(parseExtensionIds(content.toString('utf8')))].sort((left, right) => left.localeCompare(right));
+  }
+
+  /**
+   * 已安装扩展清单的仓库形态，只保留标识并排序。
+   * 原文件还含版本号、安装路径和安装时间等本机专属字段，原样同步会让扩展一升级就产生无意义的冲突。
+   */
+  private async readInstalledExtensions(): Promise<Buffer | undefined> {
+    const ids = await this.listInstalledExtensionIds();
+    if (!ids.length) return undefined;
+    const normalized = ids.map((id) => ({ identifier: { id } }));
+    return Buffer.from(`${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
   }
 
   private async readStorage(): Promise<StorageFile> {

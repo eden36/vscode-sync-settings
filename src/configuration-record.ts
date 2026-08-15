@@ -37,7 +37,7 @@ export function isValidBranch(branch: string): boolean {
 
 export function resolveRepositoryUrl(fromSecret: string | undefined, stored: StoredConfiguration): {
   repositoryUrl: string;
-  persisted: Omit<PluginConfiguration, 'repositoryUrl' | 'autoSync' | 'pollIntervalSeconds' | 'debounceSeconds' | 'includeProfileAssociations'>;
+  persisted: Omit<PluginConfiguration, 'repositoryUrl' | 'pollIntervalSeconds' | 'debounceSeconds' | 'includeProfileAssociations'>;
   shouldPersistSecret: boolean;
 } {
   const persisted = {
@@ -136,14 +136,13 @@ export function parsePluginConfiguration(value: unknown): PluginConfiguration | 
   if (repositoryUrl.length > 4_096 || /\r|\n/.test(repositoryUrl) || hasEmbeddedCredentials(repositoryUrl)) return undefined;
   if (!isValidBranch(branch)) return undefined;
   if ([gitUserName, gitUserEmail].some((text) => text.length > 320 || /\r|\n/.test(text))) return undefined;
-  if (typeof value.autoSync !== 'boolean' || typeof value.includeProfileAssociations !== 'boolean') return undefined;
+  if (typeof value.includeProfileAssociations !== 'boolean') return undefined;
   if (!validInterval(value.debounceSeconds, 5) || !validInterval(value.pollIntervalSeconds, 30)) return undefined;
   return {
     repositoryUrl,
     branch,
     gitUserName,
     gitUserEmail,
-    autoSync: value.autoSync,
     debounceSeconds: value.debounceSeconds,
     pollIntervalSeconds: value.pollIntervalSeconds,
     includeProfileAssociations: value.includeProfileAssociations,

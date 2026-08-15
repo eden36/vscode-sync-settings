@@ -12,6 +12,7 @@ import { ConfigurationRepositoryGitService } from '../src/git-service';
 import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
+import { parseRuntimeState, RuntimeStateStore } from '../src/runtime-state';
 import { containsPotentialSecret } from '../src/secret-scanner';
 import { atomicWriteJson, readJsonFile } from '../src/json-store';
 import { classifyThreeWay, resolveConflictFallback } from '../src/snapshot-conflict';
@@ -23,11 +24,34 @@ import {
   relateConfigurationRecords,
   resolveRepositoryUrl,
 } from '../src/configuration-record';
-import { parseExtensionIds } from '../src/extension-manifest';
-import { displaySyncPhase, formatRelativeSyncTime, isBusyPhase } from '../src/sidebar-status';
-import { decideCloudAdopt, finalSyncMessage } from '../src/sync-engine';
-import { DEFAULT_CONFIGURATION, PluginConfiguration, SyncConfiguration } from '../src/types';
-import { resetApplicationSettings } from './vscode-stub';
+import { parseExtensionIds, selectMissingExtensionIds, selectRemovableExtensionIds } from '../src/extension-manifest';
+import { displayIcon, displayPhase, displayTone, formatRelativeSyncTime } from '../src/sidebar-status';
+import { AiService } from '../src/ai';
+import { mergeStage } from '../src/pipeline/merge';
+import { runPipeline } from '../src/pipeline/pipeline';
+import { testing as stageTesting } from '../src/pipeline/stages';
+import { Stage, SyncContext, SyncDependencies } from '../src/pipeline/types';
+import { createMachine, reduce, SchedulerEvent, SchedulerMachine } from '../src/scheduler';
+import { finalSyncMessage } from '../src/sync-message';
+import { decideCloudAdopt } from '../src/sync-strategy';
+import {
+  createSyncReport,
+  DEFAULT_CONFIGURATION,
+  PluginConfiguration,
+  RuntimeStatus,
+  SyncConfiguration,
+  SyncState,
+} from '../src/types';
+import { installAndWaitForExtensions, testing as extensionWaitTesting, uninstallRemovedExtensions } from '../src/extension-wait';
+import {
+  resetApplicationSettings,
+  resetExtensionStub,
+  markExtensionInstalled,
+  markExtensionInstallFailed,
+  markExtensionUninstallFailed,
+  installCommandCalls,
+  uninstallCommandCalls,
+} from './vscode-stub';
 
 test('快照路径拒绝目录穿越', () => {
   assert.throws(() => testing.normalizeRelative('../settings.json'), /非法相对路径/);
@@ -190,7 +214,8 @@ test('leader 发布的同步状态会传播给 follower', async () => {
     let received: { lastSyncAt?: string } | undefined;
     follower.on('statusChanged', (value) => { received = value as { lastSyncAt?: string }; });
     await leader.publishStatus({
-      phase: '空闲',
+      sync: { kind: 'idle' },
+      link: 'in-sync',
       role: 'leader',
       activeWindows: 2,
       profiles: ['默认'],
@@ -291,6 +316,64 @@ test('按 location 枚举命名 Profile，并恢复文件修改和删除', async
     assert.equal(await readFile(path.join(namedPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 16}');
     await assert.rejects(readFile(path.join(namedPath, 'tasks.json')), /ENOENT/);
     assert.equal(restored.structuralChange, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照采集宿主级已安装扩展清单，只保留标识且不写回本机', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-extensions-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const extensionsRoot = path.join(root, '.cursor', 'extensions');
+  const extensionsManifestPath = path.join(extensionsRoot, 'extensions.json');
+  await Promise.all([mkdir(runtimePath, { recursive: true }), mkdir(extensionsRoot, { recursive: true })]);
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 15}');
+  // 真实清单里还有版本号、安装路径和安装时间，这些本机专属字段不应进入仓库。
+  await writeFile(extensionsManifestPath, JSON.stringify([
+    { identifier: { id: 'ms-python.python', uuid: 'x' }, version: '2024.1.0', location: { path: '/tmp/a' } },
+    { identifier: { id: 'anysphere.remote-ssh' }, version: '1.1.14', metadata: { installedTimestamp: 1 } },
+    { identifier: { id: 'ms-python.python' }, version: '2024.2.0' },
+  ]));
+
+  const adapter = new ProfileAdapter({ kind: 'cursor', userDataPath, runtimePath, extensionsManifestPath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    const manifest = await adapter.createSnapshot(snapshot);
+    assert.equal(typeof manifest.files['extensions.json'], 'string');
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(snapshot, 'extensions.json'), 'utf8')),
+      [{ identifier: { id: 'anysphere.remote-ssh' } }, { identifier: { id: 'ms-python.python' } }],
+    );
+
+    // 版本升级不改变标识集合，因此不应产生新的快照差异。
+    const before = manifest.files['extensions.json'];
+    await writeFile(extensionsManifestPath, JSON.stringify([
+      { identifier: { id: 'ms-python.python' }, version: '2025.9.9' },
+      { identifier: { id: 'anysphere.remote-ssh' }, version: '9.9.9' },
+    ]));
+    const second = await adapter.createSnapshot(path.join(root, 'snapshot2'));
+    assert.equal(second.files['extensions.json'], before);
+
+    // 写回只处理 Profile 文件，绝不覆盖 IDE 维护的扩展清单。
+    await writeFile(extensionsManifestPath, '{"sentinel": true}');
+    await adapter.restoreSnapshot(snapshot, false);
+    assert.equal(await readFile(extensionsManifestPath, 'utf8'), '{"sentinel": true}');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('未提供扩展清单路径时快照不含扩展信息', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-no-extensions-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  await mkdir(runtimePath, { recursive: true });
+  await writeFile(path.join(userDataPath, 'settings.json'), '{}');
+  try {
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const manifest = await adapter.createSnapshot(path.join(root, 'snapshot'));
+    assert.equal(manifest.files['extensions.json'], undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -528,6 +611,35 @@ test('Git 服务通过普通快进推送同步宿主目录', async () => {
   }
 });
 
+test('删除配置同步仓库的 .git 不推远端也不删工作区文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-remove-git-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const first = new ConfigurationRepositoryGitService(path.join(root, 'first'));
+    await first.prepare(configuration);
+    const hostRoot = path.join(first.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
+    await mkdir(hostRoot, { recursive: true });
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await first.stageHost('vscode');
+    await first.commitAndPush(configuration, 'chore(sync): 初始配置');
+    const remoteHead = (await runProcess('git', ['--git-dir', remote, 'rev-parse', 'refs/heads/main'])).stdout;
+
+    await first.removeGitDirectory();
+    await assert.rejects(readdir(path.join(first.repositoryPath, '.git')), /ENOENT/);
+    assert.equal(await readFile(path.join(hostRoot, 'manifest.json'), 'utf8'), '{"schemaVersion":1}');
+    assert.equal((await runProcess('git', ['--git-dir', remote, 'rev-parse', 'refs/heads/main'])).stdout, remoteHead);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('配置同步仓库 Git 操作不会修改当前项目仓库', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-isolation-'));
   const project = path.join(root, 'project');
@@ -598,30 +710,18 @@ test('冲突回退按本机优先并保证收敛到实际存在的一方', () =>
 test('自动合并后的状态文案说明处理方式并提示备份', () => {
   assert.equal(
     finalSyncMessage({
-      changed: true,
-      usedAiFallback: false,
-      recoveredPendingChanges: false,
-      recoveredFromDivergence: false,
+      ...createSyncReport(),
+      changedFileCount: 2,
       merge: { conflicts: ['a', 'b'], aiMerged: ['a'], autoMerged: ['b'] },
     }),
     '同步完成（AI 已自动合并 1 项冲突；1 项冲突按本机优先自动处理；冲突前的两份配置已备份到扩展运行目录）。',
   );
+  assert.equal(finalSyncMessage(createSyncReport()), '配置已是最新。');
   assert.equal(
     finalSyncMessage({
-      changed: false,
-      usedAiFallback: false,
-      recoveredPendingChanges: false,
-      recoveredFromDivergence: false,
-    }),
-    '配置已是最新。',
-  );
-  assert.equal(
-    finalSyncMessage({
+      ...createSyncReport(),
+      changedFileCount: 1,
       structuralMessage: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
-      changed: true,
-      usedAiFallback: false,
-      recoveredPendingChanges: false,
-      recoveredFromDivergence: false,
     }),
     '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
   );
@@ -629,33 +729,24 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
 
 test('首次接入的状态文案说明已按云端覆盖并提示备份', () => {
   assert.equal(
-    finalSyncMessage({
-      changed: false,
-      usedAiFallback: false,
-      recoveredPendingChanges: false,
-      recoveredFromDivergence: false,
-      adoptedCloud: true,
-    }),
+    finalSyncMessage({ ...createSyncReport(), adoptedCloud: true }),
     '同步完成（已按云端配置覆盖本机；本机原配置已备份到扩展运行目录）。',
   );
   assert.equal(
     finalSyncMessage({
-      structuralMessage: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。',
-      changed: false,
-      usedAiFallback: false,
-      recoveredPendingChanges: false,
-      recoveredFromDivergence: false,
+      ...createSyncReport(),
       adoptedCloud: true,
+      structuralMessage: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。',
     }),
     '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用；已按云端配置覆盖本机；本机原配置已备份到扩展运行目录。',
   );
 });
 
 test('状态栏只在同步执行阶段显示忙碌', () => {
-  assert.equal(isBusyPhase('正在拉取'), true);
-  assert.equal(isBusyPhase('等待 AI'), true);
-  assert.equal(isBusyPhase('空闲'), false);
-  assert.equal(isBusyPhase('等待其他窗口关闭'), false);
+  assert.equal(displayIcon({ kind: 'running', stage: 'pull' }, 'in-sync'), '$(sync~spin)');
+  assert.equal(displayIcon({ kind: 'running', stage: 'ai' }, 'in-sync'), '$(sync~spin)');
+  assert.equal(displayIcon({ kind: 'idle' }, 'in-sync'), '$(check)');
+  assert.equal(displayIcon({ kind: 'blocked', reason: 'other-windows' }, 'in-sync'), '$(question)');
 });
 
 test('凭据扫描覆盖常见键名与 token 值', () => {
@@ -831,15 +922,107 @@ test('解析 extensions.json 中的扩展标识', () => {
   ])), ['ms-python.python', 'vscodevim.vim']);
 });
 
+test('筛选待安装扩展时跳过已安装、需跳过和重复项', () => {
+  assert.deepEqual(selectMissingExtensionIds(
+    ['ms-python.python', 'vscodevim.vim', 'ms-python.python', 'saltcoreyan.my-setting-sync', ''],
+    ['ms-python.python'],
+    ['saltcoreyan.my-setting-sync'],
+  ), ['vscodevim.vim']);
+  assert.deepEqual(selectMissingExtensionIds(['a.b'], ['a.b']), []);
+  assert.deepEqual(selectMissingExtensionIds([], ['a.b']), []);
+});
+
+test('同步后会调用 IDE 安装尚未存在的扩展', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  markExtensionInstalled('already.present');
+  const result = await installAndWaitForExtensions(
+    ['already.present', 'ms-python.python', 'saltcoreyan.my-setting-sync'],
+    { timeoutMs: 1_000 },
+  );
+  assert.equal(result.converged, true);
+  assert.deepEqual(result.pending, []);
+  assert.deepEqual(installCommandCalls, ['ms-python.python']);
+});
+
+test('扩展安装失败时不中断同步并记录未完成项', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  markExtensionInstallFailed('missing.one');
+  const result = await installAndWaitForExtensions(['missing.one', 'ok.two'], { timeoutMs: 1_000 });
+  assert.equal(result.converged, false);
+  assert.deepEqual(result.pending, ['missing.one']);
+  assert.deepEqual(installCommandCalls, ['missing.one', 'ok.two']);
+  installCommandCalls.length = 0;
+  const retry = await installAndWaitForExtensions(['missing.one', 'ok.two'], { timeoutMs: 1_000 });
+  assert.deepEqual(retry.pending, ['missing.one']);
+  assert.deepEqual(installCommandCalls, []);
+});
+
+test('云端移除的扩展会在本机卸载', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  const failed = await uninstallRemovedExtensions(
+    ['keep.one'],
+    ['keep.one', 'drop.two', 'drop.three'],
+    { timeoutMs: 1_000 },
+  );
+  assert.deepEqual(failed, []);
+  assert.deepEqual(uninstallCommandCalls, ['drop.two', 'drop.three']);
+});
+
+test('卸载不会波及本插件自身和内置扩展', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  // installedIds 只来自扩展清单文件，内置扩展本就不在其中；本插件即使在清单里也必须跳过。
+  await uninstallRemovedExtensions(['keep.one'], ['keep.one', 'saltcoreyan.my-setting-sync'], { timeoutMs: 1_000 });
+  assert.deepEqual(uninstallCommandCalls, []);
+});
+
+test('云端没有扩展信息时不清空本机扩展', () => {
+  assert.deepEqual(selectRemovableExtensionIds(['a.one', 'b.two'], []), []);
+  assert.deepEqual(selectRemovableExtensionIds(['a.one', 'b.two'], ['a.one']), ['b.two']);
+});
+
+test('扩展卸载失败时记录未完成项且本进程不再重试', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  markExtensionUninstallFailed('stuck.one');
+  const failed = await uninstallRemovedExtensions(['keep.one'], ['stuck.one', 'drop.two'], { timeoutMs: 1_000 });
+  assert.deepEqual(failed, ['stuck.one']);
+  assert.deepEqual(uninstallCommandCalls, ['stuck.one', 'drop.two']);
+
+  uninstallCommandCalls.length = 0;
+  const retry = await uninstallRemovedExtensions(['keep.one'], ['stuck.one'], { timeoutMs: 1_000 });
+  assert.deepEqual(retry, []);
+  assert.deepEqual(uninstallCommandCalls, []);
+});
+
 test('检测 URL 中嵌入的明文凭据', () => {
   assert.equal(hasEmbeddedCredentials('https://user:ghp_token@github.com/user/repo.git'), true);
   assert.equal(hasEmbeddedCredentials('git@github.com:user/repo.git'), false);
 });
 
-test('侧边栏仅在已有成功同步记录时显示已同步', () => {
-  assert.equal(displaySyncPhase('空闲', undefined), '未同步');
-  assert.equal(displaySyncPhase('空闲', '2026-08-09T04:44:35.000Z'), '已同步');
-  assert.equal(displaySyncPhase('正在拉取', undefined), '正在拉取');
+test('对外状态由链路状态和本地远端关系共同决定', () => {
+  assert.equal(displayPhase({ kind: 'disabled' }, 'in-sync'), '已关闭');
+  assert.equal(displayPhase({ kind: 'unconfigured' }, 'no-repository'), '未配置');
+  assert.equal(displayPhase({ kind: 'running', stage: 'pull' }, 'in-sync'), '同步中');
+  assert.equal(displayPhase({ kind: 'blocked', reason: 'unrelated' }, 'unrelated'), '需要处理');
+  assert.equal(displayPhase({ kind: 'failed' }, 'in-sync'), '同步失败');
+  assert.equal(displayPhase({ kind: 'idle' }, 'in-sync'), '已同步');
+  assert.equal(displayPhase({ kind: 'idle' }, 'diverged'), '已同步');
+  assert.equal(displayPhase({ kind: 'idle' }, 'never-synced'), '未同步');
+});
+
+test('删除本地仓库后即使留有上次同步时间也显示未同步', () => {
+  assert.equal(displayPhase({ kind: 'idle' }, 'no-repository'), '未同步');
+  assert.equal(displayIcon({ kind: 'idle' }, 'no-repository'), '$(circle-outline)');
+  assert.equal(displayTone({ kind: 'idle' }, 'no-repository'), 'muted');
+});
+
+test('关闭同步时状态不按告警呈现', () => {
+  assert.equal(displayIcon({ kind: 'disabled' }, 'in-sync'), '$(circle-slash)');
+  assert.equal(displayTone({ kind: 'disabled' }, 'in-sync'), 'muted');
 });
 
 test('格式化同步相对时间', () => {
@@ -1005,12 +1188,12 @@ test('本地仓库与远端没有共同祖先时拒绝合并且不改写本地�
 });
 
 test('快照剥离插件自身设置并在写回本机时保留原值', () => {
-  const text = '{\n  // 编辑器\n  "editor.fontSize": 14,\n  "profileGitSync.autoSync": false\n}';
+  const text = '{\n  // 编辑器\n  "editor.fontSize": 14,\n  "profileGitSync.enabled": false\n}';
   const stripped = testing.stripPluginSettings(text);
   assert.match(stripped, /\/\/ 编辑器/);
   assert.doesNotMatch(stripped, /profileGitSync/);
-  const restored = testing.restorePluginSettings(stripped, '{"profileGitSync.autoSync": true}');
-  assert.match(restored, /"profileGitSync.autoSync":\s*true/);
+  const restored = testing.restorePluginSettings(stripped, '{"profileGitSync.enabled": true}');
+  assert.match(restored, /"profileGitSync.enabled":\s*true/);
   assert.match(restored, /"editor.fontSize":\s*14/);
   assert.equal(testing.stripPluginSettings('not-json'), 'not-json');
   assert.equal(testing.restorePluginSettings('{}', 'not-json'), '{}');
@@ -1095,6 +1278,394 @@ test('共享 JSON 存储写入完整内容并忽略损坏文件', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('运行状态解析拒绝结构不符的记录', () => {
+  const valid = { schemaVersion: 1, enabled: true, link: 'in-sync', cloudAdoptPending: false };
+  assert.deepEqual(parseRuntimeState(valid), valid);
+  assert.deepEqual(parseRuntimeState({ ...valid, lastSyncAt: '2026-08-09T04:44:35.000Z' }), {
+    ...valid,
+    lastSyncAt: '2026-08-09T04:44:35.000Z',
+  });
+  assert.equal(parseRuntimeState({ ...valid, schemaVersion: 2 }), undefined);
+  assert.equal(parseRuntimeState({ ...valid, link: '已同步' }), undefined);
+  assert.equal(parseRuntimeState({ ...valid, enabled: 'true' }), undefined);
+  assert.equal(parseRuntimeState({ ...valid, lastSyncAt: 12 }), undefined);
+  assert.equal(parseRuntimeState(undefined), undefined);
+});
+
+test('运行状态在多个窗口之间共享且互不覆盖其他字段', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-runtime-state-'));
+  try {
+    const first = new RuntimeStateStore(root);
+    const second = new RuntimeStateStore(root);
+    await first.initialize();
+    await second.initialize();
+
+    await first.update({ link: 'in-sync', lastSyncAt: '2026-08-09T04:44:35.000Z' });
+    // 第二个窗口在自己的缓存上只改另一个字段，不应把第一个窗口写入的值退回默认。
+    await second.update({ cloudAdoptPending: true });
+
+    const third = new RuntimeStateStore(root);
+    await third.initialize();
+    assert.equal(third.get().link, 'in-sync');
+    assert.equal(third.get().lastSyncAt, '2026-08-09T04:44:35.000Z');
+    assert.equal(third.get().cloudAdoptPending, true);
+
+    assert.equal(await first.reload(), true);
+    assert.equal(first.get().cloudAdoptPending, true);
+    assert.equal(await first.reload(), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('删除本地仓库后清空上次同步时间', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-runtime-clear-'));
+  try {
+    const store = new RuntimeStateStore(root);
+    await store.initialize();
+    await store.update({ link: 'in-sync', lastSyncAt: '2026-08-09T04:44:35.000Z' });
+    await store.update({ link: 'no-repository', lastSyncAt: undefined });
+
+    const reopened = new RuntimeStateStore(root);
+    await reopened.initialize();
+    assert.equal(reopened.get().link, 'no-repository');
+    assert.equal(reopened.get().lastSyncAt, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('拉取到不同源的远端时暂停同步而不是直接失败', async () => {
+  const context = stageContext({
+    dependencies: stageDependencies({
+      git: fakeGit({ pull: async () => ({ state: 'unrelated', recoveredFromDivergence: false }) }),
+    }),
+  });
+  assert.deepEqual(await stageTesting.pullStage.run(context), { kind: 'blocked', reason: 'unrelated', link: 'unrelated' });
+});
+
+test('整包采用云端时不产生新的远端提交', async () => {
+  let staged = false;
+  const context = stageContext({
+    artifacts: { strategy: 'adopt' },
+    dependencies: stageDependencies({
+      git: fakeGit({ stageHost: async () => { staged = true; return []; } }),
+    }),
+  });
+  assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
+  assert.equal(staged, false);
+});
+
+test('提交前发现未保存的配置文档时暂停且不推送', async () => {
+  let pushed = false;
+  const context = stageContext({
+    artifacts: { strategy: 'merge' },
+    dependencies: stageDependencies({
+      git: fakeGit({ stageHost: async () => [], pushIfAhead: async () => { pushed = true; } }),
+      windowSafety: async () => ({ activeWindows: 2, dirtyWindows: 1, unreadableWindows: 0 }),
+    }),
+  });
+  const outcome = await stageTesting.pushStage.run(context);
+  assert.equal(outcome.kind, 'blocked');
+  assert.equal(outcome.kind === 'blocked' ? outcome.reason : undefined, 'dirty-windows');
+  assert.equal(pushed, false);
+});
+
+test('强制采用云端但云端没有本宿主快照时中止并清除重建标记', async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  const context = stageContext({
+    adoptCloud: true,
+    artifacts: { pull: { state: 'synced', recoveredFromDivergence: false } },
+    dependencies: stageDependencies({
+      runtimeState: { update: async (patch: Record<string, unknown>) => { updates.push(patch); } } as unknown as RuntimeStateStore,
+    }),
+  });
+  await assert.rejects(() => stageTesting.decideStage.run(context), /云端没有 VS Code 的配置快照/);
+  assert.deepEqual(updates, [{ cloudAdoptPending: false }]);
+});
+
+test('远端还没有本宿主快照时直接用本机内容初始化', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-seed-'));
+  try {
+    const localHostRoot = path.join(root, 'tmp', 'vscode');
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    await mkdir(localHostRoot, { recursive: true });
+    await writeFile(path.join(localHostRoot, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [], files: {},
+    }));
+
+    const context = stageContext({
+      artifacts: { strategy: 'seed-local', remoteExists: false },
+      paths: {
+        temporaryRoot: path.join(root, 'tmp'),
+        localHostRoot,
+        baseHostRoot: path.join(root, 'tmp', 'base'),
+        repositoryHostRoot,
+      },
+    });
+
+    // 远端缺少 manifest.json，走合并会直接读文件失败，这里必须跳过合并。
+    assert.deepEqual(await mergeStage.run(context), { kind: 'continue' });
+    assert.equal(context.report.merge, undefined);
+    assert.deepEqual(await readJsonFile(path.join(repositoryHostRoot, 'manifest.json')), {
+      schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [], files: {},
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('扩展同步只认宿主级清单，忽略 Profile 目录下的启用状态', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-stage-'));
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  try {
+    const repositoryHostRoot = path.join(root, 'repository', 'cursor');
+    await mkdir(path.join(repositoryHostRoot, 'profiles', 'default'), { recursive: true });
+    // 仅 Profile 级清单存在时不应触发任何安装或卸载。
+    await writeFile(path.join(repositoryHostRoot, 'profiles', 'default', 'extensions.json'),
+      JSON.stringify([{ identifier: { id: 'stale.one' } }]));
+    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1, host: 'cursor', createdAt: '', profiles: [],
+      files: { 'profiles/default/extensions.json': 'x' },
+    }));
+
+    const context = stageContext({
+      paths: {
+        temporaryRoot: path.join(root, 'tmp'),
+        localHostRoot: path.join(root, 'tmp', 'cursor'),
+        baseHostRoot: path.join(root, 'tmp', 'base'),
+        repositoryHostRoot,
+      },
+      dependencies: stageDependencies({
+        adapter: { listInstalledExtensionIds: async () => ['local.only'] } as unknown as ProfileAdapter,
+      }),
+    });
+
+    assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
+    assert.deepEqual(installCommandCalls, []);
+    assert.deepEqual(uninstallCommandCalls, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('管道在阻塞时不再执行后续步骤', async () => {
+  const executed: string[] = [];
+  const stages: Stage[] = [
+    { name: 'snapshot', async run() { executed.push('snapshot'); return { kind: 'continue' }; } },
+    { name: 'pull', async run() { executed.push('pull'); return { kind: 'blocked', reason: 'unrelated', link: 'unrelated' }; } },
+    { name: 'push', async run() { executed.push('push'); return { kind: 'continue' }; } },
+  ];
+  const patches: Array<Partial<RuntimeStatus>> = [];
+  const context = stageContext({ dependencies: stageDependencies({ updateStatus: (patch) => { patches.push(patch); } }) });
+
+  assert.deepEqual(await runPipeline(context, stages), { ok: false, unrelated: true, blockReason: 'unrelated' });
+  assert.deepEqual(executed, ['snapshot', 'pull']);
+  // 每进入一个步骤都会上报进度，无需 stage 自己写状态。
+  assert.deepEqual(patches.slice(0, 2).map((patch) => patch.sync), [
+    { kind: 'running', stage: 'snapshot' },
+    { kind: 'running', stage: 'pull' },
+  ]);
+});
+
+test('结构变化未应用时同步仍算完成但报告需要关闭其他窗口', async () => {
+  const context = stageContext({ report: { ...createSyncReport(), waitingForWindows: true, activeWindows: 2 } });
+  const outcome = await runPipeline(context, []);
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.waitingForWindows, true);
+});
+
+test('同步顺利结束时报告完成并给出状态说明', async () => {
+  const patches: Array<Partial<RuntimeStatus>> = [];
+  const context = stageContext({
+    dependencies: stageDependencies({ updateStatus: (patch) => { patches.push(patch); } }),
+  });
+
+  const outcome = await runPipeline(context, []);
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.waitingForWindows, false);
+  // 流程只写说明文案，链路状态交给调度层判定。
+  assert.equal(patches.at(-1)?.sync, undefined);
+  assert.equal(patches.at(-1)?.link, undefined);
+  assert.equal(patches.at(-1)?.message, '配置已是最新。');
+});
+
+test('关闭同步开关后不再发起任何同步', () => {
+  const machine = { ...leaderMachine(), enabled: false, sync: { kind: 'disabled' } as SyncState };
+  for (const event of [
+    { type: 'sync-requested', source: 'user' },
+    { type: 'sync-requested', source: 'timer' },
+    { type: 'sync-requested', source: 'startup' },
+  ] as SchedulerEvent[]) {
+    const { next, commands } = reduce(machine, event);
+    assert.deepEqual(commands, []);
+    assert.deepEqual(next.sync, { kind: 'disabled' });
+  }
+});
+
+test('同步进行中关闭开关不打断当前这一轮', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
+  const closed = reduce(running, { type: 'enabled-changed', enabled: false });
+  // 仍在 running：已经提交但未推送的中间态不能被切断。
+  assert.deepEqual(closed.next.sync, { kind: 'running', stage: 'push' });
+  assert.deepEqual(closed.commands.map((command) => command.type), ['stop-schedules', 'cancel-retry']);
+
+  const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  assert.deepEqual(finished.next.sync, { kind: 'disabled' });
+});
+
+test('开启开关后立即同步一次并启动定时器', () => {
+  const disabled: SchedulerMachine = { ...leaderMachine(), enabled: false, sync: { kind: 'disabled' } };
+  const { next, commands } = reduce(disabled, { type: 'enabled-changed', enabled: true });
+  assert.deepEqual(next.sync, { kind: 'idle' });
+  assert.deepEqual(commands, [{ type: 'start-schedules' }, { type: 'start-sync', adoptCloud: false }]);
+});
+
+test('同步期间的请求排队，结束后再跑一轮', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'merge' } };
+  const queued = reduce(running, { type: 'sync-requested', source: 'timer' });
+  assert.equal(queued.next.pending, true);
+  assert.deepEqual(queued.commands, []);
+
+  const finished = reduce(queued.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  assert.deepEqual(finished.next.sync, { kind: 'running', stage: 'snapshot' });
+  assert.deepEqual(finished.commands, [{ type: 'start-sync', adoptCloud: false }]);
+});
+
+test('阻塞是否可自动恢复取决于原因', () => {
+  const safe = { activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 };
+  const resolvable: Array<[SchedulerMachine['sync'], boolean]> = [
+    [{ kind: 'blocked', reason: 'dirty-windows' }, true],
+    [{ kind: 'blocked', reason: 'unreadable-windows' }, true],
+    [{ kind: 'blocked', reason: 'other-windows' }, true],
+    [{ kind: 'blocked', reason: 'unrelated' }, false],
+    [{ kind: 'blocked', reason: 'exclusive-lock' }, false],
+  ];
+  for (const [sync, shouldResume] of resolvable) {
+    const { commands } = reduce({ ...leaderMachine(), sync }, { type: 'windows-changed', safety: safe });
+    assert.deepEqual(commands, shouldResume ? [{ type: 'start-sync', adoptCloud: false }] : []);
+  }
+});
+
+test('未保存文档仍在时阻塞不解除', () => {
+  const blocked: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'blocked', reason: 'dirty-windows' } };
+  const { commands } = reduce(blocked, {
+    type: 'windows-changed',
+    safety: { activeWindows: 2, dirtyWindows: 1, unreadableWindows: 0 },
+  });
+  assert.deepEqual(commands, []);
+});
+
+test('不同源只询问一次，用户拒绝后不再弹窗', () => {
+  const first = reduce(leaderMachine(), { type: 'sync-finished', outcome: { ok: false, unrelated: true } });
+  assert.deepEqual(first.next.sync, { kind: 'blocked', reason: 'unrelated' });
+  assert.equal(first.next.link, 'unrelated');
+  assert.deepEqual(first.commands, [{ type: 'prompt-cloud-adopt' }]);
+
+  const declined = reduce(first.next, { type: 'cloud-adopt-declined' });
+  assert.deepEqual(reduce(declined.next, { type: 'sync-requested', source: 'timer' }).commands, []);
+
+  // 换了仓库地址后重新允许询问。
+  const reconfigured = reduce(declined.next, { type: 'configuration-changed', configured: true, repositoryChanged: true });
+  assert.deepEqual(reconfigured.next.sync, { kind: 'idle' });
+  assert.equal(reconfigured.next.cloudAdoptPrompted, false);
+});
+
+test('用户确认重建时绕过不同源阻塞直接同步', () => {
+  const blocked: SchedulerMachine = {
+    ...leaderMachine(),
+    sync: { kind: 'blocked', reason: 'unrelated' },
+    link: 'unrelated',
+    cloudAdoptPrompted: true,
+  };
+  const { next, commands } = reduce(blocked, { type: 'sync-requested', source: 'user', adoptCloud: true });
+  assert.deepEqual(next.sync, { kind: 'running', stage: 'snapshot' });
+  assert.deepEqual(commands, [{ type: 'start-sync', adoptCloud: true }]);
+});
+
+test('抢不到独占锁时按指数退避重试', () => {
+  let machine = leaderMachine();
+  const delays: number[] = [];
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const { next, commands } = reduce(machine, { type: 'sync-lock-busy' });
+    machine = next;
+    const retry = commands.find((command) => command.type === 'schedule-retry');
+    if (retry?.type === 'schedule-retry') delays.push(retry.delayMs);
+  }
+  assert.deepEqual(delays, [5_000, 10_000, 20_000, 40_000, 60_000]);
+  assert.deepEqual(machine.sync, { kind: 'blocked', reason: 'exclusive-lock' });
+
+  // 成功一轮后退避重新归零。
+  const recovered = reduce(machine, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  assert.equal(recovered.next.retryAttempt, 0);
+  assert.deepEqual(recovered.next.sync, { kind: 'idle' });
+});
+
+test('follower 收到请求时转交给 leader 而不是自己执行', () => {
+  const follower: SchedulerMachine = { ...leaderMachine(), isLeader: false };
+  const { next, commands } = reduce(follower, { type: 'sync-requested', source: 'user' });
+  assert.deepEqual(commands, [{ type: 'forward-sync-request' }]);
+  assert.deepEqual(next.sync, { kind: 'idle' });
+});
+
+test('删除本地仓库后链路状态回到没有仓库', () => {
+  const synced: SchedulerMachine = { ...leaderMachine(), link: 'in-sync' };
+  const { next } = reduce(synced, { type: 'repository-removed' });
+  assert.equal(next.link, 'no-repository');
+  assert.deepEqual(next.sync, { kind: 'idle' });
+  assert.equal(displayPhase(next.sync, next.link), '未同步');
+});
+
+test('结构变化已应用时请求重载窗口', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'apply' } };
+  const { next, commands } = reduce(running, {
+    type: 'sync-finished',
+    outcome: { ok: true, structuralApplied: true, waitingForWindows: false },
+  });
+  assert.deepEqual(next.sync, { kind: 'idle' });
+  assert.deepEqual(commands.map((command) => command.type), ['reload-window', 'complete-sync-requests']);
+});
+
+function leaderMachine(): SchedulerMachine {
+  return { ...createMachine({ enabled: true, configured: true, link: 'never-synced' }), isLeader: true };
+}
+
+function stageDependencies(overrides: Partial<SyncDependencies> = {}): SyncDependencies {
+  return {
+    environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime' },
+    adapter: {} as unknown as ProfileAdapter,
+    git: fakeGit({}),
+    ai: {} as unknown as AiService,
+    runtimeState: { update: async () => undefined } as unknown as RuntimeStateStore,
+    windowSafety: async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    updateStatus: () => undefined,
+    conflictBackupRoot: '/runtime/conflict-backups',
+    ...overrides,
+  };
+}
+
+function stageContext(overrides: Partial<SyncContext> = {}): SyncContext {
+  return {
+    dependencies: stageDependencies(),
+    configuration: { ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git' },
+    adoptCloud: false,
+    paths: {
+      temporaryRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp'),
+      localHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp', 'vscode'),
+      baseHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp', 'base'),
+      repositoryHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'repository'),
+    },
+    report: createSyncReport(),
+    artifacts: {},
+    ...overrides,
+  };
+}
+
+function fakeGit(overrides: Partial<ConfigurationRepositoryGitService>): ConfigurationRepositoryGitService {
+  return { repositoryPath: '/runtime/repository', ...overrides } as unknown as ConfigurationRepositoryGitService;
+}
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
