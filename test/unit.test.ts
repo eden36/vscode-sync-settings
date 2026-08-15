@@ -25,6 +25,7 @@ import {
   resolveRepositoryUrl,
 } from '../src/configuration-record';
 import { parseExtensionIds, selectMissingExtensionIds, selectRemovableExtensionIds } from '../src/extension-manifest';
+import { withFileLock } from '../src/file-lock';
 import { displayIcon, displayPhase, displayTone, formatRelativeSyncTime } from '../src/sidebar-status';
 import { AiService } from '../src/ai';
 import { mergeStage } from '../src/pipeline/merge';
@@ -1010,8 +1011,7 @@ test('对外状态由链路状态和本地远端关系共同决定', () => {
   assert.equal(displayPhase({ kind: 'blocked', reason: 'unrelated' }, 'unrelated'), '需要处理');
   assert.equal(displayPhase({ kind: 'failed' }, 'in-sync'), '同步失败');
   assert.equal(displayPhase({ kind: 'idle' }, 'in-sync'), '已同步');
-  assert.equal(displayPhase({ kind: 'idle' }, 'diverged'), '已同步');
-  assert.equal(displayPhase({ kind: 'idle' }, 'never-synced'), '未同步');
+  assert.equal(displayPhase({ kind: 'idle' }, 'no-repository'), '未同步');
 });
 
 test('删除本地仓库后即使留有上次同步时间也显示未同步', () => {
@@ -1279,6 +1279,33 @@ test('共享 JSON 存储写入完整内容并忽略损坏文件', async () => {
   }
 });
 
+test('文件锁只在持有者已退出或长期不释放时才被清理', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-lock-'));
+  const lockPath = path.join(root, 'busy.lock');
+  try {
+    // 持有者仍在运行且未超过残留判定时长：必须等待并最终超时，不能抢锁并行写同一份文件。
+    await writeFile(lockPath, JSON.stringify({ token: 'other', pid: process.pid, createdAt: Date.now() }));
+    await assert.rejects(
+      () => withFileLock(lockPath, async () => undefined, { timeoutMs: 120, staleMs: 60_000, busyMessage: '锁被占用' }),
+      /锁被占用/,
+    );
+
+    // 持有者已退出：无需等待残留时长即可接管，避免进程被强杀后所有窗口都写不进配置。
+    await writeFile(lockPath, JSON.stringify({ token: 'dead', pid: 2_147_483_646, createdAt: Date.now() }));
+    let entered = false;
+    await withFileLock(lockPath, async () => { entered = true; }, { timeoutMs: 500, staleMs: 60_000 });
+    assert.equal(entered, true);
+
+    // 持有者卡死不释放时用时长兜底，否则一个挂起的进程会永久阻塞其它窗口。
+    await writeFile(lockPath, JSON.stringify({ token: 'stuck', pid: process.pid, createdAt: Date.now() - 3_600_000 }));
+    let recovered = false;
+    await withFileLock(lockPath, async () => { recovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
+    assert.equal(recovered, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('运行状态解析拒绝结构不符的记录', () => {
   const valid = { schemaVersion: 1, enabled: true, link: 'in-sync', cloudAdoptPending: false };
   assert.deepEqual(parseRuntimeState(valid), valid);
@@ -1342,7 +1369,7 @@ test('拉取到不同源的远端时暂停同步而不是直接失败', async ()
       git: fakeGit({ pull: async () => ({ state: 'unrelated', recoveredFromDivergence: false }) }),
     }),
   });
-  assert.deepEqual(await stageTesting.pullStage.run(context), { kind: 'blocked', reason: 'unrelated', link: 'unrelated' });
+  assert.deepEqual(await stageTesting.pullStage.run(context), { kind: 'blocked', reason: 'unrelated' });
 });
 
 test('整包采用云端时不产生新的远端提交', async () => {
@@ -1625,11 +1652,22 @@ test('结构变化已应用时请求重载窗口', () => {
     outcome: { ok: true, structuralApplied: true, waitingForWindows: false },
   });
   assert.deepEqual(next.sync, { kind: 'idle' });
-  assert.deepEqual(commands.map((command) => command.type), ['reload-window', 'complete-sync-requests']);
+  assert.deepEqual(commands, [{ type: 'reload-window' }]);
+});
+
+test('重载窗口时不再并行开启排队的同步', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'apply' }, pending: true };
+  const { next, commands } = reduce(running, {
+    type: 'sync-finished',
+    outcome: { ok: true, structuralApplied: true, waitingForWindows: false },
+  });
+  // 同步与重载并行会把 Git 操作掐断在中途；排队请求留到重启后由 leader 重新认领。
+  assert.deepEqual(commands, [{ type: 'reload-window' }]);
+  assert.equal(next.pending, false);
 });
 
 function leaderMachine(): SchedulerMachine {
-  return { ...createMachine({ enabled: true, configured: true, link: 'never-synced' }), isLeader: true };
+  return { ...createMachine({ enabled: true, configured: true, link: 'no-repository' }), isLeader: true };
 }
 
 function stageDependencies(overrides: Partial<SyncDependencies> = {}): SyncDependencies {

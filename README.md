@@ -76,7 +76,7 @@ npm run package
 
 需要验证多窗口时，可在已打开的调试宿主中执行“新建窗口”，并选择不同 Profile；这些窗口共享同一个隔离 User Data，适合观察 leader/follower 状态。
 
-生成的 `my-setting-sync-0.1.0.vsix` 可通过 VS Code 或 Cursor 的“从 VSIX 安装”功能安装。
+生成的 `my-setting-sync-<版本号>.vsix` 可通过 VS Code 或 Cursor 的“从 VSIX 安装”功能安装。
 
 ## 使用
 

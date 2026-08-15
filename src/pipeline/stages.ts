@@ -49,7 +49,8 @@ const pullStage: Stage = {
   async run(context: SyncContext): Promise<StageOutcome> {
     const { git, environment } = context.dependencies;
     const pull = await git.pull(context.configuration);
-    if (pull.state === 'unrelated') return { kind: 'blocked', reason: 'unrelated', link: 'unrelated' };
+    // 链路状态由调度层根据 SyncOutcome.unrelated 写入，stage 只报告阻塞原因。
+    if (pull.state === 'unrelated') return { kind: 'blocked', reason: 'unrelated' };
     context.artifacts.pull = pull;
     context.report.recoveredFromDivergence = pull.recoveredFromDivergence;
     // 基准必须取本地与远端的共同祖先，否则本机上次的改动会被当成共同基础，导致误判冲突。

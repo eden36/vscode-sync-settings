@@ -53,13 +53,14 @@ export async function withFileLock<T>(lockPath: string, action: () => Promise<T>
 
 function isStaleLock(value: unknown, staleMs: number): boolean {
   if (!isRecord(value) || typeof value.pid !== 'number' || typeof value.createdAt !== 'number') return false;
-  if (Date.now() - value.createdAt > staleMs) return true;
+  // 先确认持有者是否还活着：活进程持有的锁不能因为耗时长就被抢走，否则两个窗口会并行写同一份文件。
   try {
     process.kill(value.pid, 0);
-    return false;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'EPERM';
+    if ((error as NodeJS.ErrnoException).code !== 'EPERM') return true;
   }
+  // 进程仍在，但长时间不释放通常意味着 pid 已被系统复用或持有者卡死，用时间兜底避免永久阻塞。
+  return Date.now() - value.createdAt > staleMs;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

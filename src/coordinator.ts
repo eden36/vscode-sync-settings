@@ -73,9 +73,7 @@ const STAGE_NAMES = new Set<StageName>([
 const BLOCK_REASONS = new Set<BlockReason>([
   'dirty-windows', 'unreadable-windows', 'other-windows', 'unrelated', 'exclusive-lock',
 ]);
-const LINK_STATES = new Set<LinkState>([
-  'no-repository', 'never-synced', 'in-sync', 'diverged', 'unrelated',
-]);
+const LINK_STATES = new Set<LinkState>(['no-repository', 'in-sync', 'unrelated']);
 
 export class MultiWindowCoordinator extends EventEmitter {
   public readonly instanceId = randomUUID();

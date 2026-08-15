@@ -4,9 +4,7 @@ import { atomicWriteJson, readJsonFile as readJson } from './json-store';
 import { LinkState } from './types';
 
 const RUNTIME_STATE_LOCK_BUSY = '同步状态正在被其他窗口更新，请稍后重试。';
-const LINK_STATES = new Set<LinkState>([
-  'no-repository', 'never-synced', 'in-sync', 'diverged', 'unrelated',
-]);
+const LINK_STATES = new Set<LinkState>(['no-repository', 'in-sync', 'unrelated']);
 
 /**
  * 跨窗口、跨 Profile 共享的运行状态。

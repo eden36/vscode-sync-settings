@@ -27,9 +27,7 @@ export type BlockReason =
  */
 export type LinkState =
   | 'no-repository'
-  | 'never-synced'
   | 'in-sync'
-  | 'diverged'
   | 'unrelated';
 
 /** 扩展当前在做什么。与 LinkState 正交，两者共同决定对外显示的状态。 */

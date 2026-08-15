@@ -11,7 +11,7 @@ export function displayPhase(sync: SyncState, link: LinkState): DisplayPhase {
     case 'running': return '同步中';
     case 'blocked': return '需要处理';
     case 'failed': return '同步失败';
-    case 'idle': return link === 'in-sync' || link === 'diverged' ? '已同步' : '未同步';
+    case 'idle': return link === 'in-sync' ? '已同步' : '未同步';
   }
 }
 
@@ -22,7 +22,7 @@ export function displayIcon(sync: SyncState, link: LinkState): string {
     case 'running': return '$(sync~spin)';
     case 'blocked': return '$(question)';
     case 'failed': return '$(warning)';
-    case 'idle': return link === 'in-sync' || link === 'diverged' ? '$(check)' : '$(circle-outline)';
+    case 'idle': return link === 'in-sync' ? '$(check)' : '$(circle-outline)';
   }
 }
 
@@ -34,7 +34,7 @@ export function displayTone(sync: SyncState, link: LinkState): DisplayTone {
     case 'running': return 'running';
     case 'blocked': return 'warning';
     case 'failed': return 'error';
-    case 'idle': return link === 'in-sync' || link === 'diverged' ? 'success' : 'muted';
+    case 'idle': return link === 'in-sync' ? 'success' : 'muted';
   }
 }
 

@@ -56,7 +56,7 @@ export interface SyncContext {
 
 export type StageOutcome =
   | { kind: 'continue' }
-  | { kind: 'blocked'; reason: BlockReason; link?: LinkState; message?: string };
+  | { kind: 'blocked'; reason: BlockReason; message?: string };
 
 export interface Stage {
   readonly name: StageName;

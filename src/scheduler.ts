@@ -231,13 +231,18 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
     retryAttempt: 0,
     cloudAdoptPrompted: false,
   };
-  const commands: SchedulerCommand[] = [];
-  if (outcome.structuralApplied) commands.push({ type: 'reload-window' });
-  if (machine.pending && machine.isLeader) {
-    return { next: { ...next, sync: { kind: 'running', stage: 'snapshot' } }, commands: [...commands, { type: 'start-sync', adoptCloud: false }] };
+  // 窗口即将重载，此时再开一轮同步会被中途掐断，可能留下已提交未推送的中间态。
+  // 排队中的请求不在这里消费，重载后由 leader 重新认领并触发启动同步。
+  if (outcome.structuralApplied) {
+    return { next: { ...next, pending: false }, commands: [{ type: 'reload-window' }] };
   }
-  commands.push({ type: 'complete-sync-requests' });
-  return { next, commands };
+  if (machine.pending && machine.isLeader) {
+    return {
+      next: { ...next, sync: { kind: 'running', stage: 'snapshot' } },
+      commands: [{ type: 'start-sync', adoptCloud: false }],
+    };
+  }
+  return { next, commands: [{ type: 'complete-sync-requests' }] };
 }
 
 /** 阻塞原因决定了它能否被窗口状态变化解除；退避重试和用户决策不在此列。 */
