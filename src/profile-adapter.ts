@@ -112,7 +112,7 @@ export class ProfileAdapter {
       host: this.environment.kind,
       createdAt: '',
       profiles: profiles.map(({ id, name, isDefault }) => ({ id, name, isDefault })),
-      profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })),
+      profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })) ?? [],
       ...(includeAssociations && storage.profileAssociations !== undefined
         ? { profileAssociations: storage.profileAssociations }
         : {}),
@@ -213,8 +213,7 @@ export class ProfileAdapter {
   }
 
   private async restoreProfileStructure(manifest: SnapshotManifest): Promise<void> {
-    const metadata = manifest.profileMetadata;
-    if (!metadata) throw new Error('远程快照缺少 Profile 元数据，无法安全应用结构变化。');
+    const metadata = resolveProfileMetadata(manifest);
     const locations = metadata.map((profile) => profile.location);
     if (!locations.every((location) => typeof location === 'string' && isSafeSegment(location))) {
       throw new Error('远程 Profile 元数据包含非法目录。');
@@ -460,4 +459,12 @@ function setsEqual(left: Set<string>, right: Set<string>): boolean {
   return left.size === right.size && [...left].every((item) => right.has(item));
 }
 
-export const testing = { normalizeRelative, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups };
+/** 旧快照可能省略元数据；命名 Profile 的 id 就是磁盘目录名，可以按清单补全。 */
+function resolveProfileMetadata(manifest: SnapshotManifest): Array<Record<string, unknown>> {
+  if (manifest.profileMetadata) return manifest.profileMetadata;
+  return manifest.profiles
+    .filter((profile) => !profile.isDefault)
+    .map((profile) => ({ location: profile.id, name: profile.name }));
+}
+
+export const testing = { normalizeRelative, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };

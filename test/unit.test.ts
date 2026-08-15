@@ -372,6 +372,112 @@ test('结构变化被窗口拦住时仍可覆盖共有 Profile 的文件', async
   }
 });
 
+test('缺少 Profile 元数据时按清单补全并应用结构变化', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-metadata-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const extraPath = path.join(userDataPath, 'profiles', 'extra456');
+  const snapshot = path.join(root, 'snapshot');
+  await Promise.all([
+    mkdir(runtimePath, { recursive: true }),
+    mkdir(extraPath, { recursive: true }),
+    mkdir(path.join(snapshot, 'profiles', 'default'), { recursive: true }),
+  ]);
+  await writeFile(path.join(userDataPath, 'globalStorage', 'storage.json'), JSON.stringify({
+    userDataProfiles: [{ location: 'extra456', name: '插件调试' }]
+  }));
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 99}');
+  await writeFile(path.join(extraPath, 'settings.json'), '{"editor.fontSize": 42}');
+  await writeFile(path.join(snapshot, 'profiles', 'default', 'settings.json'), '{"editor.fontSize": 14}');
+  await writeFile(path.join(snapshot, 'manifest.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [{ id: 'default', name: '默认', isDefault: true }],
+    files: { 'profiles/default/settings.json': testing.sha256(Buffer.from('{"editor.fontSize": 14}', 'utf8')) },
+  }, null, 2)}\n`);
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  try {
+    const restored = await adapter.restoreSnapshot(snapshot, true);
+    assert.equal(restored.structuralChange, true);
+    assert.equal(restored.structuralApplied, true);
+    assert.equal(await readFile(path.join(userDataPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 14}');
+    const storage = JSON.parse(await readFile(path.join(userDataPath, 'globalStorage', 'storage.json'), 'utf8')) as {
+      userDataProfiles?: Array<{ location: string }>;
+    };
+    assert.deepEqual(storage.userDataProfiles ?? [], []);
+    await assert.rejects(readFile(path.join(extraPath, 'settings.json')), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('缺少元数据但清单含命名 Profile 时按 id 补全并创建目录', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-synthesize-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const snapshot = path.join(root, 'snapshot');
+  const namedSnapshot = path.join(snapshot, 'profiles', 'abc123');
+  await Promise.all([
+    mkdir(runtimePath, { recursive: true }),
+    mkdir(path.join(userDataPath, 'globalStorage'), { recursive: true }),
+    mkdir(namedSnapshot, { recursive: true }),
+  ]);
+  await writeFile(path.join(userDataPath, 'globalStorage', 'storage.json'), '{}');
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 10}');
+  await writeFile(path.join(namedSnapshot, 'settings.json'), '{"editor.fontSize": 16}');
+  await writeFile(path.join(snapshot, 'manifest.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [
+      { id: 'default', name: '默认', isDefault: true },
+      { id: 'abc123', name: '开发', isDefault: false },
+    ],
+    files: { 'profiles/abc123/settings.json': testing.sha256(Buffer.from('{"editor.fontSize": 16}', 'utf8')) },
+  }, null, 2)}\n`);
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  try {
+    const restored = await adapter.restoreSnapshot(snapshot, true);
+    assert.equal(restored.structuralApplied, true);
+    assert.equal(await readFile(path.join(userDataPath, 'profiles', 'abc123', 'settings.json'), 'utf8'), '{"editor.fontSize": 16}');
+    const storage = JSON.parse(await readFile(path.join(userDataPath, 'globalStorage', 'storage.json'), 'utf8')) as {
+      userDataProfiles: Array<{ location: string; name: string }>;
+    };
+    assert.deepEqual(storage.userDataProfiles, [{ location: 'abc123', name: '开发' }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('旧快照缺少元数据时按 Profile 清单补全', () => {
+  assert.deepEqual(testing.resolveProfileMetadata({
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [
+      { id: 'default', name: '默认', isDefault: true },
+      { id: 'abc123', name: '开发', isDefault: false },
+    ],
+    files: {},
+  }), [{ location: 'abc123', name: '开发' }]);
+  assert.deepEqual(testing.resolveProfileMetadata({
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [{ id: 'default', name: '默认', isDefault: true }],
+    files: {},
+  }), []);
+  assert.deepEqual(testing.resolveProfileMetadata({
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [{ id: 'default', name: '默认', isDefault: true }],
+    profileMetadata: [{ location: 'kept', name: '保留' }],
+    files: {},
+  }), [{ location: 'kept', name: '保留' }]);
+});
+
 test('强制采用云端时缺快照不得回退为本机推送', () => {
   assert.equal(decideCloudAdopt(true, 'synced', true), 'adopt');
   assert.equal(decideCloudAdopt(true, 'cloned', false), 'missing-cloud');
