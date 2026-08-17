@@ -1,4 +1,5 @@
 export type HostKind = 'vscode' | 'cursor';
+export type SyncMode = 'backup' | 'sync';
 export type SyncPhase =
   | '未配置'
   | '空闲'
@@ -34,6 +35,7 @@ export interface SyncConfiguration {
 }
 
 export interface PluginConfiguration extends SyncConfiguration {
+  mode: SyncMode;
   autoSync: boolean;
   pollIntervalSeconds: number;
   debounceSeconds: number;
@@ -73,6 +75,7 @@ export const DEFAULT_CONFIGURATION: PluginConfiguration = {
   branch: 'main',
   gitUserName: '',
   gitUserEmail: '',
+  mode: 'backup',
   autoSync: true,
   pollIntervalSeconds: 300,
   debounceSeconds: 10,

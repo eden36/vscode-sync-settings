@@ -203,7 +203,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       })();
     }, debounceMs);
-    remoteTimer = setInterval(() => void synchronize(), pollMs);
+    if (configuration.mode === 'sync') {
+      remoteTimer = setInterval(() => void synchronize(), pollMs);
+    }
     startupTimer = setTimeout(() => {
       startupTimer = undefined;
       void synchronize();

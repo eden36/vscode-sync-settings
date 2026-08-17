@@ -19,7 +19,7 @@ import {
   snapshotStructure,
   SnapshotStructure,
 } from './snapshot-conflict';
-import { MergeReport, RuntimeStatus, SnapshotManifest, SyncOutcome } from './types';
+import { MergeReport, RuntimeStatus, SnapshotManifest, SyncMode, SyncOutcome } from './types';
 
 // 冲突备份保留份数：既能回溯最近几次自动合并，又不会让运行目录无限增长。
 const MAX_CONFLICT_BACKUPS = 5;
@@ -56,6 +56,7 @@ export class SyncEngine {
         this.updateStatus({ phase: '未配置', message: '请填写 Git 仓库地址。' });
         return { ok: false };
       }
+      const backupOnly = configuration.mode === 'backup';
       if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
 
       this.updateStatus({ phase: '正在扫描', message: undefined });
@@ -79,12 +80,12 @@ export class SyncEngine {
       const pull = await this.git.pull(configuration);
       recoveredFromDivergence = pull.recoveredFromDivergence;
       // 基准必须取本地与远端的共同祖先，否则本机上次的改动会被当成共同基础，导致误判冲突。
-      if (pull.mergeBase) await this.git.exportHostTree(pull.mergeBase, this.environment.kind, baseHostRoot);
+      if (pull.mergeBase && !backupOnly) await this.git.exportHostTree(pull.mergeBase, this.environment.kind, baseHostRoot);
       const remoteExists = await exists(path.join(repositoryHostRoot, 'manifest.json'));
       const baseExists = await exists(path.join(baseHostRoot, 'manifest.json'));
 
       let mergedRoot = localHostRoot;
-      if (remoteExists) {
+      if (remoteExists && !backupOnly) {
         const merged = path.join(temporaryRoot, 'merged');
         merge = await this.mergeSnapshots(baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, merged);
         // 自动合并会覆盖某一方的内容，先留存两份原始快照，用户事后仍可人工找回。
@@ -119,6 +120,21 @@ export class SyncEngine {
         if (!await this.ensureWindowSafety()) return { ok: false, retry: true };
         await this.git.pushIfAhead(configuration);
       }
+      if (backupOnly) {
+        this.updateStatus({
+          phase: '空闲',
+          pendingChanges: 0,
+          lastSyncAt: new Date().toISOString(),
+          message: finalSyncMessage({
+            mode: configuration.mode,
+            changed: changed.length > 0,
+            usedAiFallback,
+            recoveredPendingChanges,
+            recoveredFromDivergence,
+          }),
+        });
+        return { ok: true };
+      }
 
       const safety = await this.ensureWindowSafety();
       if (!safety) return { ok: false, retry: true };
@@ -143,6 +159,7 @@ export class SyncEngine {
         pendingChanges: 0,
         lastSyncAt: new Date().toISOString(),
         message: finalSyncMessage({
+          mode: configuration.mode,
           structuralMessage: restore.message,
           changed: changed.length > 0,
           usedAiFallback,
@@ -378,6 +395,7 @@ function sha256(content: Buffer): string {
 }
 
 interface SyncMessageDetails {
+  mode: SyncMode;
   structuralMessage?: string;
   changed: boolean;
   usedAiFallback: boolean;
@@ -407,6 +425,9 @@ export function finalSyncMessage(details: SyncMessageDetails): string {
   if (details.recoveredFromDivergence) notes.push('已重新对齐上次未推送成功的提交');
   if (details.extensionsPending?.length) {
     notes.push(`部分扩展尚未安装完成：${details.extensionsPending.join('、')}`);
+  }
+  if (details.mode === 'backup') {
+    return notes.length ? `备份完成（${notes.join('；')}）。` : '备份完成。';
   }
   return notes.length ? `同步完成（${notes.join('；')}）。` : '同步完成。';
 }

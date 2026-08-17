@@ -7,6 +7,7 @@ import type * as vscode from 'vscode';
 import { MultiWindowCoordinator } from '../src/coordinator';
 import { ConfigurationStore } from '../src/configuration';
 import { parseUtilityModelSetting } from '../src/ai-model';
+import type { AiService } from '../src/ai';
 import { fallbackCommitMessage } from '../src/sync-fallback';
 import { ConfigurationRepositoryGitService } from '../src/git-service';
 import { resolveHostStoragePaths } from '../src/host-paths';
@@ -20,12 +21,13 @@ import {
   createConfigurationRecord,
   hasEmbeddedCredentials,
   parseConfigurationRecord,
+  parsePluginConfiguration,
   relateConfigurationRecords,
   resolveRepositoryUrl,
 } from '../src/configuration-record';
 import { parseExtensionIds } from '../src/extension-manifest';
 import { displaySyncPhase, formatRelativeSyncTime, isBusyPhase } from '../src/sidebar-status';
-import { finalSyncMessage } from '../src/sync-engine';
+import { SyncEngine, finalSyncMessage } from '../src/sync-engine';
 import { DEFAULT_CONFIGURATION, PluginConfiguration, SyncConfiguration } from '../src/types';
 import { resetApplicationSettings } from './vscode-stub';
 
@@ -408,6 +410,7 @@ test('冲突回退按本机优先并保证收敛到实际存在的一方', () =>
 test('自动合并后的状态文案说明处理方式并提示备份', () => {
   assert.equal(
     finalSyncMessage({
+      mode: 'sync',
       changed: true,
       usedAiFallback: false,
       recoveredPendingChanges: false,
@@ -418,6 +421,7 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
   );
   assert.equal(
     finalSyncMessage({
+      mode: 'sync',
       changed: false,
       usedAiFallback: false,
       recoveredPendingChanges: false,
@@ -427,6 +431,7 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
   );
   assert.equal(
     finalSyncMessage({
+      mode: 'sync',
       structuralMessage: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
       changed: true,
       usedAiFallback: false,
@@ -434,6 +439,19 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
       recoveredFromDivergence: false,
     }),
     '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
+  );
+});
+
+test('备份模式状态文案使用备份完成前缀', () => {
+  assert.equal(
+    finalSyncMessage({
+      mode: 'backup',
+      changed: true,
+      usedAiFallback: true,
+      recoveredPendingChanges: false,
+      recoveredFromDivergence: false,
+    }),
+    '备份完成（AI 不可用或结果无效，已使用兜底策略）。',
   );
 });
 
@@ -501,6 +519,42 @@ test('同步配置记录拒绝无效结构和含凭据仓库地址', () => {
   assert.equal(parseConfigurationRecord({ ...valid, configuration: { ...valid.configuration, branch: '../main' } }), undefined);
 });
 
+test('同步配置解析缺省回落到备份模式并拒绝非法模式', () => {
+  const parsed = parsePluginConfiguration({
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'main',
+    gitUserName: '',
+    gitUserEmail: '',
+    autoSync: true,
+    debounceSeconds: 10,
+    pollIntervalSeconds: 300,
+    includeProfileAssociations: false,
+  });
+  assert.equal(parsed?.mode, 'backup');
+  assert.equal(parsePluginConfiguration({
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'main',
+    gitUserName: '',
+    gitUserEmail: '',
+    mode: 'sync',
+    autoSync: true,
+    debounceSeconds: 10,
+    pollIntervalSeconds: 300,
+    includeProfileAssociations: false,
+  })?.mode, 'sync');
+  assert.equal(parsePluginConfiguration({
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'main',
+    gitUserName: '',
+    gitUserEmail: '',
+    mode: 'invalid',
+    autoSync: true,
+    debounceSeconds: 10,
+    pollIntervalSeconds: 300,
+    includeProfileAssociations: false,
+  }), undefined);
+});
+
 test('独立 Profile 配置实例通过共享锁传播因果更新', async () => {
   resetApplicationSettings();
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-shared-configuration-'));
@@ -519,6 +573,7 @@ test('独立 Profile 配置实例通过共享锁传播因果更新', async () =>
       ...firstConfiguration,
       branch: 'second',
       pollIntervalSeconds: 900,
+      mode: 'sync' as const,
     };
     await first.save(firstConfiguration);
     await second.save(secondConfiguration);
@@ -526,6 +581,73 @@ test('独立 Profile 配置实例通过共享锁传播因果更新', async () =>
     assert.deepEqual(first.get(), secondConfiguration);
     assert.deepEqual(second.get(), secondConfiguration);
     assert.deepEqual(firstState.get('profileGitSync.syncedConfiguration'), secondState.get('profileGitSync.syncedConfiguration'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('备份模式同步只写仓库不写回本机', async () => {
+  const configuration = {
+    ...DEFAULT_CONFIGURATION,
+    repositoryUrl: 'git@github.com:user/settings.git',
+    mode: 'backup' as const,
+  };
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-backup-mode-'));
+  let restoreCalled = false;
+  let exportedBase = false;
+  let committed = false;
+  let pushedAhead = false;
+  try {
+    const repositoryPath = path.join(root, 'repository');
+    await mkdir(path.join(repositoryPath, '.profile-git-sync', 'hosts'), { recursive: true });
+    const engine = new SyncEngine(
+      { kind: 'vscode', userDataPath: path.join(root, 'User'), runtimePath: path.join(root, 'Runtime') },
+      {
+        createSnapshot: async (hostRoot: string) => {
+          await mkdir(hostRoot, { recursive: true });
+          await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1,"host":"vscode","createdAt":"","profiles":[],"files":{}}');
+          return {
+            schemaVersion: 1,
+            host: 'vscode',
+            createdAt: '',
+            profiles: [],
+            files: {},
+          };
+        },
+        restoreSnapshot: async () => {
+          restoreCalled = true;
+          return { changedFiles: [], structuralChange: false, structuralApplied: false };
+        },
+      } as unknown as ProfileAdapter,
+      {
+        repositoryPath,
+        prepare: async () => undefined,
+        discardPendingHostChanges: async () => false,
+        pull: async () => ({ recoveredFromDivergence: false }),
+        exportHostTree: async () => {
+          exportedBase = true;
+          return true;
+        },
+        stageHost: async () => ['.profile-git-sync/hosts/vscode/manifest.json'],
+        commitAndPush: async () => { committed = true; },
+        pushIfAhead: async () => { pushedAhead = true; },
+      } as unknown as ConfigurationRepositoryGitService,
+      {
+        createCommitMessage: async () => 'chore(sync): 备份',
+        resolveConflict: async () => '',
+      } as unknown as AiService,
+      {
+        get: () => configuration,
+      } as unknown as ConfigurationStore,
+      () => undefined,
+      async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    );
+    const result = await engine.synchronize();
+    assert.equal(result?.ok, true);
+    assert.equal(restoreCalled, false);
+    assert.equal(exportedBase, false);
+    assert.equal(committed, true);
+    assert.equal(pushedAhead, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
