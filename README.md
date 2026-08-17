@@ -6,7 +6,7 @@
 
 - 一次快照默认 Profile 与全部命名 Profile 的 `settings.json`、`keybindings.json`、`tasks.json`、`extensions.json`、`mcp.json`、`snippets/` 和 `prompts/`。
 - VS Code 与 Cursor 分别存放在 `.profile-git-sync/hosts/vscode` 和 `.profile-git-sync/hosts/cursor`，不会互相覆盖。
-- 支持两种运行模式：备份模式（只上传，不写回本机）与同步模式（双向同步，会写回本机）；默认备份模式。
+- 支持两种运行模式：备份模式（只上传，不写回本机）与同步模式（双向同步，会写回本机）；默认备份模式，可在侧边栏直接切换，切到同步模式前会先确认。
 - 同步模式下自动拉取、三方合并、提交和推送；不会使用 force push。
 - 优先通过 AI 生成中文 commit message；AI 不可用或结果无效时使用固定的中文 Conventional Commit，不阻塞同步。
 - 全流程无需用户操作：同一文件被本机和远程同时修改时优先交给 AI 合并，AI 不可用或结果无效时按本机优先自动收敛，合并前的两份完整配置会先备份。
