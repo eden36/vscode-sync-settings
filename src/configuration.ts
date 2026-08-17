@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { withFileLock } from './file-lock';
 import { atomicWriteJson, readJsonFile as readJson } from './json-store';
 import {
   createConfigurationRecord,
@@ -160,10 +161,9 @@ export class ConfigurationStore {
     const settings = vscode.workspace.getConfiguration('profileGitSync');
     return {
       ...base,
-      autoSync: settings.get<boolean>('autoSync', base.autoSync),
       pollIntervalSeconds: settings.get<number>('pollIntervalSeconds', base.pollIntervalSeconds),
       debounceSeconds: settings.get<number>('debounceSeconds', base.debounceSeconds),
-      includeProfileAssociations: settings.get<boolean>('includeProfileAssociations', base.includeProfileAssociations),
+      includeProfileAssociations: true,
     };
   }
 
@@ -171,7 +171,6 @@ export class ConfigurationStore {
     const settings = vscode.workspace.getConfiguration('profileGitSync');
     const updates: Array<Thenable<void>> = [];
     for (const [key, value] of [
-      ['autoSync', configuration.autoSync],
       ['pollIntervalSeconds', configuration.pollIntervalSeconds],
       ['debounceSeconds', configuration.debounceSeconds],
       ['includeProfileAssociations', configuration.includeProfileAssociations],
@@ -184,52 +183,10 @@ export class ConfigurationStore {
   }
 
   private async withLock<T>(action: () => Promise<T>): Promise<T> {
-    const token = randomUUID();
-    const deadline = Date.now() + CONFIGURATION_LOCK_TIMEOUT_MS;
-    while (true) {
-      try {
-        const handle = await fs.open(this.lockPath, 'wx');
-        try {
-          await handle.writeFile(JSON.stringify({ token, pid: process.pid, createdAt: Date.now() }));
-        } finally {
-          await handle.close();
-        }
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        const lock = await readJson(this.lockPath);
-        if (isStaleLock(lock)) {
-          await fs.rm(this.lockPath, { force: true });
-          continue;
-        }
-        if (Date.now() >= deadline) throw new Error('配置正在被其他窗口更新，请稍后重试。');
-        await delay(50);
-      }
-    }
-    try {
-      return await action();
-    } finally {
-      const lock = await readJson(this.lockPath);
-      if (isRecord(lock) && lock.token === token) await fs.rm(this.lockPath, { force: true });
-    }
+    return withFileLock(this.lockPath, action, {
+      timeoutMs: CONFIGURATION_LOCK_TIMEOUT_MS,
+      staleMs: CONFIGURATION_LOCK_STALE_MS,
+      busyMessage: '配置正在被其他窗口更新，请稍后重试。',
+    });
   }
-}
-
-function isStaleLock(value: unknown): boolean {
-  if (!isRecord(value) || typeof value.pid !== 'number' || typeof value.createdAt !== 'number') return false;
-  if (Date.now() - value.createdAt > CONFIGURATION_LOCK_STALE_MS) return true;
-  try {
-    process.kill(value.pid, 0);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'EPERM';
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

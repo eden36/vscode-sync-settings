@@ -7,8 +7,16 @@ import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
+import { RuntimeStateStore } from './runtime-state';
+import {
+  createMachine,
+  reduce,
+  SchedulerCommand,
+  SchedulerEvent,
+  SchedulerMachine,
+} from './scheduler';
 import { SidebarProvider } from './sidebar';
-import { displaySyncPhase, isBusyPhase } from './sidebar-status';
+import { displayIcon, displayPhase, stageLabel } from './sidebar-status';
 import { SyncEngine } from './sync-engine';
 import { RuntimeStatus, SyncOutcome } from './types';
 
@@ -18,24 +26,38 @@ let remoteTimer: NodeJS.Timeout | undefined;
 let startupTimer: NodeJS.Timeout | undefined;
 let retryTimer: NodeJS.Timeout | undefined;
 let configurationTimer: NodeJS.Timeout | undefined;
-const LAST_SYNC_KEY = 'profileGitSync.lastSyncAt';
-const OPERATION_RETRY_MS = 5_000;
-const MAX_OPERATION_RETRY_MS = 60_000;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const environment = detectHost(context);
   await fs.mkdir(environment.runtimePath, { recursive: true });
   const configurationStore = new ConfigurationStore(context, environment.runtimePath);
   await configurationStore.initialize();
+  const runtimeState = new RuntimeStateStore(environment.runtimePath);
+  await runtimeState.initialize({
+    enabled: vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', false),
+  });
   const adapter = new ProfileAdapter(environment);
   const profiles = await adapter.listProfiles();
+
+  const persisted = runtimeState.get();
+  // 共享文件是权威来源，启动时把它镜像回宿主设置，避免多个 Profile 显示的开关不一致。
+  const enabledSetting = vscode.workspace.getConfiguration('profileGitSync');
+  if (enabledSetting.get<boolean>('enabled') !== persisted.enabled) {
+    await enabledSetting.update('enabled', persisted.enabled, vscode.ConfigurationTarget.Global);
+  }
+  let machine = createMachine({
+    enabled: persisted.enabled,
+    configured: Boolean(configurationStore.get().repositoryUrl),
+    link: persisted.link,
+  });
   const status: RuntimeStatus = {
-    phase: configurationStore.get().repositoryUrl ? '空闲' : '未配置',
+    sync: machine.sync,
+    link: machine.link,
     role: 'stopped',
     activeWindows: 1,
     profiles: profiles.map((profile) => profile.name),
     pendingChanges: 0,
-    lastSyncAt: context.globalState.get<string>(LAST_SYNC_KEY),
+    ...(persisted.lastSyncAt ? { lastSyncAt: persisted.lastSyncAt } : {}),
   };
 
   coordinator = new MultiWindowCoordinator(path.join(environment.runtimePath, 'coordination'));
@@ -43,29 +65,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const ai = new AiService();
   let localFingerprint: string | undefined;
   let sidebar: SidebarProvider;
-  let syncRunning = false;
-  let pendingSync = false;
-  let retryWhenSafe = false;
-  let scheduleGeneration = 0;
-  let leaderSchedulesReady = false;
   let localCheckRunning = false;
-  let operationRetryDelayMs = OPERATION_RETRY_MS;
+  let scheduleGeneration = 0;
+  let schedulesReady = false;
   let dirtyDocumentCount = countDirtyDocuments(environment.userDataPath);
+  let lastRepositoryUrl = configurationStore.get().repositoryUrl;
+  let lastBranch = configurationStore.get().branch;
 
   // 同步全过程不弹通知，状态只落在状态栏和侧边栏，避免打断用户。
   const statusBar = vscode.window.createStatusBarItem('profileGitSync.status', vscode.StatusBarAlignment.Right, 100);
   statusBar.name = 'My Setting Sync';
   statusBar.command = 'profileGitSync.openSettings';
   const renderStatusBar = () => {
-    const phase = displaySyncPhase(status.phase, status.lastSyncAt);
-    const icon = isBusyPhase(status.phase) ? '$(sync~spin)'
-      : status.phase === '失败' ? '$(warning)'
-      : status.phase === '未配置' ? '$(gear)'
-      : status.phase === '等待其他窗口关闭' ? '$(clock)'
-      : '$(check)';
-    statusBar.text = `${icon} 配置同步`;
-    statusBar.tooltip = status.message ? `配置同步：${phase}\n${status.message}` : `配置同步：${phase}`;
-    statusBar.backgroundColor = status.phase === '失败'
+    const phase = displayPhase(status.sync, status.link);
+    const detail = statusDetail(status);
+    statusBar.text = `${displayIcon(status.sync, status.link)} 配置同步`;
+    statusBar.tooltip = detail ? `配置同步：${phase}\n${detail}` : `配置同步：${phase}`;
+    statusBar.backgroundColor = status.sync.kind === 'failed'
       ? new vscode.ThemeColor('statusBarItem.warningBackground')
       : undefined;
     statusBar.show();
@@ -73,121 +89,194 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const applyStatus = (patch: Partial<RuntimeStatus>, publish: boolean) => {
     Object.assign(status, patch);
-    if (patch.lastSyncAt) void context.globalState.update(LAST_SYNC_KEY, patch.lastSyncAt);
+    // 用 in 判断而不是取值判断，删除仓库时要能把 lastSyncAt 显式清成 undefined。
+    if ('lastSyncAt' in patch) {
+      void runtimeState.update({ lastSyncAt: patch.lastSyncAt }).catch(reportRuntimeStateError);
+    }
     renderStatusBar();
     void sidebar?.pushState();
     if (publish && coordinator?.isLeader) {
       void coordinator.publishStatus(status).catch((error: unknown) => {
-        applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false);
+        applyStatus({ message: coordinationErrorMessage(error) }, false);
       });
     }
   };
-  const updateStatus = (patch: Partial<RuntimeStatus>) => applyStatus(patch, true);
+
+  const reportRuntimeStateError = (error: unknown) => {
+    applyStatus({ message: `同步状态保存失败：${error instanceof Error ? error.message : String(error)}` }, false);
+  };
+
+  /** 调度状态是唯一的真相来源，写入 status 后再渲染与广播。 */
+  const dispatch = (event: SchedulerEvent) => {
+    const previous = machine;
+    const { next, commands } = reduce(machine, event);
+    machine = next;
+    if (previous.sync !== next.sync || previous.link !== next.link) {
+      applyStatus({ sync: next.sync, link: next.link }, coordinator?.isLeader === true);
+      if (previous.link !== next.link) void runtimeState.update({ link: next.link }).catch(reportRuntimeStateError);
+    }
+    for (const command of commands) void execute(command);
+  };
+
   const engine = new SyncEngine(
     environment,
     adapter,
     configurationRepository,
     ai,
     configurationStore,
-    updateStatus,
+    runtimeState,
+    (patch) => {
+      // 流程只报告进度与说明；阶段之外的状态一律由调度层决定。
+      if (patch.sync?.kind === 'running') dispatch({ type: 'sync-progress', stage: patch.sync.stage });
+      const { sync: _sync, link: _link, ...rest } = patch;
+      if (Object.keys(rest).length) applyStatus(rest, coordinator?.isLeader === true);
+    },
     () => coordinator!.windowSafety(),
   );
 
-  // Profile 增删只有重载后才会出现在 IDE 界面上；其余配置文件写盘即生效，不需要重载。
-  const reloadAfterSync = async (outcome: SyncOutcome | undefined) => {
-    if (!outcome?.ok || !outcome.structuralApplied || status.phase === '失败') return;
-    await vscode.commands.executeCommand('workbench.action.reloadWindow');
+  const runSync = async (adoptCloud: boolean) => {
+    let outcome: SyncOutcome | undefined;
+    const acquired = await coordinator!.runExclusive(async () => {
+      outcome = await engine.synchronize(adoptCloud ? { adoptCloud } : {});
+      localFingerprint = await adapter.fingerprint();
+    });
+    if (!acquired) {
+      applyStatus({ message: '另一窗口正在执行同步，稍后将自动重试。' }, false);
+      dispatch({ type: 'sync-lock-busy' });
+      return;
+    }
+    dispatch({ type: 'sync-finished', outcome });
   };
 
-  const scheduleOperationRetry = () => {
-    if (retryTimer) clearTimeout(retryTimer);
-    // 另一窗口可能长时间持有独占锁，逐步退避避免空转重试。
-    const delayMs = Math.min(operationRetryDelayMs, MAX_OPERATION_RETRY_MS);
-    operationRetryDelayMs = Math.min(delayMs * 2, MAX_OPERATION_RETRY_MS);
-    retryTimer = setTimeout(() => {
-      retryTimer = undefined;
-      void synchronize();
-    }, delayMs);
+  const execute = async (command: SchedulerCommand): Promise<void> => {
+    switch (command.type) {
+      case 'start-sync':
+        await runSync(command.adoptCloud);
+        return;
+      case 'forward-sync-request':
+        await coordinator!.requestSync();
+        applyStatus({ role: 'follower', message: '同步请求已发送给 leader 窗口。' }, false);
+        return;
+      case 'schedule-retry':
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          retryTimer = undefined;
+          dispatch({ type: 'sync-requested', source: 'timer' });
+        }, command.delayMs);
+        return;
+      case 'cancel-retry':
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = undefined;
+        return;
+      case 'prompt-cloud-adopt':
+        await promptCloudAdopt();
+        return;
+      case 'start-schedules':
+        await startSchedules();
+        return;
+      case 'stop-schedules':
+        clearSchedules();
+        return;
+      case 'complete-sync-requests':
+        await coordinator!.completeSyncRequests();
+        return;
+      case 'reload-window':
+        await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        return;
+    }
   };
 
-  const synchronize = async (): Promise<SyncOutcome | undefined> => {
-    if (!coordinator!.isLeader) {
-      await coordinator!.requestSync();
-      applyStatus({ role: 'follower', message: '同步请求已发送给 leader 窗口。' }, false);
-      return undefined;
+  const setEnabled = async (enabled: boolean) => {
+    if (machine.enabled === enabled) return;
+    await runtimeState.update({ enabled });
+    // 必须先落到调度状态：写宿主设置会触发配置变更事件，此时 machine 若还是旧值就会再次调用本函数。
+    dispatch({ type: 'enabled-changed', enabled });
+    const settings = vscode.workspace.getConfiguration('profileGitSync');
+    if (settings.get<boolean>('enabled') !== enabled) {
+      await settings.update('enabled', enabled, vscode.ConfigurationTarget.Global);
     }
-    if (syncRunning) {
-      pendingSync = true;
-      return undefined;
-    }
+    await coordinator!.notifyConfigurationChanged();
+  };
 
-    syncRunning = true;
-    let finalOutcome: SyncOutcome | undefined;
-    let completed = false;
+  const promptCloudAdopt = async () => {
+    // 备份模式永不写回本机，重新克隆后仍是把本机配置推上去，确认文案必须如实说明方向。
+    const backupOnly = configurationStore.get().mode === 'backup';
+    const confirmed = await vscode.window.showWarningMessage(
+      '本地配置仓库与远端不同源',
+      {
+        modal: true,
+        detail: backupOnly
+          ? '将删除扩展内的本地仓库缓存并重新从远端克隆，随后继续把本机配置备份到云端，覆盖云端已有的本宿主快照。本机配置不会被改写。'
+          : '将删除扩展内的本地仓库缓存并重新从远端克隆，随后以云端配置覆盖本机，本轮不会把本机配置推到云端。本机原配置会备份到扩展运行目录；云端没有的扩展会被卸载。',
+      },
+      '废弃并覆盖',
+    );
+    if (confirmed !== '废弃并覆盖') {
+      dispatch({ type: 'cloud-adopt-declined' });
+      return;
+    }
+    const acquired = await coordinator!.runExclusive(async () => {
+      await engine.beginCloudAdopt();
+      await configurationRepository.removeRepository();
+    });
+    if (!acquired) {
+      applyStatus({ message: '另一窗口正在执行同步，请稍后重试重建。' }, false);
+      return;
+    }
+    applyStatus({
+      lastSyncAt: undefined,
+      message: backupOnly ? '本地仓库已删除，正在重新克隆并备份本机配置。' : '本地仓库已删除，正在按云端配置覆盖本机。',
+    }, false);
+    dispatch({ type: 'repository-removed' });
+    dispatch({ type: 'sync-requested', source: 'user', adoptCloud: true });
+  };
+
+  const rebuildRepository = async () => {
+    const confirmed = await vscode.window.showWarningMessage(
+      '是否删除本机配置同步目录中的 .git？',
+      { modal: true, detail: '只会去掉本机这份 Git 仓库身份，不会推送到远端，也不会改写本机配置或当前项目。' },
+      '确定',
+    );
+    if (confirmed !== '确定') return;
     try {
-      do {
-        pendingSync = false;
-        completed = false;
-        let outcome: SyncOutcome | undefined;
-        const acquired = await coordinator!.runExclusive(async () => {
-          outcome = await engine.synchronize();
-          localFingerprint = await adapter.fingerprint();
-        });
-        if (!acquired) {
-          applyStatus({ message: '另一窗口正在执行同步，稍后将自动重试。' }, false);
-          scheduleOperationRetry();
-          break;
-        }
-        operationRetryDelayMs = OPERATION_RETRY_MS;
-        finalOutcome = outcome;
-        if (outcome?.retry) {
-          retryWhenSafe = true;
-          break;
-        }
-        retryWhenSafe = false;
-        completed = outcome !== undefined;
-        if (outcome?.structuralApplied) void reloadAfterSync(outcome);
-      } while (pendingSync && coordinator!.isLeader);
-
-      if (completed && !pendingSync && !retryWhenSafe) await coordinator!.completeSyncRequests();
-      return finalOutcome;
-    } finally {
-      syncRunning = false;
-      if (pendingSync && coordinator!.isLeader && !retryWhenSafe) void synchronize();
-      if (coordinator!.isLeader && !leaderSchedulesReady) void startLeaderSchedules();
+      const acquired = await coordinator!.runExclusive(async () => {
+        await configurationRepository.removeGitDirectory();
+      });
+      if (!acquired) {
+        applyStatus({ message: '另一窗口正在执行同步，请稍后重试删除。' }, false);
+        return;
+      }
+      applyStatus({
+        lastSyncAt: undefined,
+        message: '本机配置同步仓库的 .git 已删除，下次同步将按云端配置覆盖本机，本机原配置会先备份。',
+      }, false);
+      dispatch({ type: 'repository-removed' });
+    } catch (error) {
+      applyStatus({ message: error instanceof Error ? error.message : String(error) }, false);
+      dispatch({ type: 'sync-failed', message: error instanceof Error ? error.message : String(error) });
     }
   };
 
-  const clearLeaderSchedules = () => {
+  const clearSchedules = () => {
     scheduleGeneration += 1;
-    leaderSchedulesReady = false;
+    schedulesReady = false;
     if (localTimer) clearInterval(localTimer);
     if (remoteTimer) clearInterval(remoteTimer);
-    if (configurationTimer) clearInterval(configurationTimer);
     if (startupTimer) clearTimeout(startupTimer);
     localTimer = undefined;
     remoteTimer = undefined;
-    configurationTimer = undefined;
     startupTimer = undefined;
   };
 
-  const startLeaderSchedules = async () => {
-    clearLeaderSchedules();
-    if (!coordinator!.isLeader) return;
+  const startSchedules = async () => {
+    clearSchedules();
+    if (!coordinator!.isLeader || !machine.enabled) return;
     const generation = scheduleGeneration;
     localFingerprint = await adapter.fingerprint();
     if (!coordinator!.isLeader || generation !== scheduleGeneration) return;
-    leaderSchedulesReady = true;
-    configurationTimer = setInterval(() => {
-      if (!coordinator!.isLeader) return;
-      void configurationStore.reload().then(async (changed) => {
-        if (changed) await coordinator!.notifyConfigurationChanged();
-      }).catch((error: unknown) => applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false));
-    }, 5_000);
+    schedulesReady = true;
+
     const configuration = configurationStore.get();
-    if (!configuration.autoSync) return;
-    const debounceMs = configuration.debounceSeconds * 1_000;
-    const pollMs = configuration.pollIntervalSeconds * 1_000;
     localTimer = setInterval(() => {
       if (localCheckRunning || !coordinator!.isLeader) return;
       localCheckRunning = true;
@@ -196,19 +285,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const current = await adapter.fingerprint();
           if (current !== localFingerprint) {
             localFingerprint = current;
-            await synchronize();
+            dispatch({ type: 'sync-requested', source: 'timer' });
           }
         } finally {
           localCheckRunning = false;
         }
       })();
-    }, debounceMs);
+    }, configuration.debounceSeconds * 1_000);
+    // 备份模式不写回本机，远端轮询拉不出任何要应用的变化，只会空转并占用独占锁。
     if (configuration.mode === 'sync') {
-      remoteTimer = setInterval(() => void synchronize(), pollMs);
+      remoteTimer = setInterval(() => dispatch({ type: 'sync-requested', source: 'timer' }), configuration.pollIntervalSeconds * 1_000);
     }
     startupTimer = setTimeout(() => {
       startupTimer = undefined;
-      void synchronize();
+      dispatch({ type: 'sync-requested', source: 'startup' });
     }, 1_500);
   };
 
@@ -223,42 +313,62 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const refreshConfiguration = async () => {
     await configurationStore.reload();
-    if (!syncRunning) applyStatus({
-      phase: configurationStore.get().repositoryUrl ? '空闲' : '未配置',
-      message: undefined,
-    }, false);
+    const changedRuntimeState = await runtimeState.reload();
+    const current = configurationStore.get();
+    const repositoryChanged = current.repositoryUrl !== lastRepositoryUrl || current.branch !== lastBranch;
+    lastRepositoryUrl = current.repositoryUrl;
+    lastBranch = current.branch;
+
+    if (changedRuntimeState && runtimeState.get().enabled !== machine.enabled) {
+      dispatch({ type: 'enabled-changed', enabled: runtimeState.get().enabled });
+    }
+    dispatch({ type: 'configuration-changed', configured: Boolean(current.repositoryUrl), repositoryChanged });
     await sidebar?.pushState();
-    if (coordinator!.isLeader) await startLeaderSchedules();
+    // 轮询间隔可能变了，需要按新配置重建定时器。
+    if (coordinator!.isLeader && machine.enabled) await startSchedules();
   };
 
   sidebar = new SidebarProvider(
     configurationStore,
     () => status,
-    async () => { await synchronize(); },
     async () => coordinator!.notifyConfigurationChanged(),
+    () => machine.enabled,
+    setEnabled,
   );
 
   const refreshDirtyDocuments = async () => {
-    const previous = dirtyDocumentCount;
     const current = countDirtyDocuments(environment.userDataPath);
-    if (current === previous) return;
+    if (current === dirtyDocumentCount) return;
     dirtyDocumentCount = current;
     await coordinator!.setDirtyDocuments(current);
-    if (previous > 0 && current === 0 && retryWhenSafe && coordinator!.isLeader) void synchronize();
+    dispatch({ type: 'windows-changed', safety: await coordinator!.windowSafety() });
   };
 
   context.subscriptions.push(
     statusBar,
     vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar),
-    vscode.commands.registerCommand('profileGitSync.syncNow', () => void synchronize()),
+    vscode.commands.registerCommand('profileGitSync.syncNow', () => {
+      if (!machine.enabled) {
+        void vscode.window.showInformationMessage('配置同步已关闭，请先在侧边栏开启同步。');
+        return;
+      }
+      dispatch({ type: 'sync-requested', source: 'user' });
+    }),
+    vscode.commands.registerCommand('profileGitSync.toggleEnabled', () => void setEnabled(!machine.enabled)),
+    vscode.commands.registerCommand('profileGitSync.rebuildRepository', () => void rebuildRepository()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration('profileGitSync')) return;
+      const settingEnabled = vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', machine.enabled);
+      if (settingEnabled !== machine.enabled) {
+        void setEnabled(settingEnabled).catch((error: unknown) => reportRuntimeStateError(error));
+        return;
+      }
       void configurationStore.saveApplicationSettings().then(async (changed) => {
         if (changed) await coordinator!.notifyConfigurationChanged();
         else await sidebar.pushState();
       }).catch((error: unknown) => {
-        applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false);
+        applyStatus({ message: coordinationErrorMessage(error) }, false);
       });
     }),
     vscode.workspace.onDidOpenTextDocument(() => void refreshDirtyDocuments()),
@@ -269,24 +379,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const onBecameLeader = () => {
     void updateWindowState();
-    void startLeaderSchedules();
+    dispatch({ type: 'leadership-changed', isLeader: true });
   };
   const onBecameFollower = () => {
-    clearLeaderSchedules();
-    if (retryTimer) clearTimeout(retryTimer);
-    retryTimer = undefined;
+    dispatch({ type: 'leadership-changed', isLeader: false });
     void updateWindowState();
   };
-  const onSyncRequested = () => void synchronize();
+  const onSyncRequested = () => dispatch({ type: 'sync-requested', source: 'peer' });
   const onStatusChanged = (patch: Partial<RuntimeStatus>) => applyStatus(patch, false);
   const onConfigurationChanged = () => void refreshConfiguration();
   const onWindowsChanged = (safety: WindowSafetySnapshot) => {
     applyStatus({ activeWindows: safety.activeWindows }, coordinator!.isLeader);
-    if (safety.dirtyWindows === 0 && safety.unreadableWindows === 0 && retryWhenSafe && coordinator!.isLeader) {
-      void synchronize();
-    }
+    dispatch({ type: 'windows-changed', safety });
   };
-  const onCoordinationError = (error: Error) => applyStatus({ phase: '失败', message: coordinationErrorMessage(error) }, false);
+  const onCoordinationError = (error: Error) => applyStatus({ message: coordinationErrorMessage(error) }, false);
 
   coordinator.on('becameLeader', onBecameLeader);
   coordinator.on('becameFollower', onBecameFollower);
@@ -307,10 +413,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
   });
 
+  // 配置轮询独立于同步开关：关闭状态下仍要能感知其他窗口重新开启同步。
+  // 开关状态每个窗口都要跟进，因此这一段不限于 leader。
+  configurationTimer = setInterval(() => {
+    void runtimeState.reload().then((changed) => {
+      if (changed && runtimeState.get().enabled !== machine.enabled) {
+        dispatch({ type: 'enabled-changed', enabled: runtimeState.get().enabled });
+      }
+    }).catch(reportRuntimeStateError);
+    if (!coordinator!.isLeader) return;
+    void configurationStore.reload().then(async (changed) => {
+      if (changed) await coordinator!.notifyConfigurationChanged();
+    }).catch((error: unknown) => applyStatus({ message: coordinationErrorMessage(error) }, false));
+  }, 5_000);
+
   await coordinator.setDirtyDocuments(dirtyDocumentCount);
   await coordinator.start();
   await updateWindowState();
-  if (coordinator.isLeader) await startLeaderSchedules();
+  // leadership-changed 已经会按需发出 start-schedules，这里不再重复启动。
+  dispatch({ type: 'leadership-changed', isLeader: coordinator.isLeader });
   renderStatusBar();
 }
 
@@ -343,4 +464,12 @@ function isInside(root: string, candidate: string): boolean {
 
 function coordinationErrorMessage(error: unknown): string {
   return `多窗口协调失败：${error instanceof Error ? error.message : String(error)}`;
+}
+
+/** 状态栏与侧边栏共用的详情文案：进行中的步骤在前，具体说明在后。 */
+function statusDetail(status: RuntimeStatus): string | undefined {
+  const lines: string[] = [];
+  if (status.sync.kind === 'running') lines.push(stageLabel(status.sync.stage));
+  if (status.message) lines.push(status.message);
+  return lines.length ? lines.join('\n') : undefined;
 }

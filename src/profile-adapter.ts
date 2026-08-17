@@ -2,11 +2,17 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
+import { parseExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
+import { parseManifest } from './snapshot-conflict';
 import { ProfileDescriptor, SnapshotManifest } from './types';
 
-const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'extensions.json', 'mcp.json'];
+// Profile 目录下的 extensions.json 是 IDE 维护的启用状态，跨机器同步会引用本机没有的扩展；
+// 扩展改由快照根目录的宿主级清单统一处理。
+const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'mcp.json'];
 const DIRECTORY_RESOURCES = ['snippets', 'prompts'];
+/** 宿主级的已安装扩展清单，放在快照根目录，不属于任何 Profile。 */
+export const HOST_EXTENSIONS_FILE = 'extensions.json';
 const TEMPORARY_MARKER = '.profile-git-sync-';
 const PLUGIN_SETTING_PREFIX = 'profileGitSync.';
 const BACKUP_RETENTION = 10;
@@ -57,6 +63,9 @@ export class ProfileAdapter {
   public async fingerprint(): Promise<string> {
     const profiles = (await this.listProfiles()).sort((left, right) => left.id.localeCompare(right.id));
     const hash = createHash('sha256');
+    // 安装或卸载扩展也要触发同步，但只认标识变化，扩展升级不算。
+    const installedExtensions = await this.readInstalledExtensions();
+    if (installedExtensions) hash.update(HOST_EXTENSIONS_FILE).update(sha256(installedExtensions));
     for (const profile of profiles) {
       hash.update(`${profile.id}\0${profile.name}\0${profile.isDefault ? '1' : '0'}\0`);
       for (const resource of FILE_RESOURCES) {
@@ -107,12 +116,18 @@ export class ProfileAdapter {
       }
     }
 
+    const installedExtensions = await this.readInstalledExtensions();
+    if (installedExtensions) {
+      await fs.writeFile(path.join(staging, HOST_EXTENSIONS_FILE), installedExtensions);
+      files[HOST_EXTENSIONS_FILE] = sha256(installedExtensions);
+    }
+
     const manifest: SnapshotManifest = {
       schemaVersion: 1,
       host: this.environment.kind,
       createdAt: '',
       profiles: profiles.map(({ id, name, isDefault }) => ({ id, name, isDefault })),
-      profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })),
+      profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })) ?? [],
       ...(includeAssociations && storage.profileAssociations !== undefined
         ? { profileAssociations: storage.profileAssociations }
         : {}),
@@ -123,10 +138,10 @@ export class ProfileAdapter {
     return manifest;
   }
 
-  public async restoreSnapshot(hostRoot: string, allowStructural: boolean): Promise<RestoreResult> {
+  public async restoreSnapshot(hostRoot: string, allowStructural: boolean, applyMatchingFiles = false): Promise<RestoreResult> {
     const manifestPath = path.join(hostRoot, 'manifest.json');
-    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as SnapshotManifest;
-    if (manifest.schemaVersion !== 1 || manifest.host !== this.environment.kind) {
+    const manifest = parseManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')) as unknown);
+    if (!manifest || manifest.host !== this.environment.kind) {
       throw new Error('远程快照格式或宿主类型不兼容。');
     }
 
@@ -134,7 +149,7 @@ export class ProfileAdapter {
     const localIds = new Set(localProfiles.map((profile) => profile.id));
     const remoteIds = new Set(manifest.profiles.map((profile) => profile.id));
     const structuralChange = !setsEqual(localIds, remoteIds);
-    if (structuralChange && !allowStructural) {
+    if (structuralChange && !allowStructural && !applyMatchingFiles) {
       return {
         changedFiles: [],
         structuralChange,
@@ -143,16 +158,21 @@ export class ProfileAdapter {
       };
     }
 
-    if (structuralChange) {
+    const applyStructure = structuralChange && allowStructural;
+    if (applyStructure) {
       await this.restoreProfileStructure(manifest);
     }
 
-    const refreshedProfiles = structuralChange ? await this.listProfiles() : localProfiles;
-    const localById = new Map(refreshedProfiles.map((profile) => [profile.id, profile]));
+    const refreshedProfiles = applyStructure ? await this.listProfiles() : localProfiles;
+    // 多窗口无法增删 Profile 时只动共有 Profile，避免随后合并把本机旧文件推回云端。
+    const targetProfiles = structuralChange && !allowStructural
+      ? refreshedProfiles.filter((profile) => remoteIds.has(profile.id))
+      : refreshedProfiles;
+    const localById = new Map(targetProfiles.map((profile) => [profile.id, profile]));
     const changedFiles: string[] = [];
     const backupsRoot = path.join(this.environment.runtimePath, 'backups');
     const backupRoot = path.join(backupsRoot, new Date().toISOString().replaceAll(':', '-'));
-    for (const profile of refreshedProfiles) {
+    for (const profile of targetProfiles) {
       for (const resource of FILE_RESOURCES) {
         const relative = `profiles/${profile.id}/${resource}`;
         const target = path.join(profile.location, resource);
@@ -175,6 +195,8 @@ export class ProfileAdapter {
     }
     for (const relative of Object.keys(manifest.files)) {
       const normalized = normalizeRelative(relative);
+      // 扩展清单由 IDE 自己维护，只用来决定装哪些扩展，绝不能写回本机。
+      if (normalized === HOST_EXTENSIONS_FILE) continue;
       const parts = normalized.split('/');
       if (parts[0] !== 'profiles' || parts.length < 3) {
         throw new Error(`快照包含非法路径：${relative}`);
@@ -197,12 +219,18 @@ export class ProfileAdapter {
       changedFiles.push(target);
     }
     await pruneBackups(backupsRoot);
-    return { changedFiles, structuralChange, structuralApplied: structuralChange };
+    return {
+      changedFiles,
+      structuralChange,
+      structuralApplied: applyStructure,
+      ...(structuralChange && !applyStructure
+        ? { message: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。' }
+        : {}),
+    };
   }
 
   private async restoreProfileStructure(manifest: SnapshotManifest): Promise<void> {
-    const metadata = manifest.profileMetadata;
-    if (!metadata) throw new Error('远程快照缺少 Profile 元数据，无法安全应用结构变化。');
+    const metadata = resolveProfileMetadata(manifest);
     const locations = metadata.map((profile) => profile.location);
     if (!locations.every((location) => typeof location === 'string' && isSafeSegment(location))) {
       throw new Error('远程 Profile 元数据包含非法目录。');
@@ -266,6 +294,32 @@ export class ProfileAdapter {
       await fs.writeFile(target, content);
       files[`profiles/${profileId}/${resource}/${relative.split(path.sep).join('/')}`] = sha256(content);
     }
+  }
+
+  /**
+   * 本机用户安装的扩展标识，来自扩展目录的清单文件。
+   * 内置扩展不在该文件中，因此这份列表可以安全地用于判断哪些扩展需要卸载。
+   */
+  public async listInstalledExtensionIds(): Promise<string[]> {
+    const manifestPath = this.environment.extensionsManifestPath;
+    if (!manifestPath) return [];
+    const content = await stableRead(manifestPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (!content) return [];
+    return [...new Set(parseExtensionIds(content.toString('utf8')))].sort((left, right) => left.localeCompare(right));
+  }
+
+  /**
+   * 已安装扩展清单的仓库形态，只保留标识并排序。
+   * 原文件还含版本号、安装路径和安装时间等本机专属字段，原样同步会让扩展一升级就产生无意义的冲突。
+   */
+  private async readInstalledExtensions(): Promise<Buffer | undefined> {
+    const ids = await this.listInstalledExtensionIds();
+    if (!ids.length) return undefined;
+    const normalized = ids.map((id) => ({ identifier: { id } }));
+    return Buffer.from(`${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
   }
 
   private async readStorage(): Promise<StorageFile> {
@@ -448,4 +502,12 @@ function setsEqual(left: Set<string>, right: Set<string>): boolean {
   return left.size === right.size && [...left].every((item) => right.has(item));
 }
 
-export const testing = { normalizeRelative, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups };
+/** 旧快照可能省略元数据；命名 Profile 的 id 就是磁盘目录名，可以按清单补全。 */
+function resolveProfileMetadata(manifest: SnapshotManifest): Array<Record<string, unknown>> {
+  if (manifest.profileMetadata) return manifest.profileMetadata;
+  return manifest.profiles
+    .filter((profile) => !profile.isDefault)
+    .map((profile) => ({ location: profile.id, name: profile.name }));
+}
+
+export const testing = { normalizeRelative, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };

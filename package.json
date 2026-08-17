@@ -2,7 +2,7 @@
   "name": "my-setting-sync",
   "displayName": "My Setting Sync",
   "description": "在 VS Code 与 Cursor 中通过 Git 自动同步全部用户配置文件。",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "publisher": "saltcoreyan",
   "license": "MIT",
   "icon": "media/profile-git-sync.png",
@@ -32,8 +32,27 @@
       {
         "command": "profileGitSync.openSettings",
         "title": "My Setting Sync: 打开设置"
+      },
+      {
+        "command": "profileGitSync.toggleEnabled",
+        "title": "My Setting Sync: 启用或关闭同步"
+      },
+      {
+        "command": "profileGitSync.rebuildRepository",
+        "title": "删除本机 .git",
+        "category": "My Setting Sync",
+        "icon": "$(trash)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "profileGitSync.rebuildRepository",
+          "when": "view == profileGitSync.sidebar",
+          "group": "navigation"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -55,12 +74,12 @@
     "configuration": {
       "title": "My Setting Sync",
       "properties": {
-        "profileGitSync.autoSync": {
+        "profileGitSync.enabled": {
           "type": "boolean",
           "scope": "application",
           "ignoreSync": true,
-          "default": true,
-          "description": "自动检测本机和远程配置变化并同步。"
+          "default": false,
+          "description": "启用配置同步。关闭后不创建本地仓库、不访问远程仓库，也不写回本机配置。"
         },
         "profileGitSync.pollIntervalSeconds": {
           "type": "number",
@@ -82,8 +101,8 @@
           "type": "boolean",
           "scope": "application",
           "ignoreSync": true,
-          "default": false,
-          "description": "同步工作区与配置文件的关联关系。默认关闭以避免把本机路径提交到仓库。"
+          "default": true,
+          "description": "同步工作区与配置文件的关联关系。"
         }
       }
     }

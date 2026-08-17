@@ -1,20 +1,55 @@
 export type HostKind = 'vscode' | 'cursor';
-export type SyncMode = 'backup' | 'sync';
-export type SyncPhase =
-  | '未配置'
-  | '空闲'
-  | '正在扫描'
-  | '正在拉取'
-  | '正在提交'
-  | '正在推送'
-  | '正在同步扩展'
-  | '等待其他窗口关闭'
-  | '等待 AI'
-  | '失败';
 
+/** 备份模式只把本机配置提交到仓库，同步模式才会把仓库内容写回本机。 */
+export type SyncMode = 'backup' | 'sync';
+
+/** 同步流程内部的步骤，只用于进度展示，不参与任何判定。 */
+export type StageName =
+  | 'snapshot'
+  | 'scan-secrets'
+  | 'prepare'
+  | 'pull'
+  | 'decide'
+  | 'merge'
+  | 'ai'
+  | 'push'
+  | 'apply'
+  | 'extensions';
+
+/** 同步暂停的原因，决定了何时可以自动恢复。 */
+export type BlockReason =
+  | 'dirty-windows'
+  | 'unreadable-windows'
+  | 'other-windows'
+  | 'unrelated'
+  | 'exclusive-lock';
+
+/**
+ * 本机仓库与远端的关系，是同步流程的输出。
+ * 改变仓库的动作自身产出新值，因此不需要探测磁盘，也不会与磁盘事实脱钩。
+ */
+export type LinkState =
+  | 'no-repository'
+  | 'in-sync'
+  | 'unrelated';
+
+/** 扩展当前在做什么。与 LinkState 正交，两者共同决定对外显示的状态。 */
+export type SyncState =
+  | { kind: 'disabled' }
+  | { kind: 'unconfigured' }
+  | { kind: 'idle' }
+  | { kind: 'running'; stage: StageName }
+  | { kind: 'blocked'; reason: BlockReason }
+  | { kind: 'failed' };
+
+/** 一轮同步的结果报告；状态由调度层据此决定，流程本身不写链路状态。 */
 export interface SyncOutcome {
   ok: boolean;
   retry?: boolean;
+  unrelated?: boolean;
+  blockReason?: BlockReason;
+  /** Profile 增删因窗口数未满足而搁置，同步本身已完成。 */
+  waitingForWindows?: boolean;
   extensionsPending?: string[];
   structuralApplied?: boolean;
 }
@@ -27,6 +62,36 @@ export interface MergeReport {
   aiError?: string;
 }
 
+/** 整轮同步累积的观察结果，只用于生成最终文案与返回值。 */
+export interface SyncReport {
+  mode: SyncMode;
+  usedAiFallback: boolean;
+  recoveredPendingChanges: boolean;
+  recoveredFromDivergence: boolean;
+  adoptedCloud: boolean;
+  changedFileCount: number;
+  /** Profile 增删需要单窗口才能应用；未应用时同步仍算完成，但要提示用户关闭其他窗口。 */
+  waitingForWindows: boolean;
+  structuralApplied: boolean;
+  activeWindows?: number;
+  structuralMessage?: string;
+  extensionsPending?: string[];
+  merge?: MergeReport;
+}
+
+export function createSyncReport(mode: SyncMode): SyncReport {
+  return {
+    mode,
+    usedAiFallback: false,
+    recoveredPendingChanges: false,
+    recoveredFromDivergence: false,
+    adoptedCloud: false,
+    changedFileCount: 0,
+    waitingForWindows: false,
+    structuralApplied: false,
+  };
+}
+
 export interface SyncConfiguration {
   repositoryUrl: string;
   branch: string;
@@ -36,14 +101,14 @@ export interface SyncConfiguration {
 
 export interface PluginConfiguration extends SyncConfiguration {
   mode: SyncMode;
-  autoSync: boolean;
   pollIntervalSeconds: number;
   debounceSeconds: number;
   includeProfileAssociations: boolean;
 }
 
 export interface RuntimeStatus {
-  phase: SyncPhase;
+  sync: SyncState;
+  link: LinkState;
   role: 'leader' | 'follower' | 'stopped';
   activeWindows: number;
   profiles: string[];
@@ -76,8 +141,7 @@ export const DEFAULT_CONFIGURATION: PluginConfiguration = {
   gitUserName: '',
   gitUserEmail: '',
   mode: 'backup',
-  autoSync: true,
   pollIntervalSeconds: 300,
   debounceSeconds: 10,
-  includeProfileAssociations: false,
+  includeProfileAssociations: true,
 };
