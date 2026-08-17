@@ -203,11 +203,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const promptCloudAdopt = async () => {
+    // 备份模式永不写回本机，重新克隆后仍是把本机配置推上去，确认文案必须如实说明方向。
+    const backupOnly = configurationStore.get().mode === 'backup';
     const confirmed = await vscode.window.showWarningMessage(
       '本地配置仓库与远端不同源',
       {
         modal: true,
-        detail: '将删除扩展内的本地仓库缓存并重新从远端克隆，随后以云端配置覆盖本机，本轮不会把本机配置推到云端。本机原配置会备份到扩展运行目录；云端没有的扩展会被卸载。',
+        detail: backupOnly
+          ? '将删除扩展内的本地仓库缓存并重新从远端克隆，随后继续把本机配置备份到云端，覆盖云端已有的本宿主快照。本机配置不会被改写。'
+          : '将删除扩展内的本地仓库缓存并重新从远端克隆，随后以云端配置覆盖本机，本轮不会把本机配置推到云端。本机原配置会备份到扩展运行目录；云端没有的扩展会被卸载。',
       },
       '废弃并覆盖',
     );
@@ -223,7 +227,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       applyStatus({ message: '另一窗口正在执行同步，请稍后重试重建。' }, false);
       return;
     }
-    applyStatus({ lastSyncAt: undefined, message: '本地仓库已删除，正在按云端配置覆盖本机。' }, false);
+    applyStatus({
+      lastSyncAt: undefined,
+      message: backupOnly ? '本地仓库已删除，正在重新克隆并备份本机配置。' : '本地仓库已删除，正在按云端配置覆盖本机。',
+    }, false);
     dispatch({ type: 'repository-removed' });
     dispatch({ type: 'sync-requested', source: 'user', adoptCloud: true });
   };
@@ -289,7 +296,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       })();
     }, configuration.debounceSeconds * 1_000);
-    remoteTimer = setInterval(() => dispatch({ type: 'sync-requested', source: 'timer' }), configuration.pollIntervalSeconds * 1_000);
+    // 备份模式不写回本机，远端轮询拉不出任何要应用的变化，只会空转并占用独占锁。
+    if (configuration.mode === 'sync') {
+      remoteTimer = setInterval(() => dispatch({ type: 'sync-requested', source: 'timer' }), configuration.pollIntervalSeconds * 1_000);
+    }
     startupTimer = setTimeout(() => {
       startupTimer = undefined;
       dispatch({ type: 'sync-requested', source: 'startup' });

@@ -6,7 +6,7 @@ import { WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService } from './git-service';
 import { HostEnvironment } from './host';
 import { runPipeline } from './pipeline/pipeline';
-import { SYNC_STAGES } from './pipeline/stages';
+import { BACKUP_STAGES, SYNC_STAGES } from './pipeline/stages';
 import { SyncContext, SyncDependencies } from './pipeline/types';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
@@ -86,7 +86,9 @@ export class SyncEngine {
 
       // 其他窗口可能刚标记过重建，必须读共享文件的最新值而不是本窗口缓存。
       await this.runtimeState.reload();
-      const adoptCloud = options.adoptCloud === true || this.runtimeState.get().cloudAdoptPending;
+      const backupOnly = configuration.mode === 'backup';
+      // 备份模式永不写回本机，采用云端无从谈起；置为 false 才能保证本机内容仍要过凭据扫描。
+      const adoptCloud = !backupOnly && (options.adoptCloud === true || this.runtimeState.get().cloudAdoptPending);
 
       // 同步在独占锁内执行，进程异常退出残留的临时快照可以安全清空。
       const snapshotRoot = path.join(this.environment.runtimePath, 'snapshots');
@@ -108,10 +110,10 @@ export class SyncEngine {
             this.environment.kind,
           ),
         },
-        report: createSyncReport(),
+        report: createSyncReport(configuration.mode),
         artifacts: {},
       };
-      return await runPipeline(context, SYNC_STAGES);
+      return await runPipeline(context, backupOnly ? BACKUP_STAGES : SYNC_STAGES);
     } catch (error) {
       this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
       return { ok: false };

@@ -21,6 +21,7 @@ import {
   createConfigurationRecord,
   hasEmbeddedCredentials,
   parseConfigurationRecord,
+  parsePluginConfiguration,
   relateConfigurationRecords,
   resolveRepositoryUrl,
 } from '../src/configuration-record';
@@ -30,7 +31,7 @@ import { displayIcon, displayPhase, displayTone, formatRelativeSyncTime } from '
 import { AiService } from '../src/ai';
 import { mergeStage } from '../src/pipeline/merge';
 import { runPipeline } from '../src/pipeline/pipeline';
-import { testing as stageTesting } from '../src/pipeline/stages';
+import { BACKUP_STAGES, SYNC_STAGES, testing as stageTesting } from '../src/pipeline/stages';
 import { Stage, SyncContext, SyncDependencies } from '../src/pipeline/types';
 import { createMachine, reduce, SchedulerEvent, SchedulerMachine } from '../src/scheduler';
 import { finalSyncMessage } from '../src/sync-message';
@@ -563,11 +564,17 @@ test('旧快照缺少元数据时按 Profile 清单补全', () => {
 });
 
 test('强制采用云端时缺快照不得回退为本机推送', () => {
-  assert.equal(decideCloudAdopt(true, 'synced', true), 'adopt');
-  assert.equal(decideCloudAdopt(true, 'cloned', false), 'missing-cloud');
-  assert.equal(decideCloudAdopt(false, 'cloned', true), 'adopt');
-  assert.equal(decideCloudAdopt(false, 'cloned', false), 'seed-local');
-  assert.equal(decideCloudAdopt(false, 'synced', true), 'merge');
+  assert.equal(decideCloudAdopt('sync', true, 'synced', true), 'adopt');
+  assert.equal(decideCloudAdopt('sync', true, 'cloned', false), 'missing-cloud');
+  assert.equal(decideCloudAdopt('sync', false, 'cloned', true), 'adopt');
+  assert.equal(decideCloudAdopt('sync', false, 'cloned', false), 'seed-local');
+  assert.equal(decideCloudAdopt('sync', false, 'synced', true), 'merge');
+});
+
+test('备份模式任何情况下都不采用云端', () => {
+  assert.equal(decideCloudAdopt('backup', true, 'synced', true), 'backup');
+  assert.equal(decideCloudAdopt('backup', false, 'cloned', true), 'backup');
+  assert.equal(decideCloudAdopt('backup', false, 'synced', false), 'backup');
 });
 
 test('Git 服务通过普通快进推送同步宿主目录', async () => {
@@ -711,16 +718,16 @@ test('冲突回退按本机优先并保证收敛到实际存在的一方', () =>
 test('自动合并后的状态文案说明处理方式并提示备份', () => {
   assert.equal(
     finalSyncMessage({
-      ...createSyncReport(),
+      ...createSyncReport('sync'),
       changedFileCount: 2,
       merge: { conflicts: ['a', 'b'], aiMerged: ['a'], autoMerged: ['b'] },
     }),
     '同步完成（AI 已自动合并 1 项冲突；1 项冲突按本机优先自动处理；冲突前的两份配置已备份到扩展运行目录）。',
   );
-  assert.equal(finalSyncMessage(createSyncReport()), '配置已是最新。');
+  assert.equal(finalSyncMessage(createSyncReport('sync')), '配置已是最新。');
   assert.equal(
     finalSyncMessage({
-      ...createSyncReport(),
+      ...createSyncReport('sync'),
       changedFileCount: 1,
       structuralMessage: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
     }),
@@ -730,17 +737,25 @@ test('自动合并后的状态文案说明处理方式并提示备份', () => {
 
 test('首次接入的状态文案说明已按云端覆盖并提示备份', () => {
   assert.equal(
-    finalSyncMessage({ ...createSyncReport(), adoptedCloud: true }),
+    finalSyncMessage({ ...createSyncReport('sync'), adoptedCloud: true }),
     '同步完成（已按云端配置覆盖本机；本机原配置已备份到扩展运行目录）。',
   );
   assert.equal(
     finalSyncMessage({
-      ...createSyncReport(),
+      ...createSyncReport('sync'),
       adoptedCloud: true,
       structuralMessage: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。',
     }),
     '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用；已按云端配置覆盖本机；本机原配置已备份到扩展运行目录。',
   );
+});
+
+test('备份模式状态文案使用备份完成前缀', () => {
+  assert.equal(
+    finalSyncMessage({ ...createSyncReport('backup'), changedFileCount: 1, usedAiFallback: true }),
+    '备份完成（AI 不可用或结果无效，已使用兜底策略）。',
+  );
+  assert.equal(finalSyncMessage({ ...createSyncReport('backup'), changedFileCount: 1 }), '备份完成。');
 });
 
 test('状态栏只在同步执行阶段显示忙碌', () => {
@@ -807,6 +822,42 @@ test('同步配置记录拒绝无效结构和含凭据仓库地址', () => {
   assert.equal(parseConfigurationRecord({ ...valid, configuration: { ...valid.configuration, branch: '../main' } }), undefined);
 });
 
+test('同步配置解析缺省回落到备份模式并拒绝非法模式', () => {
+  const parsed = parsePluginConfiguration({
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'main',
+    gitUserName: '',
+    gitUserEmail: '',
+    autoSync: true,
+    debounceSeconds: 10,
+    pollIntervalSeconds: 300,
+    includeProfileAssociations: false,
+  });
+  assert.equal(parsed?.mode, 'backup');
+  assert.equal(parsePluginConfiguration({
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'main',
+    gitUserName: '',
+    gitUserEmail: '',
+    mode: 'sync',
+    autoSync: true,
+    debounceSeconds: 10,
+    pollIntervalSeconds: 300,
+    includeProfileAssociations: false,
+  })?.mode, 'sync');
+  assert.equal(parsePluginConfiguration({
+    repositoryUrl: 'git@github.com:user/settings.git',
+    branch: 'main',
+    gitUserName: '',
+    gitUserEmail: '',
+    mode: 'invalid',
+    autoSync: true,
+    debounceSeconds: 10,
+    pollIntervalSeconds: 300,
+    includeProfileAssociations: false,
+  }), undefined);
+});
+
 test('独立 Profile 配置实例通过共享锁传播因果更新', async () => {
   resetApplicationSettings();
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-shared-configuration-'));
@@ -825,6 +876,7 @@ test('独立 Profile 配置实例通过共享锁传播因果更新', async () =>
       ...firstConfiguration,
       branch: 'second',
       pollIntervalSeconds: 900,
+      mode: 'sync' as const,
     };
     await first.save(firstConfiguration);
     await second.save(secondConfiguration);
@@ -832,6 +884,61 @@ test('独立 Profile 配置实例通过共享锁传播因果更新', async () =>
     assert.deepEqual(first.get(), secondConfiguration);
     assert.deepEqual(second.get(), secondConfiguration);
     assert.deepEqual(firstState.get('profileGitSync.syncedConfiguration'), secondState.get('profileGitSync.syncedConfiguration'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('备份模式的流程止于推送，不含写回本机的步骤', () => {
+  const names = BACKUP_STAGES.map((stage) => stage.name);
+  assert.deepEqual(names, ['snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'merge', 'push']);
+  assert.deepEqual(SYNC_STAGES.map((stage) => stage.name).slice(0, names.length), names);
+});
+
+test('备份模式不导出合并基准', async () => {
+  let exportedBase = false;
+  const context = stageContext({
+    configuration: { ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'backup' },
+    dependencies: stageDependencies({
+      git: fakeGit({
+        prepare: async () => undefined,
+        pull: async () => ({ state: 'synced', recoveredFromDivergence: false, mergeBase: 'abc123' }),
+        exportHostTree: async () => { exportedBase = true; return true; },
+      }),
+    }),
+  });
+  assert.deepEqual(await stageTesting.pullStage.run(context), { kind: 'continue' });
+  assert.equal(exportedBase, false);
+});
+
+test('备份模式直接用本机内容覆盖仓库快照', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-backup-merge-'));
+  try {
+    const localHostRoot = path.join(root, 'tmp', 'vscode');
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    const localManifest = { schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [], files: {} };
+    await mkdir(localHostRoot, { recursive: true });
+    await writeFile(path.join(localHostRoot, 'manifest.json'), JSON.stringify(localManifest));
+    await mkdir(repositoryHostRoot, { recursive: true });
+    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [{ id: 'cloud', name: '云端', isDefault: true }], files: {},
+    }));
+
+    const context = stageContext({
+      configuration: { ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'backup' },
+      artifacts: { strategy: 'backup', remoteExists: true },
+      paths: {
+        temporaryRoot: path.join(root, 'tmp'),
+        localHostRoot,
+        baseHostRoot: path.join(root, 'tmp', 'base'),
+        repositoryHostRoot,
+      },
+    });
+
+    assert.deepEqual(await mergeStage.run(context), { kind: 'continue' });
+    // 云端快照存在也不参与合并：备份模式下本机是仓库内容的唯一来源。
+    assert.equal(context.report.merge, undefined);
+    assert.deepEqual(await readJsonFile(path.join(repositoryHostRoot, 'manifest.json')), localManifest);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1552,7 +1659,7 @@ test('管道在阻塞时不再执行后续步骤', async () => {
 });
 
 test('结构变化未应用时同步仍算完成但报告需要关闭其他窗口', async () => {
-  const context = stageContext({ report: { ...createSyncReport(), waitingForWindows: true, activeWindows: 2 } });
+  const context = stageContext({ report: { ...createSyncReport('sync'), waitingForWindows: true, activeWindows: 2 } });
   const outcome = await runPipeline(context, []);
   assert.equal(outcome.ok, true);
   assert.equal(outcome.waitingForWindows, true);
@@ -1759,7 +1866,7 @@ function stageDependencies(overrides: Partial<SyncDependencies> = {}): SyncDepen
 function stageContext(overrides: Partial<SyncContext> = {}): SyncContext {
   return {
     dependencies: stageDependencies(),
-    configuration: { ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git' },
+    configuration: { ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'sync' },
     adoptCloud: false,
     paths: {
       temporaryRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp'),
@@ -1767,7 +1874,7 @@ function stageContext(overrides: Partial<SyncContext> = {}): SyncContext {
       baseHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp', 'base'),
       repositoryHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'repository'),
     },
-    report: createSyncReport(),
+    report: createSyncReport('sync'),
     artifacts: {},
     ...overrides,
   };

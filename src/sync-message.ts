@@ -25,5 +25,6 @@ export function finalSyncMessage(report: SyncReport): string {
   if (report.extensionsPending?.length) {
     notes.push(`部分扩展尚未安装完成：${report.extensionsPending.join('、')}`);
   }
-  return notes.length ? `同步完成（${notes.join('；')}）。` : '同步完成。';
+  const done = report.mode === 'backup' ? '备份完成' : '同步完成';
+  return notes.length ? `${done}（${notes.join('；')}）。` : `${done}。`;
 }

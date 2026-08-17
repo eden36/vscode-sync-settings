@@ -1,4 +1,4 @@
-import { BlockReason, LinkState, StageName, SyncState } from './types';
+import { BlockReason, LinkState, StageName, SyncMode, SyncState } from './types';
 
 export type DisplayPhase = '已关闭' | '未配置' | '未同步' | '同步中' | '已同步' | '同步失败' | '需要处理';
 export type DisplayTone = 'success' | 'running' | 'warning' | 'error' | 'muted';
@@ -51,6 +51,16 @@ export function stageLabel(stage: StageName): string {
     case 'apply': return '正在写回本机配置';
     case 'extensions': return '正在同步扩展';
   }
+}
+
+export function modeLabel(mode: SyncMode): string {
+  return mode === 'sync' ? '同步模式' : '备份模式';
+}
+
+export function modeNote(mode: SyncMode): string {
+  return mode === 'sync'
+    ? '同步模式会把仓库内容写回本机；与 IDE 内置 Settings Sync 同时开启时，两者可能互相覆盖。'
+    : '备份模式只把本机配置提交到仓库，不会写回本机，适合已经开启 IDE 内置 Settings Sync 的宿主。';
 }
 
 export function blockReasonLabel(reason: BlockReason): string {

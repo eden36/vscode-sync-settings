@@ -6,10 +6,11 @@
 
 - 一次快照默认 Profile 与全部命名 Profile 的 `settings.json`、`keybindings.json`、`tasks.json`、`extensions.json`、`mcp.json`、`snippets/` 和 `prompts/`。
 - VS Code 与 Cursor 分别存放在 `.profile-git-sync/hosts/vscode` 和 `.profile-git-sync/hosts/cursor`，不会互相覆盖。
-- 自动拉取、三方合并、提交和推送；不会使用 force push。
+- 支持两种运行模式：备份模式（只上传，不写回本机）与同步模式（双向同步，会写回本机）；默认备份模式。
+- 同步模式下自动拉取、三方合并、提交和推送；不会使用 force push。
 - 优先通过 AI 生成中文 commit message；AI 不可用或结果无效时使用固定的中文 Conventional Commit，不阻塞同步。
 - 全流程无需用户操作：同一文件被本机和远程同时修改时优先交给 AI 合并，AI 不可用或结果无效时按本机优先自动收敛，合并前的两份完整配置会先备份。
-- 配置同步仓库地址、分支、Git 提交身份和自动同步参数在同一设备的全部窗口与 Profiles 间保持一致；启用宿主 Settings Sync 后，也会在同类 IDE 的设备间自动恢复。
+- 配置同步仓库地址、分支、Git 提交身份、运行模式和同步间隔参数在同一设备的全部窗口与 Profiles 间保持一致；启用宿主 Settings Sync 后，也会在同类 IDE 的设备间自动恢复。
 - 多设备同时修改插件配置时自动以当前机器配置为准，并生成包含双方版本历史的新修订写回宿主 Settings Sync，不阻塞 Profile 配置同步。
 - 优先使用 VS Code `chat.utilitySmallModel` 指定的小模型，无法使用时回退到 IDE 通过 Language Model API 开放的默认模型，无需配置 API Key；疑似含有明文凭据的配置会被拒绝提交。
 - Profile 增删属于结构变化：只剩一个活动窗口时自动应用并重载窗口，多窗口运行时暂存，不直接改写 VS Code 内部 Profile 元数据。
@@ -29,6 +30,8 @@
 同步开始前会检查全部活动窗口。只要存在未保存的 Profile 配置文档，或有窗口状态无法确认，本轮同步就会暂停，条件恢复后由 leader 重试。插件在创建本机快照后以及提交合并结果前都会扫描疑似凭据；命中时停止同步，不写入远程仓库。
 
 ### 三方合并
+
+以下流程只适用于同步模式。备份模式每轮都用本机快照整包覆盖仓库中本宿主的目录，不做三方合并，也不进行远程轮询。
 
 每轮同步以本地与云端的共同祖先提交作为基础版本，拉取云端最新版本后，将基础版本、本机快照和云端快照逐个文件比较：
 
@@ -53,7 +56,7 @@
 
 ### 提交、应用与失败处理
 
-插件只暂存和提交 `.profile-git-sync/hosts/<宿主>`，不会操作当前工作区项目的 Git 仓库，也不会 force push。合并结果推送成功后才恢复本机 Profile 文件；涉及 `extensions.json` 时会调用 IDE 安装缺失扩展并等待生效，未装完也不会阻塞或提示重载。Profile 结构变化在单窗口时自动应用，应用后静默重载窗口。
+插件只暂存和提交 `.profile-git-sync/hosts/<宿主>`，不会操作当前工作区项目的 Git 仓库，也不会 force push。同步模式下，合并结果推送成功后才恢复本机 Profile 文件；涉及 `extensions.json` 时会调用 IDE 安装缺失扩展并等待生效，未装完也不会阻塞或提示重载。Profile 结构变化在单窗口时自动应用，应用后静默重载窗口。备份模式不写回本机，因此不会触发扩展装卸和窗口重载。
 
 窗口不安全、独占锁被其他窗口占用等可恢复情况会延迟重试，重试间隔逐步退避；失败原因显示在状态栏与侧边栏，不弹出通知。本轮未完整成功时不会更新“上次成功同步”时间。
 
@@ -82,7 +85,7 @@ npm run package
 
 打开活动栏中的“配置同步”，填写配置同步仓库和分支。这个仓库固定克隆在扩展全局存储中，插件不会读取或修改当前工作区项目的 `.git`。Git 用户名和邮箱是可选项：留空时继承本机 Git 配置，填写时只覆盖配置同步仓库的提交身份；SSH 密钥或 HTTPS 凭据始终使用本机 Git 配置。提交信息与冲突合并优先使用 `chat.utilitySmallModel` 配置的模型；该设置为空或模型未向扩展开放时，回退到当前 IDE 暴露的默认模型。宿主没有开放模型或 AI 返回无效结果时，插件自动使用确定性兜底并继续同步。
 
-插件配置在同一 User Data 下使用共享版本记录，因此默认 Profile、命名 Profile 和多个窗口会自动收敛到同一版本。跨设备自动恢复需要在各设备登录同一 VS Code 或 Cursor 账号并开启 Settings Sync；VS Code 与 Cursor 使用各自的同步账号和宿主目录，不保证跨宿主互通。仓库地址可以进入 Settings Sync，但包含用户名密码或 Token 的 URL 会被拒绝；SSH 密钥和 Credential Manager 凭据不会同步。
+插件配置在同一 User Data 下使用共享版本记录，因此默认 Profile、命名 Profile 和多个窗口会自动收敛到同一版本。跨设备自动恢复需要在各设备登录同一 VS Code 或 Cursor 账号并开启 Settings Sync；VS Code 与 Cursor 使用各自的同步账号和宿主目录，不保证跨宿主互通。仓库地址可以进入 Settings Sync，但包含用户名密码或 Token 的 URL 会被拒绝；SSH 密钥和 Credential Manager 凭据不会同步。建议 VS Code 在开启内置 Settings Sync 时保持备份模式，Cursor（或其他无内置同步的宿主）再切到同步模式，并分别使用不同仓库。
 
 建议使用 SSH 或系统 Git Credential Manager 管理 Git 凭据，不要把凭据写进仓库 URL。插件会在 IDE 启动完成后自动激活，但仍需要应用到所有 Profiles；否则仅打开未安装该扩展的 Profile 时，不会有实例负责自动同步或参与多窗口安全检查。
 

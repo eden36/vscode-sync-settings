@@ -54,7 +54,10 @@ const pullStage: Stage = {
     context.artifacts.pull = pull;
     context.report.recoveredFromDivergence = pull.recoveredFromDivergence;
     // 基准必须取本地与远端的共同祖先，否则本机上次的改动会被当成共同基础，导致误判冲突。
-    if (pull.mergeBase) await git.exportHostTree(pull.mergeBase, environment.kind, context.paths.baseHostRoot);
+    // 备份模式不做三方合并，导出基准纯属多余开销。
+    if (pull.mergeBase && context.configuration.mode === 'sync') {
+      await git.exportHostTree(pull.mergeBase, environment.kind, context.paths.baseHostRoot);
+    }
     return { kind: 'continue' };
   },
 };
@@ -65,7 +68,7 @@ const decideStage: Stage = {
     const { environment } = context.dependencies;
     const pull = requireValue(context.artifacts.pull, 'pull');
     const remoteExists = await exists(path.join(context.paths.repositoryHostRoot, 'manifest.json'));
-    const strategy = decideCloudAdopt(context.adoptCloud, pull.state, remoteExists);
+    const strategy = decideCloudAdopt(context.configuration.mode, context.adoptCloud, pull.state, remoteExists);
     if (strategy === 'missing-cloud') {
       await context.dependencies.runtimeState.update({ cloudAdoptPending: false });
       const hostLabel = environment.kind === 'cursor' ? 'Cursor' : 'VS Code';
@@ -166,6 +169,17 @@ export const SYNC_STAGES: Stage[] = [
   pushStage,
   applyStage,
   extensionsStage,
+];
+
+/** 备份模式的流程到推送为止：不写回本机，也就没有 apply 与 extensions 两步。 */
+export const BACKUP_STAGES: Stage[] = [
+  snapshotStage,
+  scanSecretsStage,
+  prepareStage,
+  pullStage,
+  decideStage,
+  mergeStage,
+  pushStage,
 ];
 
 export const testing = { snapshotStage, scanSecretsStage, prepareStage, pullStage, decideStage, pushStage, applyStage, extensionsStage };

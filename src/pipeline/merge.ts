@@ -32,8 +32,9 @@ export const mergeStage: Stage = {
     }
 
     // 远端还没有本宿主的快照时（例如同一仓库先接入了另一个宿主），直接用本机内容初始化，没有可合并的对方。
+    // 备份模式同理：本机是仓库内容的唯一来源，整包覆盖即可，不做三方合并也不需要冲突备份。
     let mergedRoot = localHostRoot;
-    if (requireValue(context.artifacts.remoteExists, 'remoteExists')) {
+    if (strategy !== 'backup' && requireValue(context.artifacts.remoteExists, 'remoteExists')) {
       const baseExists = await exists(path.join(baseHostRoot, 'manifest.json'));
       const merged = path.join(temporaryRoot, 'merged');
       const report = await mergeSnapshots(context, baseExists ? baseHostRoot : undefined, localHostRoot, repositoryHostRoot, merged);

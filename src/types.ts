@@ -1,5 +1,8 @@
 export type HostKind = 'vscode' | 'cursor';
 
+/** 备份模式只把本机配置提交到仓库，同步模式才会把仓库内容写回本机。 */
+export type SyncMode = 'backup' | 'sync';
+
 /** 同步流程内部的步骤，只用于进度展示，不参与任何判定。 */
 export type StageName =
   | 'snapshot'
@@ -63,6 +66,7 @@ export interface MergeReport {
 
 /** 整轮同步累积的观察结果，只用于生成最终文案与返回值。 */
 export interface SyncReport {
+  mode: SyncMode;
   usedAiFallback: boolean;
   recoveredPendingChanges: boolean;
   recoveredFromDivergence: boolean;
@@ -77,8 +81,9 @@ export interface SyncReport {
   merge?: MergeReport;
 }
 
-export function createSyncReport(): SyncReport {
+export function createSyncReport(mode: SyncMode): SyncReport {
   return {
+    mode,
     usedAiFallback: false,
     recoveredPendingChanges: false,
     recoveredFromDivergence: false,
@@ -97,6 +102,7 @@ export interface SyncConfiguration {
 }
 
 export interface PluginConfiguration extends SyncConfiguration {
+  mode: SyncMode;
   pollIntervalSeconds: number;
   debounceSeconds: number;
   includeProfileAssociations: boolean;
@@ -136,6 +142,7 @@ export const DEFAULT_CONFIGURATION: PluginConfiguration = {
   branch: 'main',
   gitUserName: '',
   gitUserEmail: '',
+  mode: 'backup',
   pollIntervalSeconds: 300,
   debounceSeconds: 10,
   includeProfileAssociations: true,
