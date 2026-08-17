@@ -2,7 +2,7 @@
   "name": "my-setting-sync",
   "displayName": "My Setting Sync",
   "description": "在 VS Code 与 Cursor 中通过 Git 自动同步全部用户配置文件。",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "publisher": "saltcoreyan",
   "license": "MIT",
   "icon": "media/profile-git-sync.png",
