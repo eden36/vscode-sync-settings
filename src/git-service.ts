@@ -16,12 +16,15 @@ export interface PullResult {
 
 export class ConfigurationRepositoryGitService {
   public readonly repositoryPath: string;
+  /** 供通用失败路径脱敏用：Git 常在 stderr 中回显完整远程地址。由 prepare 赋值，之前的调用不脱敏。 */
+  private remoteUrl = '';
 
   public constructor(runtimePath: string) {
     this.repositoryPath = path.join(runtimePath, 'repository');
   }
 
   public async prepare(configuration: SyncConfiguration): Promise<void> {
+    this.remoteUrl = configuration.repositoryUrl;
     await fs.mkdir(this.repositoryPath, { recursive: true });
     if (!(await exists(path.join(this.repositoryPath, '.git')))) {
       await this.git(['init']);
@@ -155,7 +158,9 @@ export class ConfigurationRepositoryGitService {
 
   private async git(args: string[], allowFailure = false, timeoutMs = 60_000) {
     const result = await runProcess('git', args, this.repositoryPath, timeoutMs);
-    if (!allowFailure && result.exitCode !== 0) throw new Error(`配置同步仓库 Git 操作失败：${result.stderr || result.stdout}`);
+    if (!allowFailure && result.exitCode !== 0) {
+      throw new Error(`配置同步仓库 Git 操作失败：${redact(result.stderr || result.stdout, this.remoteUrl)}`);
+    }
     return result;
   }
 
@@ -170,7 +175,8 @@ async function exists(filePath: string): Promise<boolean> {
 }
 
 function redact(message: string, repositoryUrl: string): string {
-  return message.replaceAll(repositoryUrl, '<远程仓库>');
+  // 地址为空时 replaceAll 会在每个字符之间插入替换文本，必须先判空。
+  return repositoryUrl ? message.replaceAll(repositoryUrl, '<远程仓库>') : message;
 }
 
 function formatRemoteError(message: string, repositoryUrl: string): string {
@@ -180,3 +186,5 @@ function formatRemoteError(message: string, repositoryUrl: string): string {
   }
   return `无法访问远程仓库：${detail}`;
 }
+
+export const testing = { redact };

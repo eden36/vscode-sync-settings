@@ -8,7 +8,7 @@ import { MultiWindowCoordinator } from '../src/coordinator';
 import { ConfigurationStore } from '../src/configuration';
 import { parseUtilityModelSetting } from '../src/ai-model';
 import { fallbackCommitMessage } from '../src/sync-fallback';
-import { ConfigurationRepositoryGitService } from '../src/git-service';
+import { ConfigurationRepositoryGitService, testing as gitTesting } from '../src/git-service';
 import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
@@ -34,6 +34,7 @@ import { runPipeline } from '../src/pipeline/pipeline';
 import { BACKUP_STAGES, SYNC_STAGES, testing as stageTesting } from '../src/pipeline/stages';
 import { Stage, SyncContext, SyncDependencies } from '../src/pipeline/types';
 import { createMachine, reduce, SchedulerEvent, SchedulerMachine } from '../src/scheduler';
+import { SyncEngine } from '../src/sync-engine';
 import { finalSyncMessage } from '../src/sync-message';
 import { decideCloudAdopt } from '../src/sync-strategy';
 import {
@@ -277,11 +278,14 @@ test('扩展在启动后激活并固定运行于 UI extension host', async () =>
     displayName?: string;
     activationEvents?: string[];
     extensionKind?: string[];
+    contributes?: { configuration?: { properties?: Record<string, unknown> } };
   };
   assert.equal(manifest.name, 'my-setting-sync');
   assert.equal(manifest.displayName, 'My Setting Sync');
   assert.equal(manifest.activationEvents?.includes('onStartupFinished'), true);
+  assert.equal(manifest.activationEvents?.includes('onView:profileGitSync.sidebar'), true);
   assert.deepEqual(manifest.extensionKind, ['ui']);
+  assert.equal(manifest.contributes?.configuration?.properties?.['profileGitSync.includeProfileAssociations'], undefined);
 });
 
 test('默认与命名 Profile 解析到同一扩展运行目录', () => {
@@ -689,6 +693,12 @@ test('配置同步仓库 Git 操作不会修改当前项目仓库', async () => 
   }
 });
 
+test('Git 错误消息脱敏远程仓库地址且空地址不改写原文', () => {
+  const url = 'git@github.com:user/settings.git';
+  assert.equal(gitTesting.redact(`fatal: ${url} Permission denied`, url), 'fatal: <远程仓库> Permission denied');
+  assert.equal(gitTesting.redact('fatal: Permission denied', ''), 'fatal: Permission denied');
+});
+
 test('扩展产物不包含 jsonc-parser 的未打包相对加载', async () => {
   const bundle = await readFile(path.join(process.cwd(), 'dist', 'extension.js'), 'utf8');
   assert.doesNotMatch(bundle, /require\w*\(["']\.\/impl\//);
@@ -893,6 +903,55 @@ test('备份模式的流程止于推送，不含写回本机的步骤', () => {
   const names = BACKUP_STAGES.map((stage) => stage.name);
   assert.deepEqual(names, ['snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'merge', 'push']);
   assert.deepEqual(SYNC_STAGES.map((stage) => stage.name).slice(0, names.length), names);
+});
+
+test('备份模式同步前会清除遗留的采用云端标记', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-backup-pending-'));
+  try {
+    const runtimeState = new RuntimeStateStore(root);
+    await runtimeState.initialize();
+    await runtimeState.update({ cloudAdoptPending: true });
+    const engine = new SyncEngine(
+      { kind: 'vscode', userDataPath: root, runtimePath: root },
+      { createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
+      fakeGit({ prepare: async () => undefined, pull: async () => ({ state: 'synced', recoveredFromDivergence: false }) }),
+      {} as unknown as AiService,
+      { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'backup' }) } as unknown as ConfigurationStore,
+      runtimeState,
+      () => undefined,
+      async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    );
+    const outcome = await engine.synchronize();
+    assert.equal(runtimeState.get().cloudAdoptPending, false);
+    assert.equal(outcome?.ok, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('尚未开始的同步也会响应停止请求，且停止意图只兑现一次', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-stop-'));
+  try {
+    const engine = new SyncEngine(
+      { kind: 'vscode', userDataPath: root, runtimePath: root },
+      { createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
+      fakeGit({}),
+      {} as unknown as AiService,
+      { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git' }) } as unknown as ConfigurationStore,
+      { reload: async () => undefined, get: () => ({ cloudAdoptPending: false }) } as unknown as RuntimeStateStore,
+      () => undefined,
+      async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    );
+    engine.requestStop();
+    assert.deepEqual(await engine.synchronize(), { ok: false, cancelled: true });
+    // 意图已经兑现，不能粘住让之后每一轮都被直接取消。
+    assert.deepEqual(await engine.synchronize(), { ok: false });
+    engine.requestStop();
+    engine.clearStop();
+    assert.deepEqual(await engine.synchronize(), { ok: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('备份模式不导出合并基准', async () => {
@@ -1462,6 +1521,26 @@ test('文件锁只在持有者已退出或长期不释放时才被清理', async
     let recovered = false;
     await withFileLock(lockPath, async () => { recovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
     assert.equal(recovered, true);
+
+    // 空锁文件没有 pid，只能按修改时间判定残留，否则共享状态会永久无法写入。
+    await writeFile(lockPath, '');
+    await utimes(lockPath, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+    let emptyRecovered = false;
+    await withFileLock(lockPath, async () => { emptyRecovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
+    assert.equal(emptyRecovered, true);
+
+    await writeFile(lockPath, '{');
+    await utimes(lockPath, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+    let brokenRecovered = false;
+    await withFileLock(lockPath, async () => { brokenRecovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
+    assert.equal(brokenRecovered, true);
+
+    // 刚创建的空锁视为写入中途，不能立刻抢走。
+    await writeFile(lockPath, '');
+    await assert.rejects(
+      () => withFileLock(lockPath, async () => undefined, { timeoutMs: 120, staleMs: 60_000, busyMessage: '锁被占用' }),
+      /锁被占用/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1719,6 +1798,31 @@ test('同步进行中关闭开关后等待当前安全操作完成再停止', ()
 
   const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
   assert.deepEqual(finished.next.sync, { kind: 'disabled' });
+});
+
+test('取消后重新开启不算失败，并且补跑一轮', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
+  const closed = reduce(running, { type: 'enabled-changed', enabled: false });
+  const reopened = reduce(closed.next, { type: 'enabled-changed', enabled: true });
+  const finished = reduce(reopened.next, { type: 'sync-finished', outcome: { ok: false, cancelled: true } });
+  assert.deepEqual(finished.next.sync, { kind: 'running', stage: 'snapshot' });
+  assert.equal(finished.next.retryAttempt, 0);
+  assert.deepEqual(finished.commands, [{ type: 'cancel-retry' }, { type: 'start-sync', adoptCloud: false }]);
+});
+
+test('取消的一轮结束时开关仍关着则停在关闭状态', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
+  const closed = reduce(running, { type: 'enabled-changed', enabled: false });
+  const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: false, cancelled: true } });
+  assert.deepEqual(finished.next.sync, { kind: 'disabled' });
+  assert.deepEqual(finished.commands, [{ type: 'stop-schedules' }]);
+});
+
+test('follower 上取消的一轮不会自行补跑', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), isLeader: false, sync: { kind: 'running', stage: 'push' } };
+  const finished = reduce(running, { type: 'sync-finished', outcome: { ok: false, cancelled: true } });
+  assert.deepEqual(finished.next.sync, { kind: 'idle' });
+  assert.deepEqual(finished.commands, [{ type: 'cancel-retry' }]);
 });
 
 test('开启开关后立即同步一次并启动定时器', () => {

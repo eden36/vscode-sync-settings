@@ -8,7 +8,7 @@ const DEFAULT_LOCK_STALE_MS = 30_000;
 export interface FileLockOptions {
   /** 等待锁的最长时间，超时抛出 busyMessage。 */
   timeoutMs?: number;
-  /** 超过此时长且持有进程已退出的锁视为残留，可强制清除。 */
+  /** 超过此时长的锁视为残留并可强制清除：持有进程已退出、活进程长期不释放，或无法解析的空/损坏锁文件。 */
   staleMs?: number;
   busyMessage?: string;
 }
@@ -35,7 +35,7 @@ export async function withFileLock<T>(lockPath: string, action: () => Promise<T>
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const lock = await readJson(lockPath);
-      if (isStaleLock(lock, staleMs)) {
+      if (await isStaleLock(lockPath, lock, staleMs)) {
         await fs.rm(lockPath, { force: true });
         continue;
       }
@@ -51,8 +51,18 @@ export async function withFileLock<T>(lockPath: string, action: () => Promise<T>
   }
 }
 
-function isStaleLock(value: unknown, staleMs: number): boolean {
-  if (!isRecord(value) || typeof value.pid !== 'number' || typeof value.createdAt !== 'number') return false;
+async function isStaleLock(lockPath: string, value: unknown, staleMs: number): Promise<boolean> {
+  // 创建锁文件与写入持有者信息不是一步完成的，进程在两步之间退出会留下空文件或半截 JSON。
+  // 这种锁没有 pid 可查，只能按修改时间兜底，否则共享状态会永久无法写入，重启也不能恢复。
+  if (!isRecord(value) || typeof value.pid !== 'number' || typeof value.createdAt !== 'number') {
+    try {
+      const stats = await fs.stat(lockPath);
+      return Date.now() - stats.mtimeMs > staleMs;
+    } catch (error) {
+      // 只有锁文件确实不存在才算残留；权限或占用导致的 stat 失败按锁仍有效处理，避免误删其他窗口正在持有的锁。
+      return (error as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+  }
   // 先确认持有者是否还活着：活进程持有的锁不能因为耗时长就被抢走，否则两个窗口会并行写同一份文件。
   try {
     process.kill(value.pid, 0);

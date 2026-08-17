@@ -195,6 +195,25 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
     return { next: { ...machine, sync: resolveIdleState(machine.enabled, machine.configured), pending: false }, commands: [] };
   }
 
+  // 用户主动停止后又重新开启：这一轮是被取消而不是失败，不能落到 failed 让状态卡住。
+  if (outcome.cancelled) {
+    const next: SchedulerMachine = {
+      ...machine,
+      sync: resolveIdleState(machine.enabled, machine.configured),
+      pending: false,
+      retryAttempt: 0,
+    };
+    // 开关又开着说明用户要的是继续同步。被取消的这一轮什么都没做完，且期间排下的退避重试会被 cancel-retry 清掉，
+    // 此处不补一轮就要等到下次远程轮询或本机指纹变化，备份模式没有远程轮询，可能长时间不同步。
+    if (machine.enabled && machine.configured && machine.isLeader) {
+      return {
+        next: { ...next, sync: { kind: 'running', stage: 'snapshot' } },
+        commands: [{ type: 'cancel-retry' }, { type: 'start-sync', adoptCloud: false }],
+      };
+    }
+    return { next, commands: [{ type: 'cancel-retry' }] };
+  }
+
   if (outcome.unrelated) {
     const next: SchedulerMachine = {
       ...machine,

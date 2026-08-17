@@ -187,13 +187,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  /**
+   * 开关变化进入调度层的唯一入口。开关也可能由其他窗口改变并经共享文件传来，
+   * 那些路径不走 setEnabled，停止意图必须在这里跟随每一次变化：
+   * 漏掉 requestStop 会让本轮照常写回本机，漏掉 clearStop 会让本窗口之后每一轮都被取消。
+   */
+  const applyEnabledChange = (enabled: boolean) => {
+    // 调度状态已是 running 但引擎可能还在抢锁，停止意图必须无条件登记。
+    if (enabled) engine.clearStop();
+    else engine.requestStop();
+    dispatch({ type: 'enabled-changed', enabled });
+  };
+
   const setEnabled = async (enabled: boolean) => {
     if (machine.enabled === enabled) return;
     await runtimeState.update({ enabled });
     const stopping = !enabled && machine.sync.kind === 'running';
-    if (stopping) engine.requestStop();
     // 必须先落到调度状态：写宿主设置会触发配置变更事件，此时 machine 若还是旧值就会再次调用本函数。
-    dispatch({ type: 'enabled-changed', enabled });
+    applyEnabledChange(enabled);
     if (stopping) applyStatus({ message: '正在停止同步，当前操作完成后将停止。' }, false);
     const settings = vscode.workspace.getConfiguration('profileGitSync');
     if (settings.get<boolean>('enabled') !== enabled) {
@@ -220,7 +231,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     const acquired = await coordinator!.runExclusive(async () => {
-      await engine.beginCloudAdopt();
+      // 备份模式重建后仍然只上传本机配置，标记采用云端会在用户切到同步模式时覆盖本机。
+      if (!backupOnly) await engine.beginCloudAdopt();
       await configurationRepository.removeRepository();
     });
     if (!acquired) {
@@ -324,7 +336,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     lastBranch = current.branch;
 
     if (changedRuntimeState && runtimeState.get().enabled !== machine.enabled) {
-      dispatch({ type: 'enabled-changed', enabled: runtimeState.get().enabled });
+      applyEnabledChange(runtimeState.get().enabled);
     }
     dispatch({ type: 'configuration-changed', configured: Boolean(current.repositoryUrl), repositoryChanged });
     await sidebar?.pushState();
@@ -426,7 +438,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   configurationTimer = setInterval(() => {
     void runtimeState.reload().then((changed) => {
       if (changed && runtimeState.get().enabled !== machine.enabled) {
-        dispatch({ type: 'enabled-changed', enabled: runtimeState.get().enabled });
+        applyEnabledChange(runtimeState.get().enabled);
       }
     }).catch(reportRuntimeStateError);
     if (!coordinator!.isLeader) return;

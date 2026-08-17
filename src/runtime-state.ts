@@ -16,11 +16,11 @@ export interface RuntimeStateRecord {
   enabled: boolean;
   link: LinkState;
   lastSyncAt?: string;
-  /** 重建或首次接入后必须整包采用云端，跨进程重启也要保持。 */
+  /** 同步模式下重建或首次接入后必须整包采用云端，跨进程重启也要保持；备份模式会清除此标记。 */
   cloudAdoptPending: boolean;
 }
 
-// 默认关闭：本机没有仓库时首轮同步会整包采用云端覆盖本机，不能在用户无感知时发生。
+// 默认关闭：同步模式下本机没有仓库时首轮同步会整包采用云端覆盖本机，不能在用户无感知时发生。
 export const DEFAULT_RUNTIME_STATE: RuntimeStateRecord = {
   schemaVersion: 1,
   enabled: false,
