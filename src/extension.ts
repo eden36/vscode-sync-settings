@@ -47,6 +47,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     async () => coordinator!.notifyConfigurationChanged(),
     () => machine.enabled,
     async (enabled) => setEnabled(enabled),
+    async (resolution) => applyResolution(resolution),
   );
   // 视图必须在任何 IO 之前注册：初始化要抢跨窗口文件锁、写 SecretStorage 和宿主设置，
   // 多窗口同时启动时可能等上数秒，注册晚了这段时间里点开侧边栏只有一片空白。
@@ -174,7 +175,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let outcome: SyncOutcome | undefined;
     const acquired = await coordinator!.runExclusive(async () => {
       outcome = await engine.synchronize(adoptCloud ? { adoptCloud } : {});
-      if (!outcome?.cancelled) localFingerprint = await adapter.fingerprint();
+      // 本机在本轮期间被改动时保留旧指纹，让本机检测的下一拍立刻重跑，而不是干等远端轮询。
+      if (!outcome?.cancelled && outcome?.blockReason !== 'local-changed') {
+        localFingerprint = await adapter.fingerprint();
+      }
     });
     if (!acquired) {
       applyStatus({ message: '另一窗口正在执行同步，稍后将自动重试。' }, false);
@@ -197,7 +201,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (retryTimer) clearTimeout(retryTimer);
         retryTimer = setTimeout(() => {
           retryTimer = undefined;
-          dispatch({ type: 'sync-requested', source: 'timer' });
+          requestSync('timer');
         }, command.delayMs);
         return;
       case 'cancel-retry':
@@ -206,6 +210,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       case 'prompt-cloud-adopt':
         await promptCloudAdopt();
+        return;
+      case 'prompt-version-choice':
+        await promptVersionChoice();
         return;
       case 'start-schedules':
         await startSchedules();
@@ -246,6 +253,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await settings.update('enabled', enabled, vscode.ConfigurationTarget.Global);
     }
     await coordinator!.notifyConfigurationChanged();
+  };
+
+  /** 同步请求的统一入口：用户已经选定一方时必须带上标记，否则会停在等待选择的阻塞态。 */
+  const requestSync = (source: 'user' | 'peer' | 'timer' | 'startup') => {
+    dispatch({ type: 'sync-requested', source, resolved: runtimeState.get().pendingResolution !== undefined });
+  };
+
+  /** 用户的选择写进共享状态，本窗口不是 leader 时由 leader 读出来执行。 */
+  const applyResolution = async (resolution: 'local' | 'cloud') => {
+    await runtimeState.update({ pendingResolution: resolution });
+    applyStatus({
+      message: resolution === 'local' ? '正在用本机配置覆盖云端。' : '正在用云端配置覆盖本机。',
+    }, false);
+    dispatch({ type: 'sync-requested', source: 'user', resolved: true });
+  };
+
+  const promptVersionChoice = async () => {
+    const reason = status.message ? `${status.message}\n\n` : '';
+    const choice = await vscode.window.showWarningMessage(
+      '本机与云端都有改动',
+      {
+        modal: true,
+        detail: `${reason}选择「以本机为准」会用本机配置整份覆盖云端；选择「以云端为准」会用云端配置整份覆盖本机，并按云端清单装卸扩展。另一份配置会先备份到扩展运行目录。不选择则一直暂停，两侧都不会被改写。`,
+      },
+      '以本机为准',
+      '以云端为准',
+    );
+    if (choice !== '以本机为准' && choice !== '以云端为准') return;
+    await applyResolution(choice === '以本机为准' ? 'local' : 'cloud');
   };
 
   const promptCloudAdopt = async () => {
@@ -334,7 +370,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const current = await adapter.fingerprint();
           if (current !== localFingerprint) {
             localFingerprint = current;
-            dispatch({ type: 'sync-requested', source: 'timer' });
+            requestSync('timer');
           }
         } catch (error) {
           // 指纹读取失败不升级为同步失败：下个周期会重试，但要留下可见原因。
@@ -346,11 +382,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, configuration.debounceSeconds * 1_000);
     // 备份模式不写回本机，远端轮询拉不出任何要应用的变化，只会空转并占用独占锁。
     if (configuration.mode === 'sync') {
-      remoteTimer = setInterval(() => dispatch({ type: 'sync-requested', source: 'timer' }), configuration.pollIntervalSeconds * 1_000);
+      remoteTimer = setInterval(() => requestSync('timer'), configuration.pollIntervalSeconds * 1_000);
     }
     startupTimer = setTimeout(() => {
       startupTimer = undefined;
-      dispatch({ type: 'sync-requested', source: 'startup' });
+      requestSync('startup');
     }, 1_500);
   };
 
@@ -395,7 +431,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showInformationMessage('配置同步已关闭，请先在侧边栏开启同步。');
         return;
       }
-      dispatch({ type: 'sync-requested', source: 'user' });
+      requestSync('user');
     }),
     vscode.commands.registerCommand('profileGitSync.toggleEnabled', () => void setEnabled(!machine.enabled)),
     vscode.commands.registerCommand('profileGitSync.rebuildRepository', () => void rebuildRepository()),
@@ -433,7 +469,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispatch({ type: 'leadership-changed', isLeader: false });
     void updateWindowState();
   };
-  const onSyncRequested = () => dispatch({ type: 'sync-requested', source: 'peer' });
+  // 其他窗口可能刚写下用户的选择，必须先读共享状态再决定这一轮能不能开跑。
+  const onSyncRequested = () => void runtimeState.reload()
+    .then(() => requestSync('peer'))
+    .catch(reportRuntimeStateError);
   const onStatusChanged = (patch: Partial<RuntimeStatus>) => applyStatus(patch, false);
   const onConfigurationChanged = () => void refreshConfiguration();
   const onWindowsChanged = (safety: WindowSafetySnapshot) => {

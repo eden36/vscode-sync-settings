@@ -45,11 +45,12 @@ export function stageLabel(stage: StageName): string {
     case 'prepare': return '正在准备本地仓库';
     case 'pull': return '正在拉取远端配置';
     case 'decide': return '正在判定同步策略';
-    case 'merge': return '正在合并配置';
+    case 'choose': return '正在对比两侧配置';
     case 'ai': return '正在等待 AI 处理';
     case 'push': return '正在提交并推送到远端';
     case 'apply': return '正在写回本机配置';
     case 'extensions': return '正在同步扩展';
+    case 'finalize': return '正在记录同步基准';
   }
 }
 
@@ -69,6 +70,8 @@ export function blockReasonLabel(reason: BlockReason): string {
     case 'unreadable-windows': return '有窗口状态无法确认，已暂停同步。';
     case 'other-windows': return 'Profile 增删需要在只剩一个窗口时应用，关闭其他窗口后会自动继续。';
     case 'unrelated': return '本地配置同步仓库与远端仓库不同源，已停止同步，避免覆盖云端配置。';
+    case 'both-changed': return '本机与云端都有改动，已暂停同步，请选择以哪一方为准。';
+    case 'local-changed': return '同步期间本机配置发生了变化，本轮未写回，稍后会重新开始一轮。';
     case 'exclusive-lock': return '另一窗口正在执行同步，稍后将自动重试。';
   }
 }

@@ -17,10 +17,10 @@ export async function runPipeline(context: SyncContext, stages: Stage[]): Promis
     if (outcome.kind === 'continue') continue;
 
     updateStatus({ message: outcome.message ?? blockReasonLabel(outcome.reason) });
-    // 不同源无法靠重试解决，必须交回调度层询问用户，与其它可自动恢复的阻塞区分开。
-    return outcome.reason === 'unrelated'
-      ? { ok: false, unrelated: true, blockReason: 'unrelated' }
-      : { ok: false, retry: true, blockReason: outcome.reason };
+    // 不同源与「两边都改了」都无法靠重试解决，必须交回调度层询问用户，与其它可自动恢复的阻塞区分开。
+    if (outcome.reason === 'unrelated') return { ok: false, unrelated: true, blockReason: 'unrelated' };
+    if (outcome.reason === 'both-changed') return { ok: false, bothChanged: true, blockReason: 'both-changed' };
+    return { ok: false, retry: true, blockReason: outcome.reason };
   }
 
   const report = context.report;

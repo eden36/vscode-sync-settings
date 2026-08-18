@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { runProcess, runProcessBinary } from './process';
+import { runProcess } from './process';
 import { SyncConfiguration } from './types';
 
 /** cloned：本地没有历史，已直接检出远端；unrelated：与远端没有共同祖先；synced：与远端同源。 */
@@ -8,9 +8,7 @@ export type PullState = 'cloned' | 'unrelated' | 'synced';
 
 export interface PullResult {
   state: PullState;
-  /** 本地与远端的共同祖先，作为三方合并的基准；无共同历史时为 undefined。 */
-  mergeBase?: string;
-  /** 本地未推送提交与远端冲突，已丢弃本地提交并改由快照三方合并恢复。 */
+  /** 丢弃了上次推送失败留下的本地提交，本轮改由本机快照重新生成。 */
   recoveredFromDivergence: boolean;
 }
 
@@ -56,7 +54,7 @@ export class ConfigurationRepositoryGitService {
   public async pull(configuration: SyncConfiguration): Promise<PullResult> {
     const before = await this.head();
     const remote = await this.git(['ls-remote', '--exit-code', '--heads', 'origin', configuration.branch], true);
-    if (remote.exitCode === 2) return { state: 'synced', ...(before ? { mergeBase: before } : {}), recoveredFromDivergence: false };
+    if (remote.exitCode === 2) return { state: 'synced', recoveredFromDivergence: false };
     if (remote.exitCode !== 0) throw new Error(formatRemoteError(remote.stderr, configuration.repositoryUrl));
     await this.git(['fetch', '--prune', 'origin', configuration.branch]);
     if (!before) {
@@ -64,18 +62,16 @@ export class ConfigurationRepositoryGitService {
       return { state: 'cloned', recoveredFromDivergence: false };
     }
     const base = await this.git(['merge-base', 'HEAD', `origin/${configuration.branch}`], true);
-    // 没有共同祖先说明本地仓库和远端不是同一份历史，三方合并缺少可信基准，
-    // 此时任何合并都可能把本机配置推上去覆盖云端，只能中止并交给用户重建。
+    // 没有共同祖先说明本地仓库和远端不是同一份历史，此时对齐远端会悄悄丢掉本地这份，只能中止并交给用户重建。
     if (base.exitCode !== 0 || !base.stdout) return { state: 'unrelated', recoveredFromDivergence: false };
-    const mergeBase = { mergeBase: base.stdout };
-    const rebase = await this.git(['rebase', `origin/${configuration.branch}`], true);
-    if (rebase.exitCode === 0) return { state: 'synced', ...mergeBase, recoveredFromDivergence: false };
 
-    // 上次推送失败时本地会留下未推送提交，与远端改动冲突后 rebase 无法自动完成。
-    // 本机配置仍完整保存在磁盘上，丢弃这些提交后由快照三方合并重新生成，避免同步永久卡死。
-    await this.git(['rebase', '--abort'], true);
-    await this.git(['reset', '--hard', `origin/${configuration.branch}`]);
-    return { state: 'synced', ...mergeBase, recoveredFromDivergence: true };
+    // 本地仓库只是缓存，配置的真身在本机磁盘和远端。直接对齐远端可以保证历史永远是一条线、不会分叉；
+    // 上次推送失败留下的提交在本轮由「本机相对基准已变」重新生成，不会因此丢失改动。
+    const ahead = await this.git(['rev-list', '--count', `origin/${configuration.branch}..HEAD`], true);
+    const discarded = Number(ahead.stdout) > 0;
+    if (discarded) await this.git(['reset', '--hard', `origin/${configuration.branch}`]);
+    else await this.git(['merge', '--ff-only', `origin/${configuration.branch}`], true);
+    return { state: 'synced', recoveredFromDivergence: discarded };
   }
 
   /** 本地仓库只是缓存，真实配置在本机磁盘和远端仓库中，删除后会按首次接入重新克隆。 */
@@ -86,27 +82,6 @@ export class ConfigurationRepositoryGitService {
   /** 只去掉本机配置同步目录的 .git，不推远端、不改工作区文件。 */
   public async removeGitDirectory(): Promise<void> {
     await fs.rm(path.join(this.repositoryPath, '.git'), { recursive: true, force: true });
-  }
-
-  /** 把指定提交里的宿主目录导出到独立目录，用作三方合并的共同基准。 */
-  public async exportHostTree(commit: string, host: string, targetRoot: string): Promise<boolean> {
-    const prefix = `.profile-git-sync/hosts/${host}`;
-    const listed = await this.git(['ls-tree', '-r', '-z', '--name-only', commit, '--', prefix], true);
-    if (listed.exitCode !== 0) return false;
-    const files = listed.stdout.split('\0').filter(Boolean);
-    if (!files.length) return false;
-    const resolvedRoot = path.resolve(targetRoot);
-    await fs.mkdir(resolvedRoot, { recursive: true });
-    for (const file of files) {
-      const relative = file.slice(prefix.length + 1);
-      const target = path.resolve(resolvedRoot, ...relative.split('/'));
-      if (!relative || !target.startsWith(`${resolvedRoot}${path.sep}`)) return false;
-      const blob = await runProcessBinary('git', ['show', `${commit}:${file}`], this.repositoryPath);
-      if (blob.exitCode !== 0) return false;
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(target, blob.stdout);
-    }
-    return true;
   }
 
   public async discardPendingHostChanges(host: string): Promise<boolean> {

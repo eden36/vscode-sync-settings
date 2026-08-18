@@ -1,44 +1,38 @@
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { HostKind, SnapshotManifest } from './types';
+import { HOST_EXTENSIONS_FILE } from './extension-manifest';
+import { SnapshotManifest } from './types';
 
-export type ThreeWayChoice = 'local' | 'cloud' | 'conflict';
-
-export interface SnapshotStructure {
-  profiles: SnapshotManifest['profiles'];
-  profileMetadata?: SnapshotManifest['profileMetadata'];
-  profileAssociations?: unknown;
+/** 一份快照的两个可比较部分：扩展清单单独拆出，装卸收敛期间要能把它排除在判定之外。 */
+export interface SnapshotDigest {
+  snapshot: string;
+  extensions: string;
 }
 
 /**
- * 三方比较的唯一判定入口：冲突检测与实际合并必须共用，避免两处规则出现分歧。
- * 取值可为 undefined，表示该版本中文件不存在。
+ * 快照指纹：判断某一侧相对基准改没改的唯一依据。
+ * 键序归一后再哈希——两台机器写出的元数据键序可能不同，内容其实一样，
+ * 不归一就会被判成改动，导致整份覆盖和无意义的来回提交。
  */
-export function classifyThreeWay(base: string | undefined, local: string | undefined, cloud: string | undefined): ThreeWayChoice {
-  if (local === base) return 'cloud';
-  if (cloud === base || local === cloud) return 'local';
-  return 'conflict';
-}
-
-/**
- * AI 合并不可用时的确定性回退：本机版本存在就保留本机，否则采用云端，
- * 保证任一冲突都能收敛到实际存在的一份内容。
- */
-export function resolveConflictFallback(local: string | undefined, cloud: string | undefined): 'local' | 'cloud' {
-  if (local !== undefined) return 'local';
-  if (cloud !== undefined) return 'cloud';
-  throw new Error('冲突双方均不存在内容，无法自动合并。');
-}
-
-export function snapshotStructure(manifest: SnapshotManifest): SnapshotStructure {
-  return {
+export function snapshotDigest(manifest: SnapshotManifest): SnapshotDigest {
+  const files = Object.entries(manifest.files)
+    .filter(([relative]) => relative !== HOST_EXTENSIONS_FILE)
+    .sort(([left], [right]) => left.localeCompare(right));
+  const canonical = canonicalize({
     profiles: manifest.profiles,
     ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
     ...(manifest.profileAssociations !== undefined ? { profileAssociations: manifest.profileAssociations } : {}),
+    files: Object.fromEntries(files),
+  });
+  return {
+    snapshot: createHash('sha256').update(JSON.stringify(canonical)).digest('hex'),
+    // 清单缺失表示这一侧采集不到扩展信息，与「没有任何扩展」不同，但对判定而言同样是「没有变化」的比较基准。
+    extensions: manifest.files[HOST_EXTENSIONS_FILE] ?? '',
   };
 }
 
-export function emptyManifest(host: HostKind): SnapshotManifest {
+export function emptyManifest(host: SnapshotManifest['host']): SnapshotManifest {
   return { schemaVersion: 1, host, createdAt: '', profiles: [], files: {} };
 }
 
@@ -83,6 +77,17 @@ export function parseManifest(value: unknown): SnapshotManifest | undefined {
       : {}),
     ...(value.profileAssociations !== undefined ? { profileAssociations: value.profileAssociations } : {}),
   };
+}
+
+/** 递归按键排序，使语义相同、键序不同的两份数据得到同一个指纹。 */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!isRecord(value)) return value;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort((left, right) => left.localeCompare(right))) {
+    sorted[key] = canonicalize(value[key]);
+  }
+  return sorted;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

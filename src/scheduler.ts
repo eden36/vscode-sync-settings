@@ -20,13 +20,15 @@ export interface SchedulerMachine {
   retryAttempt: number;
   /** 本轮不同源只询问一次，用户拒绝后不再反复弹窗。 */
   cloudAdoptPrompted: boolean;
+  /** 「两边都改了」同样只问一次；用户不选就一直暂停，不写任何一侧。 */
+  choicePrompted: boolean;
 }
 
 export type SchedulerEvent =
   | { type: 'enabled-changed'; enabled: boolean }
   | { type: 'configuration-changed'; configured: boolean; repositoryChanged: boolean }
   | { type: 'leadership-changed'; isLeader: boolean }
-  | { type: 'sync-requested'; source: 'user' | 'peer' | 'timer' | 'startup'; adoptCloud?: boolean }
+  | { type: 'sync-requested'; source: 'user' | 'peer' | 'timer' | 'startup'; adoptCloud?: boolean; resolved?: boolean }
   | { type: 'sync-progress'; stage: StageName }
   | { type: 'sync-finished'; outcome: SyncOutcome | undefined }
   | { type: 'sync-lock-busy' }
@@ -41,6 +43,7 @@ export type SchedulerCommand =
   | { type: 'schedule-retry'; delayMs: number }
   | { type: 'cancel-retry' }
   | { type: 'prompt-cloud-adopt' }
+  | { type: 'prompt-version-choice' }
   | { type: 'start-schedules' }
   | { type: 'stop-schedules' }
   | { type: 'complete-sync-requests' }
@@ -65,6 +68,7 @@ export function createMachine(options: {
     pending: false,
     retryAttempt: 0,
     cloudAdoptPrompted: false,
+    choicePrompted: false,
   };
 }
 
@@ -78,7 +82,7 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
       if (machine.enabled === event.enabled) return unchanged(machine);
       if (!event.enabled) {
         // 同步中途关闭不打断当前这一轮，否则可能停在已提交未推送的中间态。
-        const next = { ...machine, enabled: false, pending: false, cloudAdoptPrompted: false };
+        const next = { ...machine, enabled: false, pending: false, cloudAdoptPrompted: false, choicePrompted: false };
         if (machine.sync.kind === 'running') return { next, commands: [{ type: 'stop-schedules' }, { type: 'cancel-retry' }] };
         return {
           next: { ...next, sync: { kind: 'disabled' }, retryAttempt: 0 },
@@ -91,6 +95,7 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
         sync: resolveIdleState(true, machine.configured),
         retryAttempt: 0,
         cloudAdoptPrompted: false,
+        choicePrompted: false,
       };
       const commands: SchedulerCommand[] = [{ type: 'start-schedules' }];
       if (machine.configured && machine.isLeader) commands.push({ type: 'start-sync', adoptCloud: false });
@@ -101,8 +106,9 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
       const next: SchedulerMachine = {
         ...machine,
         configured: event.configured,
-        // 换了仓库或分支，之前的不同源判断不再适用，允许重新询问。
+        // 换了仓库或分支，之前的不同源与择一判断都不再适用，允许重新询问。
         cloudAdoptPrompted: event.repositoryChanged ? false : machine.cloudAdoptPrompted,
+        choicePrompted: event.repositoryChanged ? false : machine.choicePrompted,
       };
       if (machine.sync.kind === 'running') return { next, commands: [] };
       if (event.repositoryChanged && machine.sync.kind === 'blocked' && machine.sync.reason === 'unrelated') {
@@ -133,6 +139,12 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
       if (machine.sync.kind === 'blocked' && machine.sync.reason === 'unrelated' && !event.adoptCloud) {
         if (machine.cloudAdoptPrompted) return unchanged(machine);
         return { next: { ...machine, cloudAdoptPrompted: true }, commands: [{ type: 'prompt-cloud-adopt' }] };
+      }
+
+      // 两边都改过时不选定一方就重跑，只会又跑到同一个冲突上并反复备份，白占独占锁。
+      if (machine.sync.kind === 'blocked' && machine.sync.reason === 'both-changed' && !event.resolved) {
+        if (machine.choicePrompted) return unchanged(machine);
+        return { next: { ...machine, choicePrompted: true }, commands: [{ type: 'prompt-version-choice' }] };
       }
       return {
         next: { ...machine, sync: { kind: 'running', stage: 'snapshot' }, pending: false },
@@ -179,7 +191,13 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
 
     case 'repository-removed': {
       return {
-        next: { ...machine, link: 'no-repository', cloudAdoptPrompted: false, sync: resolveIdleState(machine.enabled, machine.configured) },
+        next: {
+          ...machine,
+          link: 'no-repository',
+          cloudAdoptPrompted: false,
+          choicePrompted: false,
+          sync: resolveIdleState(machine.enabled, machine.configured),
+        },
         commands: [],
       };
     }
@@ -212,6 +230,17 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
       };
     }
     return { next, commands: [{ type: 'cancel-retry' }] };
+  }
+
+  if (outcome.bothChanged) {
+    const next: SchedulerMachine = {
+      ...machine,
+      sync: { kind: 'blocked', reason: 'both-changed' },
+      pending: false,
+      retryAttempt: 0,
+    };
+    if (machine.choicePrompted) return { next, commands: [] };
+    return { next: { ...next, choicePrompted: true }, commands: [{ type: 'prompt-version-choice' }] };
   }
 
   if (outcome.unrelated) {
@@ -249,6 +278,7 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
     pending: false,
     retryAttempt: 0,
     cloudAdoptPrompted: false,
+    choicePrompted: false,
   };
   // 窗口即将重载，此时再开一轮同步会被中途掐断，可能留下已提交未推送的中间态。
   // 排队中的请求不在这里消费，重载后由 leader 重新认领并触发启动同步。
@@ -271,6 +301,9 @@ function isResolvedBlock(reason: BlockReason, safety: WindowSafetySnapshot): boo
     case 'unreadable-windows': return safety.unreadableWindows === 0;
     case 'other-windows': return safety.activeWindows <= 1;
     case 'unrelated':
+    case 'both-changed':
+    // 本机在同步期间被改动：本机检测的下一拍会重新发起，窗口状态变化与它无关。
+    case 'local-changed':
     case 'exclusive-lock':
       return false;
   }

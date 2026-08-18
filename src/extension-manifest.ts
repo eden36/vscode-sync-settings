@@ -1,3 +1,6 @@
+/** 宿主级的已安装扩展清单，放在快照根目录，不属于任何 Profile。 */
+export const HOST_EXTENSIONS_FILE = 'extensions.json';
+
 export function parseExtensionIds(content: string): string[] {
   let parsed: unknown;
   try {
@@ -53,4 +56,14 @@ export function selectMissingExtensionIds(
     selected.push(id);
   }
   return selected;
+}
+
+/** 仓库形态的排序规则：本机采集与合并结果必须逐字节一致，否则每轮同步都会产生无意义的差异。 */
+export function sortExtensionIds(ids: Iterable<string>): string[] {
+  return [...new Set(ids)].sort((left, right) => left.localeCompare(right));
+}
+
+/** 仓库形态的扩展清单：只保留标识，去掉版本号、安装路径等本机专属字段。 */
+export function formatExtensionManifest(ids: readonly string[]): string {
+  return `${JSON.stringify(ids.map((id) => ({ identifier: { id } })), null, 2)}\n`;
 }

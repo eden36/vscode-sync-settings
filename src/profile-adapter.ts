@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
-import { parseExtensionIds } from './extension-manifest';
+import { formatExtensionManifest, HOST_EXTENSIONS_FILE, parseExtensionIds, sortExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
 import { readManifest } from './snapshot-conflict';
 import { ProfileDescriptor, SnapshotManifest } from './types';
@@ -11,8 +11,6 @@ import { ProfileDescriptor, SnapshotManifest } from './types';
 // 扩展改由快照根目录的宿主级清单统一处理。
 const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'mcp.json'];
 const DIRECTORY_RESOURCES = ['snippets', 'prompts'];
-/** 宿主级的已安装扩展清单，放在快照根目录，不属于任何 Profile。 */
-export const HOST_EXTENSIONS_FILE = 'extensions.json';
 const TEMPORARY_MARKER = '.profile-git-sync-';
 const PLUGIN_SETTING_PREFIX = 'profileGitSync.';
 const BACKUP_RETENTION = 10;
@@ -305,7 +303,7 @@ export class ProfileAdapter {
       throw error;
     });
     if (!content) return [];
-    return [...new Set(parseExtensionIds(content.toString('utf8')))].sort((left, right) => left.localeCompare(right));
+    return sortExtensionIds(parseExtensionIds(content.toString('utf8')));
   }
 
   /**
@@ -315,8 +313,7 @@ export class ProfileAdapter {
   private async readInstalledExtensions(): Promise<Buffer | undefined> {
     const ids = await this.listInstalledExtensionIds();
     if (!ids.length) return undefined;
-    const normalized = ids.map((id) => ({ identifier: { id } }));
-    return Buffer.from(`${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+    return Buffer.from(formatExtensionManifest(ids), 'utf8');
   }
 
   private async readStorage(): Promise<StorageFile> {

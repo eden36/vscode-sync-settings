@@ -3,14 +3,15 @@ import { SyncReport } from './types';
 /** 把一轮同步的观察结果汇成一句状态说明；文案顺序固定，便于用户比对多次同步。 */
 export function finalSyncMessage(report: SyncReport): string {
   const notes: string[] = [];
-  const merge = report.merge;
   if (report.adoptedCloud) {
     notes.push('已按云端配置覆盖本机', '本机原配置已备份到扩展运行目录');
-  }
-  if (merge?.conflicts.length) {
-    if (merge.aiMerged.length) notes.push(`AI 已自动合并 ${merge.aiMerged.length} 项冲突`);
-    if (merge.autoMerged.length) notes.push(`${merge.autoMerged.length} 项冲突按本机优先自动处理`);
-    notes.push('冲突前的两份配置已备份到扩展运行目录');
+  } else if (report.resolvedConflict) {
+    notes.push(
+      report.snapshotChoice === 'cloud' ? '已按你的选择用云端配置覆盖本机' : '已按你的选择用本机配置覆盖云端',
+      '另一份配置已备份到扩展运行目录',
+    );
+  } else if (report.snapshotChoice === 'cloud') {
+    notes.push('已按云端配置覆盖本机');
   }
   if (report.structuralMessage) {
     return `${[report.structuralMessage.replace(/。$/, ''), ...notes].join('；')}。`;

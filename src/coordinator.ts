@@ -68,7 +68,7 @@ const DEFAULT_LEASE_TTL_MS = 20_000;
 const DEFAULT_STALE_CONFIRMATION_MS = 10_000;
 const MAX_OPERATION_ACQUIRE_ATTEMPTS = 3;
 const STAGE_NAMES = new Set<StageName>([
-  'snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'merge', 'ai', 'push', 'apply', 'extensions',
+  'snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'choose', 'ai', 'push', 'apply', 'extensions', 'finalize',
 ]);
 const BLOCK_REASONS = new Set<BlockReason>([
   'dirty-windows', 'unreadable-windows', 'other-windows', 'unrelated', 'exclusive-lock',

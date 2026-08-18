@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
@@ -46,6 +47,7 @@ export class SyncEngine {
       updateStatus,
       // 与 ProfileAdapter 的 backups 目录分开存放，避免被那边的保留策略清理。
       conflictBackupRoot: path.join(environment.runtimePath, 'conflict-backups'),
+      deviceName: os.hostname(),
     };
   }
 
@@ -104,6 +106,8 @@ export class SyncEngine {
         await this.runtimeState.update({ cloudAdoptPending: false });
       }
       const adoptCloud = !backupOnly && (options.adoptCloud === true || this.runtimeState.get().cloudAdoptPending);
+      // 用户对「两边都改了」的选择存在共享状态里：可能是别的窗口点的，也可能是上一轮推送失败后留下的。
+      const resolution = backupOnly ? undefined : this.runtimeState.get().pendingResolution;
 
       // 同步在独占锁内执行，进程异常退出残留的临时快照可以安全清空。
       const snapshotRoot = path.join(this.environment.runtimePath, 'snapshots');
@@ -114,10 +118,10 @@ export class SyncEngine {
         dependencies: this.dependencies,
         configuration,
         adoptCloud,
+        ...(resolution ? { resolution } : {}),
         paths: {
           temporaryRoot,
           localHostRoot: path.join(temporaryRoot, this.environment.kind),
-          baseHostRoot: path.join(temporaryRoot, 'base'),
           repositoryHostRoot: path.join(
             this.dependencies.git.repositoryPath,
             '.profile-git-sync',
