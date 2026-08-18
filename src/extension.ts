@@ -31,33 +31,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const environment = detectHost(context);
   const configurationStore = new ConfigurationStore(context, environment.runtimePath);
   const runtimeState = new RuntimeStateStore(environment.runtimePath);
-  try {
-    // 运行目录不可写、共享配置被其他窗口长时间占用时这里会抛错；不接住的话扩展整体激活失败，
-    // 用户连状态栏都看不到，只能去扩展日志里找原因。
-    await fs.mkdir(environment.runtimePath, { recursive: true });
-    await configurationStore.initialize();
-    await runtimeState.initialize({
-      enabled: vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', false),
-    });
-  } catch (error) {
-    reportActivationFailure(context, error);
-    return;
-  }
-  const adapter = new ProfileAdapter(environment);
-  // Profile 枚举可能需要扫描多个目录，不能阻塞侧边栏首次渲染。
-  const profilesTask = adapter.listProfiles();
-
-  const persisted = runtimeState.get();
-  // 共享文件是权威来源，启动时把它镜像回宿主设置，避免多个 Profile 显示的开关不一致。
-  const enabledSetting = vscode.workspace.getConfiguration('profileGitSync');
-  if (enabledSetting.get<boolean>('enabled') !== persisted.enabled) {
-    await enabledSetting.update('enabled', persisted.enabled, vscode.ConfigurationTarget.Global);
-  }
-  let machine = createMachine({
-    enabled: persisted.enabled,
-    configured: Boolean(configurationStore.get().repositoryUrl),
-    link: persisted.link,
-  });
+  // 先按默认值占位，初始化完成后再换成真实状态；此前 sidebar 不推状态，只渲染静态骨架。
+  let machine = createMachine({ enabled: false, configured: false, link: 'no-repository' });
   const status: RuntimeStatus = {
     sync: machine.sync,
     link: machine.link,
@@ -65,14 +40,61 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     activeWindows: 1,
     profiles: [],
     pendingChanges: 0,
-    ...(persisted.lastSyncAt ? { lastSyncAt: persisted.lastSyncAt } : {}),
   };
+  const sidebar = new SidebarProvider(
+    configurationStore,
+    () => status,
+    async () => coordinator!.notifyConfigurationChanged(),
+    () => machine.enabled,
+    async (enabled) => setEnabled(enabled),
+  );
+  // 视图必须在任何 IO 之前注册：初始化要抢跨窗口文件锁、写 SecretStorage 和宿主设置，
+  // 多窗口同时启动时可能等上数秒，注册晚了这段时间里点开侧边栏只有一片空白。
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar, {
+    // 面板隐藏后保留上下文，重新点开不必再建一遍 DOM 并等状态往返。
+    webviewOptions: { retainContextWhenHidden: true },
+  }));
+
+  try {
+    await fs.mkdir(environment.runtimePath, { recursive: true });
+    // 两份共享状态各有各的锁，串行没有意义，最慢的一次决定用户等多久。
+    await Promise.all([
+      configurationStore.initialize(),
+      runtimeState.initialize({
+        enabled: vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', false),
+      }),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    void sidebar.fail(`配置同步启动失败：${message}`);
+    reportActivationFailure(context, error);
+    return;
+  }
+
+  const adapter = new ProfileAdapter(environment);
+  // Profile 枚举可能需要扫描多个目录，不能阻塞侧边栏首次渲染。
+  const profilesTask = adapter.listProfiles();
+
+  const persisted = runtimeState.get();
+  machine = createMachine({
+    enabled: persisted.enabled,
+    configured: Boolean(configurationStore.get().repositoryUrl),
+    link: persisted.link,
+  });
+  status.sync = machine.sync;
+  status.link = machine.link;
+  if (persisted.lastSyncAt) status.lastSyncAt = persisted.lastSyncAt;
+
+  // 共享文件是权威来源，启动时把它镜像回宿主设置，避免多个 Profile 显示的开关不一致。
+  const enabledSetting = vscode.workspace.getConfiguration('profileGitSync');
+  if (enabledSetting.get<boolean>('enabled') !== persisted.enabled) {
+    await enabledSetting.update('enabled', persisted.enabled, vscode.ConfigurationTarget.Global);
+  }
 
   coordinator = new MultiWindowCoordinator(path.join(environment.runtimePath, 'coordination'));
   const configurationRepository = new ConfigurationRepositoryGitService(environment.runtimePath);
   const ai = new AiService();
   let localFingerprint: string | undefined;
-  let sidebar: SidebarProvider;
   let localCheckRunning = false;
   let scheduleGeneration = 0;
   let dirtyDocumentCount = countDirtyDocuments(environment.userDataPath);
@@ -101,7 +123,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void runtimeState.update({ lastSyncAt: patch.lastSyncAt }).catch(reportRuntimeStateError);
     }
     renderStatusBar();
-    void sidebar?.pushState();
+    void sidebar.pushState();
     if (publish && coordinator?.isLeader) {
       void coordinator.publishStatus(status).catch((error: unknown) => {
         applyStatus({ message: coordinationErrorMessage(error) }, false);
@@ -353,18 +375,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       applyEnabledChange(runtimeState.get().enabled);
     }
     dispatch({ type: 'configuration-changed', configured: Boolean(current.repositoryUrl), repositoryChanged });
-    await sidebar?.pushState();
+    await sidebar.pushState();
     // 轮询间隔可能变了，需要按新配置重建定时器。
     if (coordinator!.isLeader && machine.enabled) await startSchedules();
   };
-
-  sidebar = new SidebarProvider(
-    configurationStore,
-    () => status,
-    async () => coordinator!.notifyConfigurationChanged(),
-    () => machine.enabled,
-    setEnabled,
-  );
 
   const refreshDirtyDocuments = async () => {
     const current = countDirtyDocuments(environment.userDataPath);
@@ -376,7 +390,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     statusBar,
-    vscode.window.registerWebviewViewProvider('profileGitSync.sidebar', sidebar),
     vscode.commands.registerCommand('profileGitSync.syncNow', () => {
       if (!machine.enabled) {
         void vscode.window.showInformationMessage('配置同步已关闭，请先在侧边栏开启同步。');
@@ -409,6 +422,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const profiles = await profilesTask;
   status.profiles = profiles.map((profile) => profile.name);
+  sidebar.markReady();
   await sidebar.pushState();
 
   const onBecameLeader = () => {
@@ -461,12 +475,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }).catch((error: unknown) => applyStatus({ message: coordinationErrorMessage(error) }, false));
   }, 5_000);
 
-  await coordinator.setDirtyDocuments(dirtyDocumentCount);
-  await coordinator.start();
-  await updateWindowState();
-  // leadership-changed 已经会按需发出 start-schedules，这里不再重复启动。
-  dispatch({ type: 'leadership-changed', isLeader: coordinator.isLeader });
   renderStatusBar();
+  // 协调器启动要写 presence、抢租约、扫描全部窗口状态，全是磁盘往返，没必要占着激活路径；
+  // 侧边栏与状态栏此时已经能显示，剩下的在后台补齐即可。
+  void (async () => {
+    try {
+      await coordinator!.setDirtyDocuments(dirtyDocumentCount);
+      await coordinator!.start();
+      await updateWindowState();
+      // leadership-changed 已经会按需发出 start-schedules，这里不再重复启动。
+      dispatch({ type: 'leadership-changed', isLeader: coordinator!.isLeader });
+    } catch (error) {
+      applyStatus({ message: coordinationErrorMessage(error) }, false);
+    }
+  })();
 }
 
 export async function deactivate(): Promise<void> {

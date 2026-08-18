@@ -18,6 +18,8 @@ type IncomingMessage =
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
+  private ready = false;
+  private failure?: string;
 
   public constructor(
     private readonly configurationStore: ConfigurationStore,
@@ -35,6 +37,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const message = parseMessage(raw);
       if (!message) {
         void vscode.window.showErrorMessage('侧边栏提交了无效参数。');
+        return;
+      }
+      // 初始化尚未完成时状态与配置都还是默认值，此时改开关会写到一份还没读出来的配置上。
+      if (!this.ready && message.type !== 'ready') {
+        void vscode.window.showInformationMessage(this.failure ?? '配置同步正在初始化，请稍候。');
         return;
       }
       try {
@@ -70,7 +77,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     void this.pushState();
   }
 
+  /** 初始化完成、状态可信后才开始推送。 */
+  public markReady(): void {
+    this.ready = true;
+  }
+
+  /** 初始化失败时把原因显示在侧边栏，否则用户只会一直看到「正在加载」。 */
+  public async fail(message: string): Promise<void> {
+    this.failure = message;
+    await this.pushState();
+  }
+
   public async pushState(): Promise<void> {
+    if (this.failure !== undefined) {
+      await this.view?.webview.postMessage({ type: 'failure', message: this.failure });
+      return;
+    }
+    if (!this.ready) return;
     const status = this.status();
     const configuration = this.configurationStore.get();
     // 状态判定全部在此完成，内联脚本只负责按结果渲染。
@@ -151,7 +174,7 @@ for(const button of modeButtons)button.onclick=()=>{for(const other of modeButto
 editRepository.onclick=()=>{for(const id of ids)document.getElementById(id).value=configuration[id]??'';document.getElementById('debounceSeconds').value=String(configuration.debounceSeconds??'');document.getElementById('pollIntervalSeconds').value=String(configuration.pollIntervalSeconds??'');configurationDialog.showModal()};
 cancelConfiguration.onclick=()=>configurationDialog.close();
 configurationForm.onsubmit=(event)=>{event.preventDefault();const next={};for(const id of ids)next[id]=document.getElementById(id).value;const automation={debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};saveConfiguration.disabled=true;cancelConfiguration.disabled=true;vscode.postMessage({type:'save',configuration:next,automation})};
-addEventListener('message',({data})=>{if(data.type==='configuration-saved'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;configurationDialog.close();return}if(data.type==='save-failed'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;return}if(data.type!=='state')return;configuration=data.configuration;enabled=data.enabled===true;toggleEnabled.className=enabled?'toggle-switch enabled':'toggle-switch';toggleEnabled.setAttribute('aria-checked',String(enabled));toggleEnabled.setAttribute('aria-label',enabled?'停止同步':'开启同步');toggleEnabled.disabled=false;document.getElementById('repositorySummary').textContent=configuration.repositoryUrl||'未配置远程仓库';document.getElementById('branchSummary').textContent=configuration.branch||'未配置分支';for(const button of modeButtons){const active=button.dataset.mode===configuration.mode;button.className=active?'active':'';button.setAttribute('aria-pressed',String(active));button.disabled=false}document.getElementById('syncMode').textContent=data.modeLabel;document.getElementById('modeNote').textContent=data.modeNote;const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
+addEventListener('message',({data})=>{if(data.type==='failure'){document.getElementById('phase').textContent='启动失败';document.getElementById('detail').textContent=data.message;document.getElementById('syncPhase').textContent='启动失败';document.getElementById('syncDot').className='dot error';document.getElementById('lastSyncAt').textContent='—';document.getElementById('syncMode').textContent='—';return}if(data.type==='configuration-saved'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;configurationDialog.close();return}if(data.type==='save-failed'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;return}if(data.type!=='state')return;configuration=data.configuration;enabled=data.enabled===true;toggleEnabled.className=enabled?'toggle-switch enabled':'toggle-switch';toggleEnabled.setAttribute('aria-checked',String(enabled));toggleEnabled.setAttribute('aria-label',enabled?'停止同步':'开启同步');toggleEnabled.disabled=false;document.getElementById('repositorySummary').textContent=configuration.repositoryUrl||'未配置远程仓库';document.getElementById('branchSummary').textContent=configuration.branch||'未配置分支';for(const button of modeButtons){const active=button.dataset.mode===configuration.mode;button.className=active?'active':'';button.setAttribute('aria-pressed',String(active));button.disabled=false}document.getElementById('syncMode').textContent=data.modeLabel;document.getElementById('modeNote').textContent=data.modeNote;const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
 vscode.postMessage({type:'ready'});
 setInterval(renderLastSyncAt,60_000);
 function renderLastSyncAt(){const last=document.getElementById('lastSyncAt');if(!lastSyncAt){last.textContent='尚未同步';last.removeAttribute('title');return}const date=new Date(lastSyncAt);if(Number.isNaN(date.getTime())){last.textContent='时间无效';last.removeAttribute('title');return}last.textContent=date.toLocaleString()+'（'+relativeTime(date.getTime())+'）';last.title=lastSyncAt}
