@@ -29,13 +29,20 @@ let configurationTimer: NodeJS.Timeout | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const environment = detectHost(context);
-  await fs.mkdir(environment.runtimePath, { recursive: true });
   const configurationStore = new ConfigurationStore(context, environment.runtimePath);
-  await configurationStore.initialize();
   const runtimeState = new RuntimeStateStore(environment.runtimePath);
-  await runtimeState.initialize({
-    enabled: vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', false),
-  });
+  try {
+    // 运行目录不可写、共享配置被其他窗口长时间占用时这里会抛错；不接住的话扩展整体激活失败，
+    // 用户连状态栏都看不到，只能去扩展日志里找原因。
+    await fs.mkdir(environment.runtimePath, { recursive: true });
+    await configurationStore.initialize();
+    await runtimeState.initialize({
+      enabled: vscode.workspace.getConfiguration('profileGitSync').get<boolean>('enabled', false),
+    });
+  } catch (error) {
+    reportActivationFailure(context, error);
+    return;
+  }
   const adapter = new ProfileAdapter(environment);
   // Profile 枚举可能需要扫描多个目录，不能阻塞侧边栏首次渲染。
   const profilesTask = adapter.listProfiles();
@@ -68,7 +75,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let sidebar: SidebarProvider;
   let localCheckRunning = false;
   let scheduleGeneration = 0;
-  let schedulesReady = false;
   let dirtyDocumentCount = countDirtyDocuments(environment.userDataPath);
   let lastRepositoryUrl = configurationStore.get().repositoryUrl;
   let lastBranch = configurationStore.get().branch;
@@ -116,7 +122,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       applyStatus({ sync: next.sync, link: next.link }, coordinator?.isLeader === true);
       if (previous.link !== next.link) void runtimeState.update({ link: next.link }).catch(reportRuntimeStateError);
     }
-    for (const command of commands) void execute(command);
+    // 命令执行失败必须有归属：未处理的拒绝会让调度状态永远停在 running，只能靠重开开关或重载窗口恢复。
+    for (const command of commands) {
+      void execute(command).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        applyStatus({ message }, false);
+        if (command.type === 'start-sync') dispatch({ type: 'sync-failed', message });
+      });
+    }
   };
 
   const engine = new SyncEngine(
@@ -275,7 +288,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const clearSchedules = () => {
     scheduleGeneration += 1;
-    schedulesReady = false;
     if (localTimer) clearInterval(localTimer);
     if (remoteTimer) clearInterval(remoteTimer);
     if (startupTimer) clearTimeout(startupTimer);
@@ -290,7 +302,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const generation = scheduleGeneration;
     localFingerprint = await adapter.fingerprint();
     if (!coordinator!.isLeader || generation !== scheduleGeneration) return;
-    schedulesReady = true;
 
     const configuration = configurationStore.get();
     localTimer = setInterval(() => {
@@ -303,6 +314,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             localFingerprint = current;
             dispatch({ type: 'sync-requested', source: 'timer' });
           }
+        } catch (error) {
+          // 指纹读取失败不升级为同步失败：下个周期会重试，但要留下可见原因。
+          applyStatus({ message: `本机配置检测失败：${error instanceof Error ? error.message : String(error)}` }, false);
         } finally {
           localCheckRunning = false;
         }
@@ -467,6 +481,19 @@ export async function deactivate(): Promise<void> {
   startupTimer = undefined;
   retryTimer = undefined;
   await coordinator?.dispose();
+}
+
+/** 初始化失败后扩展无法工作，但仍要让用户看到原因和恢复方式。 */
+function reportActivationFailure(context: vscode.ExtensionContext, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const statusBar = vscode.window.createStatusBarItem('profileGitSync.status', vscode.StatusBarAlignment.Right, 100);
+  statusBar.name = 'My Setting Sync';
+  statusBar.text = '$(error) 配置同步';
+  statusBar.tooltip = `配置同步启动失败：${message}\n重载窗口后会重新尝试。`;
+  statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+  statusBar.show();
+  context.subscriptions.push(statusBar);
+  void vscode.window.showErrorMessage(`配置同步启动失败：${message}`);
 }
 
 function countDirtyDocuments(userDataPath: string): number {

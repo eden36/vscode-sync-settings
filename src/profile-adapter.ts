@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
 import { parseExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
-import { parseManifest } from './snapshot-conflict';
+import { readManifest } from './snapshot-conflict';
 import { ProfileDescriptor, SnapshotManifest } from './types';
 
 // Profile 目录下的 extensions.json 是 IDE 维护的启用状态，跨机器同步会引用本机没有的扩展；
@@ -98,7 +98,7 @@ export class ProfileAdapter {
     return hash;
   }
 
-  public async createSnapshot(hostRoot: string, includeAssociations = false): Promise<SnapshotManifest> {
+  public async createSnapshot(hostRoot: string): Promise<SnapshotManifest> {
     const profiles = await this.listProfiles();
     const storage = await this.readStorage();
     const staging = `${hostRoot}.staging-${process.pid}-${Date.now()}`;
@@ -128,9 +128,8 @@ export class ProfileAdapter {
       createdAt: '',
       profiles: profiles.map(({ id, name, isDefault }) => ({ id, name, isDefault })),
       profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })) ?? [],
-      ...(includeAssociations && storage.profileAssociations !== undefined
-        ? { profileAssociations: storage.profileAssociations }
-        : {}),
+      // 工作区与 Profile 的关联关系始终同步，不作为开关暴露。
+      ...(storage.profileAssociations !== undefined ? { profileAssociations: storage.profileAssociations } : {}),
       files
     };
     await fs.writeFile(path.join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
@@ -139,11 +138,8 @@ export class ProfileAdapter {
   }
 
   public async restoreSnapshot(hostRoot: string, allowStructural: boolean, applyMatchingFiles = false): Promise<RestoreResult> {
-    const manifestPath = path.join(hostRoot, 'manifest.json');
-    const manifest = parseManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')) as unknown);
-    if (!manifest || manifest.host !== this.environment.kind) {
-      throw new Error('远程快照格式或宿主类型不兼容。');
-    }
+    const manifest = await readManifest(hostRoot);
+    if (manifest.host !== this.environment.kind) throw new Error('远程快照的宿主类型与本机不一致。');
 
     const localProfiles = await this.listProfiles();
     const localIds = new Set(localProfiles.map((profile) => profile.id));
@@ -196,7 +192,8 @@ export class ProfileAdapter {
     for (const relative of Object.keys(manifest.files)) {
       const normalized = normalizeRelative(relative);
       // 扩展清单由 IDE 自己维护，只用来决定装哪些扩展，绝不能写回本机。
-      if (normalized === HOST_EXTENSIONS_FILE) continue;
+      // 旧版本的云端快照里还带 Profile 级 extensions.json（记录的是本机启用状态），一并跳过。
+      if (normalized === HOST_EXTENSIONS_FILE || normalized.endsWith(`/${HOST_EXTENSIONS_FILE}`)) continue;
       const parts = normalized.split('/');
       if (parts[0] !== 'profiles' || parts.length < 3) {
         throw new Error(`快照包含非法路径：${relative}`);
@@ -339,16 +336,14 @@ export class ProfileAdapter {
   private prepareForRepository(resource: string, content: Buffer): Buffer {
     // 插件自身设置由版本化配置记录负责收敛，随 settings.json 同步会与之互相覆盖。
     if (resource === 'settings.json') return Buffer.from(stripPluginSettings(content.toString('utf8')), 'utf8');
-    if (resource !== 'extensions.json' || !this.environment.extensionDataUri) return content;
-    return Buffer.from(content.toString('utf8').replaceAll(this.environment.extensionDataUri, '%%EXTENSION_DATA_PATH%%'), 'utf8');
+    return content;
   }
 
   private prepareForLocal(relative: string, content: Buffer, current: Buffer | undefined): Buffer {
     if (relative.endsWith('/settings.json')) {
       return Buffer.from(restorePluginSettings(content.toString('utf8'), current?.toString('utf8') ?? ''), 'utf8');
     }
-    if (!relative.endsWith('/extensions.json') || !this.environment.extensionDataUri) return content;
-    return Buffer.from(content.toString('utf8').replaceAll('%%EXTENSION_DATA_PATH%%', this.environment.extensionDataUri), 'utf8');
+    return content;
   }
 }
 

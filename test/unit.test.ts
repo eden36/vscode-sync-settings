@@ -15,7 +15,7 @@ import { runProcess } from '../src/process';
 import { parseRuntimeState, RuntimeStateStore } from '../src/runtime-state';
 import { containsPotentialSecret, findPotentialSecrets } from '../src/secret-scanner';
 import { atomicWriteJson, readJsonFile } from '../src/json-store';
-import { classifyThreeWay, parseManifest, resolveConflictFallback } from '../src/snapshot-conflict';
+import { classifyThreeWay, parseManifest, readManifest, resolveConflictFallback } from '../src/snapshot-conflict';
 import {
   compareConfigurationRecords,
   createConfigurationRecord,
@@ -74,7 +74,7 @@ test('同一运行目录只选出一个 leader', async () => {
   try {
     await Promise.all([first.start(), second.start()]);
     assert.equal(Number(first.isLeader) + Number(second.isLeader), 1);
-    assert.equal(await first.activeWindowCount(), 2);
+    assert.equal((await first.windowSafety()).activeWindows, 2);
   } finally {
     await Promise.all([first.dispose(), second.dispose()]);
     await rm(root, { recursive: true, force: true });
@@ -380,6 +380,48 @@ test('未提供扩展清单路径时快照不含扩展信息', async () => {
     const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
     const manifest = await adapter.createSnapshot(path.join(root, 'snapshot'));
     assert.equal(manifest.files['extensions.json'], undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('旧快照里的 Profile 级扩展清单不写回本机', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-legacy-extensions-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const snapshot = path.join(root, 'snapshot');
+  await mkdir(runtimePath, { recursive: true });
+  await mkdir(path.join(snapshot, 'profiles', 'default'), { recursive: true });
+  await writeFile(path.join(userDataPath, 'settings.json'), '{}');
+  try {
+    // 0.1.x 版本的云端快照里带 Profile 级 extensions.json，记录的是本机启用状态，跨机器写回会引用本机没有的扩展。
+    await writeFile(path.join(snapshot, 'profiles', 'default', 'extensions.json'), '[{"identifier":{"id":"stale.one"}}]');
+    await writeFile(path.join(snapshot, 'profiles', 'default', 'settings.json'), '{"editor.fontSize": 21}');
+    await writeFile(path.join(snapshot, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      host: 'vscode',
+      createdAt: '',
+      profiles: [{ id: 'default', name: '默认', isDefault: true }],
+      files: { 'profiles/default/extensions.json': 'x', 'profiles/default/settings.json': 'y' },
+    }));
+
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const restored = await adapter.restoreSnapshot(snapshot, false);
+    assert.equal(await readFile(path.join(userDataPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 21}');
+    assert.equal(restored.changedFiles.some((file) => file.endsWith('extensions.json')), false);
+    await assert.rejects(() => readFile(path.join(userDataPath, 'extensions.json'), 'utf8'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照清单不是 JSON 时给出中文错误', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-manifest-'));
+  try {
+    await writeFile(path.join(root, 'manifest.json'), '{ 不是 JSON');
+    await assert.rejects(() => readManifest(root), /快照清单不是有效的 JSON/);
+    await rm(path.join(root, 'manifest.json'));
+    await assert.rejects(() => readManifest(root), /未找到快照清单/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -841,7 +883,6 @@ test('同步配置解析缺省回落到备份模式并拒绝非法模式', () =>
     autoSync: true,
     debounceSeconds: 10,
     pollIntervalSeconds: 300,
-    includeProfileAssociations: false,
   });
   assert.equal(parsed?.mode, 'backup');
   assert.equal(parsePluginConfiguration({
@@ -853,7 +894,6 @@ test('同步配置解析缺省回落到备份模式并拒绝非法模式', () =>
     autoSync: true,
     debounceSeconds: 10,
     pollIntervalSeconds: 300,
-    includeProfileAssociations: false,
   })?.mode, 'sync');
   assert.equal(parsePluginConfiguration({
     repositoryUrl: 'git@github.com:user/settings.git',
@@ -864,7 +904,6 @@ test('同步配置解析缺省回落到备份模式并拒绝非法模式', () =>
     autoSync: true,
     debounceSeconds: 10,
     pollIntervalSeconds: 300,
-    includeProfileAssociations: false,
   }), undefined);
 });
 
@@ -1678,6 +1717,52 @@ test('远端还没有本宿主快照时直接用本机内容初始化', async ()
     assert.deepEqual(await readJsonFile(path.join(repositoryHostRoot, 'manifest.json')), {
       schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [], files: {},
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AI 把 JSON 包进代码围栏时仍能完成合并', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ai-fence-'));
+  try {
+    const localHostRoot = path.join(root, 'tmp', 'vscode');
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    const relative = 'profiles/default/settings.json';
+    for (const [target, content, hash] of [
+      [localHostRoot, '{"editor.fontSize": 20}', 'local-hash'],
+      [repositoryHostRoot, '{"editor.fontSize": 21}', 'cloud-hash'],
+    ] as const) {
+      await mkdir(path.join(target, 'profiles', 'default'), { recursive: true });
+      await writeFile(path.join(target, relative), content);
+      await writeFile(path.join(target, 'manifest.json'), JSON.stringify({
+        schemaVersion: 1,
+        host: 'vscode',
+        createdAt: '',
+        profiles: [{ id: 'default', name: '默认', isDefault: true }],
+        files: { [relative]: hash },
+      }));
+    }
+
+    // 模型经常无视「不要 Markdown」的要求；不剥围栏的话校验必然失败，整轮的 AI 合并都会退回兜底。
+    const fenced = '```json\n{"editor.fontSize": 22}\n```';
+    const context = stageContext({
+      artifacts: { strategy: 'merge', remoteExists: true },
+      paths: {
+        temporaryRoot: path.join(root, 'tmp'),
+        localHostRoot,
+        baseHostRoot: path.join(root, 'tmp', 'base'),
+        repositoryHostRoot,
+      },
+      dependencies: stageDependencies({
+        ai: { resolveConflict: async () => fenced } as unknown as AiService,
+        conflictBackupRoot: path.join(root, 'conflict-backups'),
+      }),
+    });
+
+    assert.deepEqual(await mergeStage.run(context), { kind: 'continue' });
+    assert.deepEqual(context.report.merge?.aiMerged, [relative]);
+    assert.deepEqual(context.report.merge?.autoMerged, []);
+    assert.equal(await readFile(path.join(repositoryHostRoot, relative), 'utf8'), '{"editor.fontSize": 22}');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

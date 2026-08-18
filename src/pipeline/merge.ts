@@ -49,7 +49,9 @@ export const mergeStage: Stage = {
 
     const mergedManifest = await readManifest(repositoryHostRoot);
     const mergedSecrets = await findPotentialSecrets(repositoryHostRoot, mergedManifest);
-    if (mergedSecrets.length) throw new Error(`检测到可能包含凭据的配置，已拒绝同步：${mergedSecrets.join('、')}`);
+    if (mergedSecrets.length) {
+      throw new Error(`检测到可能包含凭据的配置，已拒绝同步：${mergedSecrets.join('、')}。请移除其中的凭据，或改写触发检测的键名后重试。`);
+    }
     return { kind: 'continue' };
   },
 };
@@ -134,7 +136,10 @@ async function aiMergeFile(
     readOptionalText(cloudRoot, relative)
   ]);
   if ([baseText, localText, cloudText].some(containsPotentialSecret)) throw new Error(`冲突文件可能包含凭据，无法交给 AI：${relative}`);
-  const candidate = await ai.resolveConflict(relative, baseText, localText, cloudText);
+  const raw = await ai.resolveConflict(relative, baseText, localText, cloudText);
+  // 模型常无视提示词把 JSON 包进 Markdown 围栏；不剥掉的话校验必然失败，一次失败会让整轮的 AI 合并全部退回兜底。
+  // 提示词一类的自由文本不能剥，围栏可能就是正文。
+  const candidate = isJsonLike(relative) ? stripJsonFence(raw) : raw;
   validateCandidate(relative, candidate);
   return Buffer.from(candidate, 'utf8');
 }
@@ -192,7 +197,7 @@ function validateCandidate(relative: string, content: string): void {
   if (!content.trim()) throw new Error(`AI 为 ${relative} 返回了空的合并结果。`);
   if (content.includes('<<<<<<<') || content.includes('>>>>>>>')) throw new Error(`AI 未完整解决 ${relative} 的冲突。`);
   if (containsPotentialSecret(content)) throw new Error(`AI 为 ${relative} 生成的内容可能包含凭据。`);
-  if (/\.(?:json|jsonc|code-snippets)$/i.test(relative)) {
+  if (isJsonLike(relative)) {
     const errors: ParseError[] = [];
     parse(content, errors, { allowTrailingComma: true, disallowComments: false });
     if (errors.length) throw new Error(`AI 为 ${relative} 生成的 JSON/JSONC 无法解析。`);
@@ -226,6 +231,10 @@ function parseProfileStructure(value: unknown): SnapshotStructure {
     ...(profileMetadata ? { profileMetadata } : {}),
     ...(value.profileAssociations !== undefined ? { profileAssociations: value.profileAssociations } : {}),
   };
+}
+
+function isJsonLike(relative: string): boolean {
+  return /\.(?:json|jsonc|code-snippets)$/i.test(relative);
 }
 
 function isNonEmptyString(value: unknown): value is string {

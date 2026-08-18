@@ -14,10 +14,7 @@ const snapshotStage: Stage = {
   name: 'snapshot',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { adapter } = context.dependencies;
-    context.artifacts.localManifest = await adapter.createSnapshot(
-      context.paths.localHostRoot,
-      context.configuration.includeProfileAssociations,
-    );
+    context.artifacts.localManifest = await adapter.createSnapshot(context.paths.localHostRoot);
     return { kind: 'continue' };
   },
 };
@@ -29,7 +26,9 @@ const scanSecretsStage: Stage = {
     if (context.adoptCloud) return { kind: 'continue' };
     const manifest = requireValue(context.artifacts.localManifest, 'localManifest');
     const secretFiles = await findPotentialSecrets(context.paths.localHostRoot, manifest);
-    if (secretFiles.length) throw new Error(`检测到可能包含凭据的配置，已拒绝提交：${secretFiles.join('、')}`);
+    if (secretFiles.length) {
+      throw new Error(`检测到可能包含凭据的配置，已拒绝提交：${secretFiles.join('、')}。请移除其中的凭据，或改写触发检测的键名后重试。`);
+    }
     return { kind: 'continue' };
   },
 };

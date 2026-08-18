@@ -44,7 +44,16 @@ export function emptyManifest(host: HostKind): SnapshotManifest {
 
 /** 快照清单可能来自远端仓库，必须校验后再使用，否则字段缺失会以难以定位的运行时错误暴露。 */
 export async function readManifest(root: string): Promise<SnapshotManifest> {
-  const parsed = parseManifest(JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as unknown);
+  const content = await fs.readFile(path.join(root, 'manifest.json'), 'utf8').catch(() => undefined);
+  if (content === undefined) throw new Error('未找到快照清单，无法继续同步。');
+  let raw: unknown;
+  try {
+    raw = JSON.parse(content) as unknown;
+  } catch {
+    // 裸 SyntaxError 是英文的，且不说明是哪一份数据出了问题。
+    throw new Error('快照清单不是有效的 JSON，无法继续同步。');
+  }
+  const parsed = parseManifest(raw);
   if (!parsed) throw new Error('快照清单格式无效，无法继续同步。');
   return parsed;
 }

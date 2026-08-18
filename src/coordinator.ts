@@ -206,10 +206,6 @@ export class MultiWindowCoordinator extends EventEmitter {
     }
   }
 
-  public async activeWindowCount(): Promise<number> {
-    return (await this.windowSafety()).activeWindows;
-  }
-
   public async windowSafety(): Promise<WindowSafetySnapshot> {
     const entries = await fs.readdir(this.runtimePath).catch(() => [] as string[]);
     let activeWindows = 0;

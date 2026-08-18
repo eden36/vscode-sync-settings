@@ -37,7 +37,7 @@ export function isValidBranch(branch: string): boolean {
 
 export function resolveRepositoryUrl(fromSecret: string | undefined, stored: StoredConfiguration): {
   repositoryUrl: string;
-  persisted: Omit<PluginConfiguration, 'repositoryUrl' | 'mode' | 'pollIntervalSeconds' | 'debounceSeconds' | 'includeProfileAssociations'>;
+  persisted: Omit<PluginConfiguration, 'repositoryUrl' | 'mode' | 'pollIntervalSeconds' | 'debounceSeconds'>;
   shouldPersistSecret: boolean;
 } {
   const persisted = {
@@ -138,7 +138,6 @@ export function parsePluginConfiguration(value: unknown): PluginConfiguration | 
   if ([gitUserName, gitUserEmail].some((text) => text.length > 320 || /\r|\n/.test(text))) return undefined;
   const mode = value.mode;
   if (mode !== undefined && mode !== 'backup' && mode !== 'sync') return undefined;
-  if (typeof value.includeProfileAssociations !== 'boolean') return undefined;
   if (!validInterval(value.debounceSeconds, 5) || !validInterval(value.pollIntervalSeconds, 30)) return undefined;
   return {
     repositoryUrl,
@@ -149,7 +148,6 @@ export function parsePluginConfiguration(value: unknown): PluginConfiguration | 
     mode: mode === 'sync' ? 'sync' : 'backup',
     debounceSeconds: value.debounceSeconds,
     pollIntervalSeconds: value.pollIntervalSeconds,
-    includeProfileAssociations: value.includeProfileAssociations,
   };
 }
 

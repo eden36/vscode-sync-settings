@@ -163,8 +163,6 @@ export class ConfigurationStore {
       ...base,
       pollIntervalSeconds: settings.get<number>('pollIntervalSeconds', base.pollIntervalSeconds),
       debounceSeconds: settings.get<number>('debounceSeconds', base.debounceSeconds),
-      // 关联关系始终同步，不作为宿主设置暴露，避免出现改了却不生效的开关。
-      includeProfileAssociations: true,
     };
   }
 

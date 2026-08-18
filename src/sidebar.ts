@@ -8,7 +8,6 @@ import { RuntimeStatus, SyncConfiguration, SyncMode } from './types';
 interface AutomationSettings {
   debounceSeconds: number;
   pollIntervalSeconds: number;
-  includeProfileAssociations: boolean;
 }
 
 type IncomingMessage =
@@ -56,7 +55,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             ...this.configurationStore.get(),
             ...message.configuration,
             ...message.automation,
-            includeProfileAssociations: true,
           });
           await this.onConfigurationSaved();
           await this.view?.webview.postMessage({ type: 'configuration-saved' });
@@ -152,7 +150,7 @@ toggleEnabled.onclick=()=>{toggleEnabled.disabled=true;vscode.postMessage({type:
 for(const button of modeButtons)button.onclick=()=>{for(const other of modeButtons)other.disabled=true;vscode.postMessage({type:'setMode',mode:button.dataset.mode})};
 editRepository.onclick=()=>{for(const id of ids)document.getElementById(id).value=configuration[id]??'';document.getElementById('debounceSeconds').value=String(configuration.debounceSeconds??'');document.getElementById('pollIntervalSeconds').value=String(configuration.pollIntervalSeconds??'');configurationDialog.showModal()};
 cancelConfiguration.onclick=()=>configurationDialog.close();
-configurationForm.onsubmit=(event)=>{event.preventDefault();const next={};for(const id of ids)next[id]=document.getElementById(id).value;const automation={includeProfileAssociations:true,debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};saveConfiguration.disabled=true;cancelConfiguration.disabled=true;vscode.postMessage({type:'save',configuration:next,automation})};
+configurationForm.onsubmit=(event)=>{event.preventDefault();const next={};for(const id of ids)next[id]=document.getElementById(id).value;const automation={debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};saveConfiguration.disabled=true;cancelConfiguration.disabled=true;vscode.postMessage({type:'save',configuration:next,automation})};
 addEventListener('message',({data})=>{if(data.type==='configuration-saved'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;configurationDialog.close();return}if(data.type==='save-failed'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;return}if(data.type!=='state')return;configuration=data.configuration;enabled=data.enabled===true;toggleEnabled.className=enabled?'toggle-switch enabled':'toggle-switch';toggleEnabled.setAttribute('aria-checked',String(enabled));toggleEnabled.setAttribute('aria-label',enabled?'停止同步':'开启同步');toggleEnabled.disabled=false;document.getElementById('repositorySummary').textContent=configuration.repositoryUrl||'未配置远程仓库';document.getElementById('branchSummary').textContent=configuration.branch||'未配置分支';for(const button of modeButtons){const active=button.dataset.mode===configuration.mode;button.className=active?'active':'';button.setAttribute('aria-pressed',String(active));button.disabled=false}document.getElementById('syncMode').textContent=data.modeLabel;document.getElementById('modeNote').textContent=data.modeNote;const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
 vscode.postMessage({type:'ready'});
 setInterval(renderLastSyncAt,60_000);
@@ -178,7 +176,6 @@ function parseMessage(raw: unknown): IncomingMessage | undefined {
   if (!strings.every((key) => typeof configuration[key] === 'string')) return undefined;
   if (/\r|\n/.test(configuration.repositoryUrl as string) || !isValidBranch(configuration.branch as string)) return undefined;
   const automation = value.automation as Record<string, unknown>;
-  if (typeof automation.includeProfileAssociations !== 'boolean') return undefined;
   if (!validInterval(automation.debounceSeconds, 5) || !validInterval(automation.pollIntervalSeconds, 30)) return undefined;
   return {
     type: 'save',

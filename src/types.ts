@@ -105,7 +105,6 @@ export interface PluginConfiguration extends SyncConfiguration {
   mode: SyncMode;
   pollIntervalSeconds: number;
   debounceSeconds: number;
-  includeProfileAssociations: boolean;
 }
 
 export interface RuntimeStatus {
@@ -145,5 +144,4 @@ export const DEFAULT_CONFIGURATION: PluginConfiguration = {
   mode: 'backup',
   pollIntervalSeconds: 300,
   debounceSeconds: 10,
-  includeProfileAssociations: true,
 };
