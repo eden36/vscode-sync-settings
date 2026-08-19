@@ -22,7 +22,6 @@ export function snapshotDigest(manifest: SnapshotManifest): SnapshotDigest {
   const canonical = canonicalize({
     profiles: manifest.profiles,
     ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
-    ...(manifest.profileAssociations !== undefined ? { profileAssociations: manifest.profileAssociations } : {}),
     files: Object.fromEntries(files),
   });
   return {
@@ -75,7 +74,6 @@ export function parseManifest(value: unknown): SnapshotManifest | undefined {
     ...(value.profileMetadata !== undefined
       ? { profileMetadata: value.profileMetadata as Array<Record<string, unknown>> }
       : {}),
-    ...(value.profileAssociations !== undefined ? { profileAssociations: value.profileAssociations } : {}),
   };
 }
 

@@ -147,7 +147,6 @@ export interface SnapshotManifest {
   createdAt: string;
   profiles: Array<Pick<ProfileDescriptor, 'id' | 'name' | 'isDefault'>>;
   profileMetadata?: Array<Record<string, unknown>>;
-  profileAssociations?: unknown;
   files: Record<string, string>;
 }
 

@@ -24,7 +24,6 @@ interface StoredProfile {
 
 interface StorageFile {
   userDataProfiles?: StoredProfile[];
-  profileAssociations?: unknown;
 }
 
 export interface RestoreResult {
@@ -126,8 +125,6 @@ export class ProfileAdapter {
       createdAt: '',
       profiles: profiles.map(({ id, name, isDefault }) => ({ id, name, isDefault })),
       profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })) ?? [],
-      // 工作区与 Profile 的关联关系始终同步，不作为开关暴露。
-      ...(storage.profileAssociations !== undefined ? { profileAssociations: storage.profileAssociations } : {}),
       files
     };
     await fs.writeFile(path.join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
@@ -243,7 +240,6 @@ export class ProfileAdapter {
 
     const storage = await this.readStorage();
     storage.userDataProfiles = metadata as StoredProfile[];
-    if (manifest.profileAssociations !== undefined) storage.profileAssociations = manifest.profileAssociations;
     await atomicWrite(storagePath, Buffer.from(`${JSON.stringify(storage, null, 2)}\n`, 'utf8'), this.stagingPath);
     const allowed = new Set(locations as string[]);
     for (const entry of await fs.readdir(profilesPath).catch(() => [])) {
@@ -283,7 +279,7 @@ export class ProfileAdapter {
     const sorted = (await collectFiles(root)).sort((left, right) => left.localeCompare(right));
     for (const absolute of sorted) {
       const relative = path.relative(root, absolute);
-      const content = await stableRead(absolute);
+      const content = normalizeLineEndings(await stableRead(absolute));
       const target = path.join(targetRoot, resource, relative);
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, content);
@@ -331,9 +327,10 @@ export class ProfileAdapter {
   }
 
   private prepareForRepository(resource: string, content: Buffer): Buffer {
+    const normalized = normalizeLineEndings(content);
     // 插件自身设置由版本化配置记录负责收敛，随 settings.json 同步会与之互相覆盖。
-    if (resource === 'settings.json') return Buffer.from(stripPluginSettings(content.toString('utf8')), 'utf8');
-    return content;
+    if (resource === 'settings.json') return Buffer.from(stripPluginSettings(normalized.toString('utf8')), 'utf8');
+    return normalized;
   }
 
   private prepareForLocal(relative: string, content: Buffer, current: Buffer | undefined): Buffer {
@@ -490,6 +487,17 @@ function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
+/**
+ * 仓库形态统一按 LF 存放：两台机器的 Git 换行符配置不同时，
+ * 同一份配置会被写成 CRLF 与 LF 两种字节，不归一就会算出两个哈希，判成双方都有改动。
+ * 不含 CRLF 的内容原样返回，避免对二进制内容做无谓的编解码。
+ */
+function normalizeLineEndings(content: Buffer): Buffer {
+  const text = content.toString('utf8');
+  if (!text.includes('\r\n')) return content;
+  return Buffer.from(text.replaceAll('\r\n', '\n'), 'utf8');
+}
+
 function setsEqual(left: Set<string>, right: Set<string>): boolean {
   return left.size === right.size && [...left].every((item) => right.has(item));
 }
@@ -502,4 +510,4 @@ function resolveProfileMetadata(manifest: SnapshotManifest): Array<Record<string
     .map((profile) => ({ location: profile.id, name: profile.name }));
 }
 
-export const testing = { normalizeRelative, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };
+export const testing = { normalizeRelative, normalizeLineEndings, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };

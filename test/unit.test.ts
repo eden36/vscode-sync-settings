@@ -329,6 +329,81 @@ test('按 location 枚举命名 Profile，并恢复文件修改和删除', async
   }
 });
 
+test('工作区关联不进快照，恢复 Profile 结构也不覆盖本机关联', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-associations-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const storagePath = path.join(userDataPath, 'globalStorage', 'storage.json');
+  const associations = {
+    workspaces: { 'file:///d%3A/local': '__default__profile__' },
+    emptyWindows: { '1787144855726': '__default__profile__' },
+  };
+  await mkdir(runtimePath, { recursive: true });
+  await writeFile(storagePath, JSON.stringify({ userDataProfiles: [], profileAssociations: associations }));
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 15}');
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    // 工作区路径和空窗口 id 都是本机专属数据，进了快照就会让两台机器永远互相判成有改动。
+    const manifest = await adapter.createSnapshot(snapshot);
+    assert.equal('profileAssociations' in manifest, false);
+    const written = JSON.parse(await readFile(path.join(snapshot, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal('profileAssociations' in written, false);
+
+    await writeFile(path.join(snapshot, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      profiles: [...manifest.profiles, { id: 'abc123', name: '开发', isDefault: false }],
+      profileMetadata: [{ location: 'abc123', name: '开发' }],
+      profileAssociations: { workspaces: { 'file:///d%3A/remote': '__default__profile__' } },
+    }, null, 2));
+    const restored = await adapter.restoreSnapshot(snapshot, true);
+    assert.equal(restored.structuralApplied, true);
+    const storage = JSON.parse(await readFile(storagePath, 'utf8')) as Record<string, unknown>;
+    assert.deepEqual(storage.profileAssociations, associations);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照与指纹按 LF 归一，换行符差异不算改动', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-eol-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const settings = '{\r\n  "editor.fontSize": 15\r\n}\r\n';
+  const snippet = '{\r\n  "循环": { "prefix": "for" }\r\n}\r\n';
+  await Promise.all([mkdir(runtimePath, { recursive: true }), mkdir(path.join(userDataPath, 'snippets'), { recursive: true })]);
+  await writeFile(path.join(userDataPath, 'settings.json'), settings);
+  await writeFile(path.join(userDataPath, 'snippets', 'markdown.json'), snippet);
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    const manifest = await adapter.createSnapshot(snapshot);
+    assert.equal(
+      manifest.files['profiles/default/settings.json'],
+      testing.sha256(Buffer.from(settings.replaceAll('\r\n', '\n'), 'utf8')),
+    );
+    assert.equal(
+      manifest.files['profiles/default/snippets/markdown.json'],
+      testing.sha256(Buffer.from(snippet.replaceAll('\r\n', '\n'), 'utf8')),
+    );
+    assert.equal(await readFile(path.join(snapshot, 'profiles', 'default', 'settings.json'), 'utf8'), settings.replaceAll('\r\n', '\n'));
+
+    // 只把本机文件换成 LF，指纹不应变化，否则两台机器的 Git 换行符配置不同就会互相判成有改动。
+    const before = await adapter.fingerprint();
+    await writeFile(path.join(userDataPath, 'settings.json'), settings.replaceAll('\r\n', '\n'));
+    await writeFile(path.join(userDataPath, 'snippets', 'markdown.json'), snippet.replaceAll('\r\n', '\n'));
+    assert.equal(await adapter.fingerprint(), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('换行符归一只改写 CRLF，其余内容原样返回', () => {
+  assert.equal(testing.normalizeLineEndings(Buffer.from('a\r\nb\r\n', 'utf8')).toString('utf8'), 'a\nb\n');
+  const untouched = Buffer.from('a\rb\nc', 'utf8');
+  assert.equal(testing.normalizeLineEndings(untouched), untouched);
+});
+
 test('快照采集宿主级已安装扩展清单，只保留标识且不写回本机', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-extensions-'));
   const userDataPath = path.join(root, 'User');
@@ -1216,6 +1291,18 @@ test('快照清单缺字段或类型不符时拒绝解析', () => {
   assert.equal(parseManifest({ ...valid, files: { 'a.json': 12 } }), undefined);
   assert.equal(parseManifest({ ...valid, files: null }), undefined);
   assert.equal(parseManifest(undefined), undefined);
+});
+
+test('快照清单丢弃工作区关联，指纹不受其影响', () => {
+  const base = {
+    schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [{ id: 'default', name: '默认', isDefault: true }], files: {},
+  };
+  const local = parseManifest({ ...base, profileAssociations: { workspaces: { 'file:///d%3A/local': '__default__profile__' } } });
+  const cloud = parseManifest({ ...base, profileAssociations: { emptyWindows: { '1787144855726': '__default__profile__' } } });
+  if (!local || !cloud) throw new Error('清单应当解析成功');
+  assert.equal('profileAssociations' in local, false);
+  // 旧版本推上去的快照仍带这个字段，解析时丢弃即可，两侧指纹要相同。
+  assert.equal(snapshotDigest(local).snapshot, snapshotDigest(cloud).snapshot);
 });
 
 test('检测 URL 中嵌入的明文凭据', () => {

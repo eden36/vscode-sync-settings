@@ -38,6 +38,8 @@ export class ConfigurationRepositoryGitService {
     if (configuration.gitUserEmail.trim()) await this.git(['config', 'user.email', configuration.gitUserEmail.trim()]);
     else await this.git(['config', '--unset', 'user.email'], true);
     await this.git(['config', 'core.hooksPath', process.platform === 'win32' ? 'NUL' : '/dev/null']);
+    // 仓库只是本机缓存，检出与提交都必须是原样字节；换行符转换会让同一份配置在两台机器上算出不同哈希。
+    await this.git(['config', 'core.autocrlf', 'false']);
 
     // 插件进程被强制关闭时，Git 可能残留未完成的操作；内部仓库可安全中止后重建快照。
     await this.git(['rebase', '--abort'], true);
