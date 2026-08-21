@@ -1,6 +1,6 @@
 import { AiService } from '../ai';
 import { WindowSafetySnapshot } from '../coordinator';
-import { ConfigurationRepositoryGitService, PullResult } from '../git-service';
+import { ConfigurationRepositoryGitService, PullResult, RepositoryCommit } from '../git-service';
 import { HostEnvironment } from '../host';
 import { ProfileAdapter, RestoreResult } from '../profile-adapter';
 import { RuntimeStateStore } from '../runtime-state';
@@ -43,12 +43,16 @@ export interface SyncArtifacts {
   /** 远端是否已有本宿主的快照；决定本轮是三方合并还是用本机内容初始化。 */
   remoteExists?: boolean;
   restore?: RestoreResult;
+  /** 预置的提交说明；有值时不再调用 AI 生成（还原历史提交时使用）。 */
+  commitMessage?: string;
 }
 
 export interface SyncContext {
   readonly dependencies: SyncDependencies;
   readonly configuration: PluginConfiguration;
   readonly adoptCloud: boolean;
+  /** 本轮要还原的历史提交，只有还原流程会设置。 */
+  readonly restoreTarget?: RepositoryCommit;
   readonly paths: SyncPaths;
   readonly report: SyncReport;
   readonly artifacts: SyncArtifacts;

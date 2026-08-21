@@ -38,6 +38,12 @@
         "title": "My Setting Sync: 启用或关闭同步"
       },
       {
+        "command": "profileGitSync.showHistory",
+        "title": "云端提交历史",
+        "category": "My Setting Sync",
+        "icon": "$(history)"
+      },
+      {
         "command": "profileGitSync.rebuildRepository",
         "title": "删除本机 .git",
         "category": "My Setting Sync",
@@ -47,9 +53,14 @@
     "menus": {
       "view/title": [
         {
+          "command": "profileGitSync.showHistory",
+          "when": "view == profileGitSync.sidebar",
+          "group": "navigation@1"
+        },
+        {
           "command": "profileGitSync.rebuildRepository",
           "when": "view == profileGitSync.sidebar",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ]
     },

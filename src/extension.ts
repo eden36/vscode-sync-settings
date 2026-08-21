@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
 import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
-import { ConfigurationRepositoryGitService } from './git-service';
+import { ConfigurationRepositoryGitService, RepositoryCommit } from './git-service';
 import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
@@ -16,7 +16,7 @@ import {
   SchedulerMachine,
 } from './scheduler';
 import { SidebarProvider } from './sidebar';
-import { displayIcon, displayPhase, stageLabel } from './sidebar-status';
+import { displayIcon, displayPhase, formatRelativeSyncTime, stageLabel } from './sidebar-status';
 import { SyncEngine } from './sync-engine';
 import { RuntimeStatus, SyncOutcome } from './types';
 
@@ -231,6 +231,80 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispatch({ type: 'sync-requested', source: 'user', adoptCloud: true });
   };
 
+  const showHistory = async () => {
+    if (!machine.enabled) {
+      void vscode.window.showInformationMessage('配置同步已关闭，请先在侧边栏开启同步。');
+      return;
+    }
+    const configuration = configurationStore.get();
+    if (!configuration.repositoryUrl) {
+      applyStatus({ message: '请填写 Git 仓库地址。' }, false);
+      return;
+    }
+
+    try {
+      let commits: RepositoryCommit[] = [];
+      // 取历史要动本地仓库并联网，与同步互斥。
+      const listed = await coordinator!.runExclusive(async () => {
+        await configurationRepository.prepare(configuration);
+        commits = await configurationRepository.listCommits(configuration, environment.kind);
+      });
+      if (!listed) {
+        applyStatus({ message: '另一窗口正在执行同步，请稍后重试查看历史。' }, false);
+        return;
+      }
+      if (!commits.length) {
+        void vscode.window.showInformationMessage('云端还没有本宿主的配置提交。');
+        return;
+      }
+
+      const picked = await vscode.window.showQuickPick(
+        commits.map((commit) => ({
+          label: commit.subject || '（无提交说明）',
+          description: formatRelativeSyncTime(commit.committedAt),
+          detail: `${commit.shortHash} · ${new Date(commit.committedAt).toLocaleString()}`,
+          commit,
+        })),
+        { title: '云端提交历史', placeHolder: '选择要还原到的提交' },
+      );
+      if (!picked) return;
+
+      const backupOnly = configuration.mode === 'backup';
+      const confirmed = await vscode.window.showWarningMessage(
+        `是否还原到 ${picked.commit.shortHash}？`,
+        {
+          modal: true,
+          detail: [
+            '将以该提交的配置覆盖本机，本机原配置会先备份到扩展运行目录；该提交清单里没有的扩展会在本机卸载。',
+            '随后在远端追加一条新的还原提交，远端已有历史不会被改写。',
+            ...(backupOnly ? ['当前是备份模式，平时不会写回本机，但还原会直接覆盖本机配置与扩展。'] : []),
+          ].join('\n'),
+        },
+        '还原',
+      );
+      if (confirmed !== '还原') return;
+
+      let outcome: SyncOutcome | undefined;
+      const acquired = await coordinator!.runExclusive(async () => {
+        outcome = await engine.restoreCommit(picked.commit);
+        // 写回后必须刷新指纹，否则本机改动检测会把还原结果当成新改动，再空跑一轮同步。
+        localFingerprint = await adapter.fingerprint();
+      });
+      if (!acquired) {
+        applyStatus({ message: '另一窗口正在执行同步，请稍后重试还原。' }, false);
+        return;
+      }
+      dispatch({ type: 'sync-finished', outcome });
+      if (outcome?.ok) {
+        applyStatus({ message: `已还原到 ${picked.commit.shortHash} 并推送新提交。` }, coordinator!.isLeader);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      applyStatus({ message }, false);
+      dispatch({ type: 'sync-failed', message });
+    }
+  };
+
   const rebuildRepository = async () => {
     const confirmed = await vscode.window.showWarningMessage(
       '是否删除本机配置同步目录中的 .git？',
@@ -355,6 +429,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       dispatch({ type: 'sync-requested', source: 'user' });
     }),
     vscode.commands.registerCommand('profileGitSync.toggleEnabled', () => void setEnabled(!machine.enabled)),
+    vscode.commands.registerCommand('profileGitSync.showHistory', () => void showHistory()),
     vscode.commands.registerCommand('profileGitSync.rebuildRepository', () => void rebuildRepository()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
     vscode.workspace.onDidChangeConfiguration((event) => {

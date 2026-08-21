@@ -3,14 +3,15 @@ import * as path from 'node:path';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
-import { ConfigurationRepositoryGitService } from './git-service';
+import { ConfigurationRepositoryGitService, RepositoryCommit } from './git-service';
 import { HostEnvironment } from './host';
 import { runPipeline } from './pipeline/pipeline';
+import { RESTORE_STAGES } from './pipeline/restore';
 import { BACKUP_STAGES, SYNC_STAGES } from './pipeline/stages';
 import { SyncContext, SyncDependencies } from './pipeline/types';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
-import { createSyncReport, RuntimeStatus, SyncOutcome } from './types';
+import { createSyncReport, PluginConfiguration, RuntimeStatus, SyncOutcome } from './types';
 
 export interface SynchronizeOptions {
   adoptCloud?: boolean;
@@ -63,18 +64,8 @@ export class SyncEngine {
       }
       if (options.adoptCloud) await this.beginCloudAdopt();
 
-      const safety = await this.windowSafety();
-      if (safety.dirtyWindows > 0 || safety.unreadableWindows > 0) {
-        const reason = safety.dirtyWindows > 0 ? 'dirty-windows' : 'unreadable-windows';
-        const count = safety.dirtyWindows > 0 ? safety.dirtyWindows : safety.unreadableWindows;
-        this.updateStatus({
-          activeWindows: safety.activeWindows,
-          message: reason === 'dirty-windows'
-            ? `有 ${count} 个窗口存在未保存的配置文件，保存后会自动继续。`
-            : `有 ${count} 个窗口状态无法确认，已暂停同步。`,
-        });
-        return { ok: false, retry: true, blockReason: reason };
-      }
+      const blocked = await this.blockedByWindows();
+      if (blocked) return blocked;
 
       // 其他窗口可能刚标记过重建，必须读共享文件的最新值而不是本窗口缓存。
       await this.runtimeState.reload();
@@ -82,29 +73,8 @@ export class SyncEngine {
       // 备份模式永不写回本机，采用云端无从谈起；置为 false 才能保证本机内容仍要过凭据扫描。
       const adoptCloud = !backupOnly && (options.adoptCloud === true || this.runtimeState.get().cloudAdoptPending);
 
-      // 同步在独占锁内执行，进程异常退出残留的临时快照可以安全清空。
-      const snapshotRoot = path.join(this.environment.runtimePath, 'snapshots');
-      await fs.rm(snapshotRoot, { recursive: true, force: true }).catch(() => undefined);
-      temporaryRoot = path.join(snapshotRoot, `local-${process.pid}-${Date.now()}`);
-
-      const context: SyncContext = {
-        dependencies: this.dependencies,
-        configuration,
-        adoptCloud,
-        paths: {
-          temporaryRoot,
-          localHostRoot: path.join(temporaryRoot, this.environment.kind),
-          baseHostRoot: path.join(temporaryRoot, 'base'),
-          repositoryHostRoot: path.join(
-            this.dependencies.git.repositoryPath,
-            '.profile-git-sync',
-            'hosts',
-            this.environment.kind,
-          ),
-        },
-        report: createSyncReport(configuration.mode),
-        artifacts: {},
-      };
+      temporaryRoot = await this.prepareTemporaryRoot();
+      const context = this.buildContext(configuration, temporaryRoot, { adoptCloud });
       return await runPipeline(context, backupOnly ? BACKUP_STAGES : SYNC_STAGES);
     } catch (error) {
       this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
@@ -115,5 +85,84 @@ export class SyncEngine {
         await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
       }
     }
+  }
+
+  /**
+   * 把所选历史提交的配置写回本机，并在远端 tip 上追加一条新的还原提交。
+   * 用户显式操作，备份模式同样会写回本机；不改写远端已有历史。
+   */
+  public async restoreCommit(target: RepositoryCommit): Promise<SyncOutcome | undefined> {
+    if (this.running) return undefined;
+    this.running = true;
+    const configuration = this.configurationStore.get();
+    let temporaryRoot: string | undefined;
+    try {
+      if (!configuration.repositoryUrl) {
+        this.updateStatus({ message: '请填写 Git 仓库地址。' });
+        return { ok: false };
+      }
+
+      const blocked = await this.blockedByWindows();
+      if (blocked) return blocked;
+
+      temporaryRoot = await this.prepareTemporaryRoot();
+      const context = this.buildContext(configuration, temporaryRoot, { adoptCloud: false, restoreTarget: target });
+      return await runPipeline(context, RESTORE_STAGES);
+    } catch (error) {
+      this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
+      return { ok: false };
+    } finally {
+      this.running = false;
+      if (temporaryRoot) {
+        await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+  }
+
+  private async blockedByWindows(): Promise<SyncOutcome | undefined> {
+    const safety = await this.windowSafety();
+    if (safety.dirtyWindows === 0 && safety.unreadableWindows === 0) return undefined;
+    const reason = safety.dirtyWindows > 0 ? 'dirty-windows' : 'unreadable-windows';
+    const count = safety.dirtyWindows > 0 ? safety.dirtyWindows : safety.unreadableWindows;
+    this.updateStatus({
+      activeWindows: safety.activeWindows,
+      message: reason === 'dirty-windows'
+        ? `有 ${count} 个窗口存在未保存的配置文件，保存后会自动继续。`
+        : `有 ${count} 个窗口状态无法确认，已暂停同步。`,
+    });
+    return { ok: false, retry: true, blockReason: reason };
+  }
+
+  /** 流程在独占锁内执行，进程异常退出残留的临时快照可以安全清空。 */
+  private async prepareTemporaryRoot(): Promise<string> {
+    const snapshotRoot = path.join(this.environment.runtimePath, 'snapshots');
+    await fs.rm(snapshotRoot, { recursive: true, force: true }).catch(() => undefined);
+    return path.join(snapshotRoot, `local-${process.pid}-${Date.now()}`);
+  }
+
+  private buildContext(
+    configuration: PluginConfiguration,
+    temporaryRoot: string,
+    options: { adoptCloud: boolean; restoreTarget?: RepositoryCommit },
+  ): SyncContext {
+    return {
+      dependencies: this.dependencies,
+      configuration,
+      adoptCloud: options.adoptCloud,
+      ...(options.restoreTarget ? { restoreTarget: options.restoreTarget } : {}),
+      paths: {
+        temporaryRoot,
+        localHostRoot: path.join(temporaryRoot, this.environment.kind),
+        baseHostRoot: path.join(temporaryRoot, 'base'),
+        repositoryHostRoot: path.join(
+          this.dependencies.git.repositoryPath,
+          '.profile-git-sync',
+          'hosts',
+          this.environment.kind,
+        ),
+      },
+      report: createSyncReport(configuration.mode),
+      artifacts: {},
+    };
   }
 }

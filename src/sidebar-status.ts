@@ -50,6 +50,7 @@ export function stageLabel(stage: StageName): string {
     case 'push': return '正在提交并推送到远端';
     case 'apply': return '正在写回本机配置';
     case 'extensions': return '正在同步扩展';
+    case 'export-history': return '正在导出历史配置';
   }
 }
 

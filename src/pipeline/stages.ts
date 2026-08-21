@@ -34,7 +34,7 @@ const scanSecretsStage: Stage = {
   },
 };
 
-const prepareStage: Stage = {
+export const prepareStage: Stage = {
   name: 'prepare',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { git, environment } = context.dependencies;
@@ -44,7 +44,7 @@ const prepareStage: Stage = {
   },
 };
 
-const pullStage: Stage = {
+export const pullStage: Stage = {
   name: 'pull',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { git, environment } = context.dependencies;
@@ -81,7 +81,7 @@ const decideStage: Stage = {
   },
 };
 
-const pushStage: Stage = {
+export const pushStage: Stage = {
   name: 'push',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { git, ai, environment, windowSafety, updateStatus } = context.dependencies;
@@ -90,8 +90,9 @@ const pushStage: Stage = {
 
     const changed = await git.stageHost(environment.kind);
     context.report.changedFileCount = changed.length;
-    let message: string | undefined;
-    if (changed.length) {
+    // 还原历史提交这类流程的说明必须是确定的，预置了就不再花一次 AI 调用。
+    let message = changed.length ? context.artifacts.commitMessage : undefined;
+    if (changed.length && !message) {
       updateStatus({ sync: { kind: 'running', stage: 'ai' }, pendingChanges: changed.length });
       try {
         message = await ai.createCommitMessage(changed.map((file) => `- ${file}`).join('\n'));
@@ -99,8 +100,8 @@ const pushStage: Stage = {
         message = fallbackCommitMessage(environment.kind);
         context.report.usedAiFallback = true;
       }
-      updateStatus({ sync: { kind: 'running', stage: 'push' }, message });
     }
+    if (message) updateStatus({ sync: { kind: 'running', stage: 'push' }, message, pendingChanges: changed.length });
 
     // 提交前再确认一次：等待 AI 期间用户可能又打开了未保存的配置文档。
     const blocked = windowBlock(await windowSafety());
@@ -112,7 +113,7 @@ const pushStage: Stage = {
   },
 };
 
-const applyStage: Stage = {
+export const applyStage: Stage = {
   name: 'apply',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { adapter, windowSafety, runtimeState } = context.dependencies;
@@ -135,7 +136,7 @@ const applyStage: Stage = {
   },
 };
 
-const extensionsStage: Stage = {
+export const extensionsStage: Stage = {
   name: 'extensions',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { adapter, updateStatus } = context.dependencies;

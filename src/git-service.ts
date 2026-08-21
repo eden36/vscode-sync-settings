@@ -1,10 +1,22 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { runProcess, runProcessBinary } from './process';
-import { SyncConfiguration } from './types';
+import { HostKind, SyncConfiguration } from './types';
 
 /** cloned：本地没有历史，已直接检出远端；unrelated：与远端没有共同祖先；synced：与远端同源。 */
 export type PullState = 'cloned' | 'unrelated' | 'synced';
+
+/** 提交说明可能包含空格与换行，字段之间用不会出现在文本里的分隔符，避免解析歧义。 */
+const COMMIT_FIELD_SEPARATOR = '\x1f';
+const MAX_COMMIT_LIST = 100;
+
+/** 云端历史中的一条提交，只用于展示和选择还原目标。 */
+export interface RepositoryCommit {
+  hash: string;
+  shortHash: string;
+  committedAt: string;
+  subject: string;
+}
 
 export interface PullResult {
   state: PullState;
@@ -73,6 +85,42 @@ export class ConfigurationRepositoryGitService {
     await this.git(['rebase', '--abort'], true);
     await this.git(['reset', '--hard', `origin/${configuration.branch}`]);
     return { state: 'synced', ...mergeBase, recoveredFromDivergence: true };
+  }
+
+  /**
+   * 列出远端分支上动过本宿主目录的提交，最新的在前。
+   * 只看本宿主目录：另一台宿主的提交里没有本机可还原的内容，列出来只会误导。
+   */
+  public async listCommits(configuration: SyncConfiguration, host: HostKind, limit = 30): Promise<RepositoryCommit[]> {
+    const remote = await this.git(['ls-remote', '--exit-code', '--heads', 'origin', configuration.branch], true);
+    if (remote.exitCode === 2) return [];
+    // 认证失败与「分支不存在」必须区分开，否则用户会以为云端没有历史。
+    if (remote.exitCode !== 0) throw new Error(formatRemoteError(remote.stderr, configuration.repositoryUrl));
+    await this.git(['fetch', '--prune', 'origin', configuration.branch]);
+
+    const count = Math.min(Math.max(Math.trunc(limit), 1), MAX_COMMIT_LIST);
+    const log = await this.git([
+      'log',
+      `--max-count=${count}`,
+      '--no-color',
+      '-z',
+      `--format=%H${COMMIT_FIELD_SEPARATOR}%cI${COMMIT_FIELD_SEPARATOR}%s`,
+      `origin/${configuration.branch}`,
+      '--',
+      `.profile-git-sync/hosts/${host}`,
+    ], true);
+    if (log.exitCode !== 0) return [];
+
+    const commits: RepositoryCommit[] = [];
+    for (const record of log.stdout.split('\0')) {
+      const fields = record.split(COMMIT_FIELD_SEPARATOR);
+      const [hash, committedAt, subject] = fields;
+      // 输出格式不符只跳过该条，不影响其余历史的展示。
+      if (fields.length !== 3 || !hash || !committedAt) continue;
+      if (!/^[0-9a-f]{40}$/.test(hash) || Number.isNaN(Date.parse(committedAt))) continue;
+      commits.push({ hash, shortHash: hash.slice(0, 7), committedAt, subject: subject ?? '' });
+    }
+    return commits;
   }
 
   /** 本地仓库只是缓存，真实配置在本机磁盘和远端仓库中，删除后会按首次接入重新克隆。 */

@@ -14,7 +14,8 @@ export type StageName =
   | 'ai'
   | 'push'
   | 'apply'
-  | 'extensions';
+  | 'extensions'
+  | 'export-history';
 
 /** 同步暂停的原因，决定了何时可以自动恢复。 */
 export type BlockReason =

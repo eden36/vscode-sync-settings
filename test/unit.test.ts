@@ -30,6 +30,7 @@ import { withFileLock } from '../src/file-lock';
 import { displayIcon, displayPhase, displayTone, formatRelativeSyncTime } from '../src/sidebar-status';
 import { AiService } from '../src/ai';
 import { mergeStage } from '../src/pipeline/merge';
+import { testing as restoreTesting } from '../src/pipeline/restore';
 import { runPipeline } from '../src/pipeline/pipeline';
 import { BACKUP_STAGES, SYNC_STAGES, testing as stageTesting } from '../src/pipeline/stages';
 import { Stage, SyncContext, SyncDependencies } from '../src/pipeline/types';
@@ -1826,6 +1827,212 @@ test('重载窗口时不再并行开启排队的同步', () => {
   assert.deepEqual(commands, [{ type: 'reload-window' }]);
   assert.equal(next.pending, false);
 });
+
+test('云端历史只列出动过本宿主目录的提交', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-history-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const service = new ConfigurationRepositoryGitService(path.join(root, 'runtime'));
+    await service.prepare(configuration);
+    const hostRoot = path.join(service.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
+    await mkdir(hostRoot, { recursive: true });
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await service.stageHost('vscode');
+    await service.commitAndPush(configuration, '第一次 备份：初始配置');
+
+    const otherHostRoot = path.join(service.repositoryPath, '.profile-git-sync', 'hosts', 'cursor');
+    await mkdir(otherHostRoot, { recursive: true });
+    await writeFile(path.join(otherHostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await service.stageHost('cursor');
+    await service.commitAndPush(configuration, 'Cursor 的提交');
+
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":2}');
+    await service.stageHost('vscode');
+    await service.commitAndPush(configuration, '第二次 备份：带空格 与中文标点，末尾');
+
+    const commits = await service.listCommits(configuration, 'vscode');
+    assert.deepEqual(commits.map((commit) => commit.subject), ['第二次 备份：带空格 与中文标点，末尾', '第一次 备份：初始配置']);
+    assert.equal(/^[0-9a-f]{40}$/.test(commits[0]!.hash), true);
+    assert.equal(commits[0]!.shortHash, commits[0]!.hash.slice(0, 7));
+    assert.equal(Number.isNaN(Date.parse(commits[0]!.committedAt)), false);
+    assert.equal((await service.listCommits(configuration, 'vscode', 1)).length, 1);
+    assert.deepEqual(await service.listCommits({ ...configuration, branch: 'missing' }, 'vscode'), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('所选提交没有本宿主快照时中止还原且不清空仓库目录', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-restore-missing-'));
+  try {
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    await mkdir(repositoryHostRoot, { recursive: true });
+    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    const context = restoreContext(root, {
+      dependencies: stageDependencies({ git: fakeGit({ exportHostTree: async () => false }) }),
+    });
+    await assert.rejects(() => restoreTesting.exportHistoryStage.run(context), /没有本宿主的配置快照/);
+    assert.equal(await readFile(path.join(repositoryHostRoot, 'manifest.json'), 'utf8'), '{"schemaVersion":1}');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('历史快照可能包含凭据时拒绝还原且不写入仓库目录', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-restore-secret-'));
+  try {
+    const context = restoreContext(root, {
+      dependencies: stageDependencies({
+        adapter: { listProfiles: async () => [] } as unknown as ProfileAdapter,
+        git: fakeGit({
+          exportHostTree: async (_commit: string, _host: string, targetRoot: string) => {
+            await writeHistorySnapshot(targetRoot, [], { 'profiles/default/settings.json': '{"apiKey": "abcdef123456"}' });
+            return true;
+          },
+        }),
+      }),
+    });
+    await assert.rejects(() => restoreTesting.exportHistoryStage.run(context), /已拒绝还原/);
+    await assert.rejects(readdir(path.join(root, 'repository', 'vscode')), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('多窗口时包含 Profile 增删的历史快照不还原', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-restore-structure-'));
+  try {
+    const context = restoreContext(root, {
+      dependencies: stageDependencies({
+        adapter: {
+          listProfiles: async () => [{ id: '__default__', name: '默认', location: '/profiles/default', isDefault: true }],
+        } as unknown as ProfileAdapter,
+        git: fakeGit({
+          exportHostTree: async (_commit: string, _host: string, targetRoot: string) => {
+            await writeHistorySnapshot(targetRoot, [{ id: 'work', name: '工作', isDefault: false }], {});
+            return true;
+          },
+        }),
+        windowSafety: async () => ({ activeWindows: 2, dirtyWindows: 0, unreadableWindows: 0 }),
+      }),
+    });
+    const outcome = await restoreTesting.exportHistoryStage.run(context);
+    assert.equal(outcome.kind, 'blocked');
+    assert.equal(outcome.kind === 'blocked' ? outcome.reason : undefined, 'other-windows');
+    await assert.rejects(readdir(path.join(root, 'repository', 'vscode')), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('还原把历史快照换进仓库目录并预置提交说明', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-restore-export-'));
+  try {
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    await mkdir(repositoryHostRoot, { recursive: true });
+    // 仓库里已有的多余文件必须被历史快照整体替换，不能残留。
+    await writeFile(path.join(repositoryHostRoot, 'stale.json'), '{}');
+    const context = restoreContext(root, {
+      dependencies: stageDependencies({
+        adapter: { listProfiles: async () => [] } as unknown as ProfileAdapter,
+        git: fakeGit({
+          exportHostTree: async (_commit: string, _host: string, targetRoot: string) => {
+            await writeHistorySnapshot(targetRoot, [], { 'profiles/default/settings.json': '{"editor.fontSize": 14}' });
+            return true;
+          },
+        }),
+      }),
+    });
+    assert.deepEqual(await restoreTesting.exportHistoryStage.run(context), { kind: 'continue' });
+    assert.equal(context.artifacts.commitMessage, '还原到 abcdefg：第一次 备份：初始配置');
+    assert.equal(
+      await readFile(path.join(repositoryHostRoot, 'profiles', 'default', 'settings.json'), 'utf8'),
+      '{"editor.fontSize": 14}',
+    );
+    await assert.rejects(readFile(path.join(repositoryHostRoot, 'stale.json'), 'utf8'), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('还原使用预置的提交说明，不再调用 AI', async () => {
+  let committed: string | undefined;
+  let aiCalled = false;
+  const context = stageContext({
+    artifacts: { commitMessage: '还原到 abcdefg：初始配置' },
+    dependencies: stageDependencies({
+      git: fakeGit({
+        stageHost: async () => ['profiles/default/settings.json'],
+        commitAndPush: async (_configuration: SyncConfiguration, message: string) => { committed = message; },
+      }),
+      ai: { createCommitMessage: async () => { aiCalled = true; return 'AI 生成的说明'; } } as unknown as AiService,
+    }),
+  });
+  assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
+  assert.equal(committed, '还原到 abcdefg：初始配置');
+  assert.equal(aiCalled, false);
+});
+
+test('本机 Profile 结构未应用时放弃推送还原提交', async () => {
+  let staged = false;
+  const context = stageContext({
+    report: { ...createSyncReport('sync'), waitingForWindows: true },
+    dependencies: stageDependencies({
+      git: fakeGit({ stageHost: async () => { staged = true; return []; } }),
+    }),
+  });
+  const outcome = await restoreTesting.restorePushStage.run(context);
+  assert.equal(outcome.kind, 'blocked');
+  assert.equal(outcome.kind === 'blocked' ? outcome.reason : undefined, 'other-windows');
+  assert.equal(staged, false);
+});
+
+/** 还原流程的上下文：临时目录与仓库宿主目录都落在测试的临时根目录下。 */
+function restoreContext(root: string, overrides: Partial<SyncContext> = {}): SyncContext {
+  return stageContext({
+    restoreTarget: {
+      hash: 'a'.repeat(40),
+      shortHash: 'abcdefg',
+      committedAt: '2026-08-20T10:00:00.000Z',
+      subject: '第一次 备份：初始配置',
+    },
+    paths: {
+      temporaryRoot: path.join(root, 'tmp'),
+      localHostRoot: path.join(root, 'tmp', 'vscode'),
+      baseHostRoot: path.join(root, 'tmp', 'base'),
+      repositoryHostRoot: path.join(root, 'repository', 'vscode'),
+    },
+    ...overrides,
+  });
+}
+
+async function writeHistorySnapshot(
+  targetRoot: string,
+  profiles: Array<{ id: string; name: string; isDefault: boolean }>,
+  files: Record<string, string>,
+): Promise<void> {
+  await mkdir(targetRoot, { recursive: true });
+  const manifest = {
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '2026-08-20T10:00:00.000Z',
+    profiles,
+    files: Object.fromEntries(Object.keys(files).map((relative) => [relative, 'hash'])),
+  };
+  await writeFile(path.join(targetRoot, 'manifest.json'), JSON.stringify(manifest));
+  for (const [relative, content] of Object.entries(files)) {
+    const target = path.join(targetRoot, ...relative.split('/'));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
+}
 
 function leaderMachine(): SchedulerMachine {
   return { ...createMachine({ enabled: true, configured: true, link: 'no-repository' }), isLeader: true };
