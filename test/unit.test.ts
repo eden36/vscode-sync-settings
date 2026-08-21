@@ -20,6 +20,7 @@ import {
   compareConfigurationRecords,
   createConfigurationRecord,
   hasEmbeddedCredentials,
+  isValidTagName,
   parseConfigurationRecord,
   parsePluginConfiguration,
   relateConfigurationRecords,
@@ -27,7 +28,7 @@ import {
 } from '../src/configuration-record';
 import { parseExtensionIds, selectMissingExtensionIds, selectRemovableExtensionIds } from '../src/extension-manifest';
 import { withFileLock } from '../src/file-lock';
-import { displayIcon, displayPhase, displayTone, formatRelativeSyncTime } from '../src/sidebar-status';
+import { displayIcon, displayPhase, displayTone } from '../src/sidebar-status';
 import { AiService } from '../src/ai';
 import { chooseStage } from '../src/pipeline/choose';
 import { testing as restoreTesting } from '../src/pipeline/restore';
@@ -1332,16 +1333,6 @@ test('关闭同步时状态不按告警呈现', () => {
   assert.equal(displayTone({ kind: 'disabled' }, 'in-sync'), 'muted');
 });
 
-test('格式化同步相对时间', () => {
-  const now = Date.UTC(2026, 7, 9, 12, 0, 0);
-  assert.equal(formatRelativeSyncTime('2026-08-09T12:00:00.000Z', now), '刚刚');
-  assert.equal(formatRelativeSyncTime('2026-08-09T11:37:00.000Z', now), '23分钟前');
-  assert.equal(formatRelativeSyncTime('2026-08-09T09:00:00.000Z', now), '3小时前');
-  assert.equal(formatRelativeSyncTime('2026-08-07T12:00:00.000Z', now), '2天前');
-  assert.equal(formatRelativeSyncTime('2026-08-09T12:01:00.000Z', now), '刚刚');
-  assert.equal(formatRelativeSyncTime('invalid', now), '时间无效');
-});
-
 test('推送失败留下的本地提交会被重新对齐并保留共同基准', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-divergence-'));
   const remote = path.join(root, 'remote.git');
@@ -2341,13 +2332,23 @@ test('云端历史只列出动过本宿主目录的提交', async () => {
     await service.stageHost('vscode');
     await service.commitAndPush(configuration, '第二次 备份：带空格 与中文标点，末尾');
 
-    const commits = await service.listCommits(configuration, 'vscode');
+    const commits = await service.refreshCommits(configuration, 'vscode');
     assert.deepEqual(commits.map((commit) => commit.subject), ['第二次 备份：带空格 与中文标点，末尾', '第一次 备份：初始配置']);
     assert.equal(/^[0-9a-f]{40}$/.test(commits[0]!.hash), true);
     assert.equal(commits[0]!.shortHash, commits[0]!.hash.slice(0, 7));
     assert.equal(Number.isNaN(Date.parse(commits[0]!.committedAt)), false);
-    assert.equal((await service.listCommits(configuration, 'vscode', 1)).length, 1);
-    assert.deepEqual(await service.listCommits({ ...configuration, branch: 'missing' }, 'vscode'), []);
+    assert.deepEqual(commits[0]!.tags, []);
+    assert.equal((await service.refreshCommits(configuration, 'vscode', 1)).length, 1);
+    assert.deepEqual(await service.refreshCommits({ ...configuration, branch: 'missing' }, 'vscode'), []);
+
+    // 本地已有 origin 跟踪分支时读缓存不联网，远端改成不可达也不影响列表。
+    const offline = await service.listCachedCommits(
+      { ...configuration, repositoryUrl: path.join(root, 'missing-remote.git') },
+      'vscode',
+    );
+    assert.deepEqual(offline?.map((commit) => commit.subject), ['第二次 备份：带空格 与中文标点，末尾', '第一次 备份：初始配置']);
+    // 没有本地跟踪分支时返回 undefined，界面据此显示加载中而不是「云端没有提交」。
+    assert.equal(await service.listCachedCommits({ ...configuration, branch: 'missing' }, 'vscode'), undefined);
 
     // 导出历史宿主树只取该提交里的内容，越界路径与其他宿主目录都不参与。
     const exported = path.join(root, 'exported');
@@ -2356,6 +2357,120 @@ test('云端历史只列出动过本宿主目录的提交', async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('标签新增后推到远端，删除后本地与远端都消失', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-tag-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const service = new ConfigurationRepositoryGitService(path.join(root, 'runtime'));
+    await service.prepare(configuration);
+    const hostRoot = path.join(service.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
+    await mkdir(hostRoot, { recursive: true });
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await service.stageHost('vscode');
+    await service.commitAndPush(configuration, '第一次 备份：初始配置');
+
+    const commits = await service.refreshCommits(configuration, 'vscode');
+    const target = commits[0]!;
+    await service.createTag(configuration, 'v1.0-stable', target.hash);
+    const listed = await runProcess('git', ['ls-remote', '--tags', remote]);
+    assert.equal(listed.stdout.includes('refs/tags/v1.0-stable'), true);
+
+    // 另一台机器的仓库缓存：标签必须能随刷新拉下来，否则打了标签别处看不到。
+    const other = new ConfigurationRepositoryGitService(path.join(root, 'runtime-other'));
+    assert.deepEqual((await other.refreshCommits(configuration, 'vscode'))[0]!.tags, ['v1.0-stable']);
+
+    await service.deleteTag(configuration, 'v1.0-stable');
+    assert.equal((await runProcess('git', ['ls-remote', '--tags', remote])).stdout.includes('refs/tags/'), false);
+    assert.deepEqual((await service.refreshCommits(configuration, 'vscode'))[0]!.tags, []);
+    // 远端删除后，别处的本地缓存也要在刷新时清掉那份标签。
+    assert.deepEqual((await other.refreshCommits(configuration, 'vscode'))[0]!.tags, []);
+    // 远端已经没有这个标签时删除不算失败，否则界面上会一直删不掉。
+    await service.deleteTag(configuration, 'v1.0-stable');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('非法标签名被拒绝且不产生任何 Git 引用', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-tag-invalid-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = {
+    repositoryUrl: remote,
+    branch: 'main',
+    gitUserName: '测试用户',
+    gitUserEmail: 'test@example.com',
+  };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const service = new ConfigurationRepositoryGitService(path.join(root, 'runtime'));
+    await service.prepare(configuration);
+    const hostRoot = path.join(service.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
+    await mkdir(hostRoot, { recursive: true });
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await service.stageHost('vscode');
+    await service.commitAndPush(configuration, '第一次 备份：初始配置');
+    const hash = (await service.refreshCommits(configuration, 'vscode'))[0]!.hash;
+
+    for (const name of ['-x', 'a..b', 'v 1', '.hidden', 'v1.lock', 'v'.repeat(101), '']) {
+      await assert.rejects(service.createTag(configuration, name, hash), /命名规则/);
+    }
+    await assert.rejects(service.createTag(configuration, 'v1', 'not-a-hash'), /提交标识无效/);
+    assert.equal((await runProcess('git', ['tag', '--list'], service.repositoryPath)).stdout, '');
+    // 合法名称必须放行，规则不能把正常标签一起拦掉。
+    await service.createTag(configuration, 'v1.0_beta-2/rc', hash);
+    assert.deepEqual((await service.refreshCommits(configuration, 'vscode'))[0]!.tags, ['v1.0_beta-2/rc']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('远端引用解析忽略 peeled 行，tip 与标签都没变才跳过 fetch', () => {
+  const parsed = gitTesting.parseRemoteRefs([
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main',
+    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/other',
+    'cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v1',
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1^{}',
+    '',
+  ].join('\n'));
+  assert.equal(parsed.branchTips.get('main'), 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(parsed.branchTips.size, 2);
+  assert.deepEqual([...parsed.tags], ['v1']);
+
+  const tip = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  assert.equal(gitTesting.needsFetch(parsed, 'main', tip, new Set(['v1'])), false);
+  assert.equal(gitTesting.needsFetch(parsed, 'main', tip, new Set()), true);
+  assert.equal(gitTesting.needsFetch(parsed, 'main', tip, new Set(['v2'])), true);
+  assert.equal(gitTesting.needsFetch(parsed, 'main', 'd'.repeat(40), new Set(['v1'])), true);
+  assert.equal(gitTesting.needsFetch(parsed, 'main', undefined, new Set(['v1'])), true);
+
+  assert.deepEqual(
+    gitTesting.parseDecoratedTags('HEAD -> refs/heads/main, tag: refs/tags/v1, refs/remotes/origin/main, tag: refs/tags/v2'),
+    ['v1', 'v2'],
+  );
+  assert.deepEqual(gitTesting.parseDecoratedTags('HEAD -> refs/heads/main'), []);
+  assert.deepEqual(gitTesting.parseDecoratedTags(''), []);
+});
+
+test('标签名称沿用分支的命名规则并另加长度上限', () => {
+  assert.equal(isValidTagName('v1.0-stable'), true);
+  assert.equal(isValidTagName('release/2026_08'), true);
+  assert.equal(isValidTagName(''), false);
+  assert.equal(isValidTagName('-v1'), false);
+  assert.equal(isValidTagName('.v1'), false);
+  assert.equal(isValidTagName('v1..2'), false);
+  assert.equal(isValidTagName('v 1'), false);
+  assert.equal(isValidTagName('v1.lock'), false);
+  assert.equal(isValidTagName('v'.repeat(100)), true);
+  assert.equal(isValidTagName('v'.repeat(101)), false);
 });
 
 test('所选提交没有本宿主快照时中止还原且不清空仓库目录', async () => {
@@ -2494,6 +2609,7 @@ function restoreContext(root: string, overrides: Partial<SyncContext> = {}): Syn
       shortHash: 'abcdefg',
       committedAt: '2026-08-20T10:00:00.000Z',
       subject: '第一次 备份：初始配置',
+      tags: [],
     },
     paths: {
       temporaryRoot: path.join(root, 'tmp'),

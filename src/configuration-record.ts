@@ -35,6 +35,11 @@ export function isValidBranch(branch: string): boolean {
     && !branch.includes('//');
 }
 
+/** 标签与分支的 ref 命名规则一致，长度另按 100 收紧。 */
+export function isValidTagName(name: string): boolean {
+  return name.length <= 100 && isValidBranch(name);
+}
+
 export function resolveRepositoryUrl(fromSecret: string | undefined, stored: StoredConfiguration): {
   repositoryUrl: string;
   persisted: Omit<PluginConfiguration, 'repositoryUrl' | 'mode' | 'pollIntervalSeconds' | 'debounceSeconds'>;

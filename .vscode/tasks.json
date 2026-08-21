@@ -2,6 +2,17 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "准备调试目录",
+      "type": "shell",
+      "command": "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '${workspaceFolder}/.debug/user-data' | Out-Null\"",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "close": true
+      }
+    },
+    {
       "label": "构建插件",
       "type": "npm",
       "script": "build",
@@ -12,6 +23,19 @@
         "clear": true
       },
       "group": "build"
+    },
+    {
+      "label": "准备并构建插件",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "准备调试目录",
+        "构建插件"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
     }
   ]
 }

@@ -76,13 +76,3 @@ export function blockReasonLabel(reason: BlockReason): string {
     case 'exclusive-lock': return '另一窗口正在执行同步，稍后将自动重试。';
   }
 }
-
-export function formatRelativeSyncTime(value: string, now = Date.now()): string {
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) return '时间无效';
-  const elapsed = Math.max(0, now - timestamp);
-  if (elapsed < 60_000) return '刚刚';
-  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}分钟前`;
-  if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}小时前`;
-  return `${Math.floor(elapsed / 86_400_000)}天前`;
-}

@@ -13,7 +13,7 @@
       "outFiles": [
         "${workspaceFolder}/dist/**/*.js"
       ],
-      "preLaunchTask": "构建插件"
+      "preLaunchTask": "准备并构建插件"
     }
   ]
 }

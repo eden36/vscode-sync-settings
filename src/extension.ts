@@ -3,8 +3,9 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
+import { isValidTagName } from './configuration-record';
 import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
-import { ConfigurationRepositoryGitService, RepositoryCommit } from './git-service';
+import { ConfigurationRepositoryGitService, MAX_COMMIT_LIST, RepositoryCommit } from './git-service';
 import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
@@ -15,8 +16,8 @@ import {
   SchedulerEvent,
   SchedulerMachine,
 } from './scheduler';
-import { SidebarProvider } from './sidebar';
-import { displayIcon, displayPhase, formatRelativeSyncTime, stageLabel } from './sidebar-status';
+import { HISTORY_PAGE_SIZE, SidebarProvider } from './sidebar';
+import { displayIcon, displayPhase, stageLabel } from './sidebar-status';
 import { SyncEngine } from './sync-engine';
 import { RuntimeStatus, SyncOutcome } from './types';
 
@@ -48,6 +49,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => machine.enabled,
     async (enabled) => setEnabled(enabled),
     async (resolution) => applyResolution(resolution),
+    {
+      load: async (limit, refresh) => loadHistory(limit, refresh),
+      restore: async (hash) => restoreFromHistory(hash),
+      createTag: async (hash) => createHistoryTag(hash),
+      deleteTag: async (hash, tag) => deleteHistoryTag(hash, tag),
+    },
   );
   // 视图必须在任何 IO 之前注册：初始化要抢跨窗口文件锁、写 SecretStorage 和宿主设置，
   // 多窗口同时启动时可能等上数秒，注册晚了这段时间里点开侧边栏只有一片空白。
@@ -101,6 +108,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let dirtyDocumentCount = countDirtyDocuments(environment.userDataPath);
   let lastRepositoryUrl = configurationStore.get().repositoryUrl;
   let lastBranch = configurationStore.get().branch;
+  // 历史页面当前列出的提交与条数：Webview 只回传标识，实体与分页状态都留在这边。
+  let historyCommits: RepositoryCommit[] = [];
+  let historyLimit = HISTORY_PAGE_SIZE;
+  let historyBusy = false;
 
   // 同步全过程不弹通知，状态只落在状态栏和侧边栏，避免打断用户。
   const statusBar = vscode.window.createStatusBarItem('profileGitSync.status', vscode.StatusBarAlignment.Right, 100);
@@ -318,62 +329,123 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispatch({ type: 'sync-requested', source: 'user', adoptCloud: true });
   };
 
-  const showHistory = async () => {
+  const openHistory = async () => {
     if (!machine.enabled) {
       void vscode.window.showInformationMessage('配置同步已关闭，请先在侧边栏开启同步。');
       return;
     }
-    const configuration = configurationStore.get();
-    if (!configuration.repositoryUrl) {
+    if (!configurationStore.get().repositoryUrl) {
       applyStatus({ message: '请填写 Git 仓库地址。' }, false);
       return;
     }
+    // 页面打开后由侧边栏发起首次加载：面板从未打开过时视图还要先解析，加载时机只能由那边决定。
+    await sidebar.openHistoryPage();
+  };
 
+  const publishHistory = async (commits: RepositoryCommit[], limit: number, refreshing: boolean) => {
+    historyCommits = commits;
+    historyLimit = limit;
+    await sidebar.postHistoryList(
+      commits.map((commit) => ({
+        hash: commit.hash,
+        shortHash: commit.shortHash,
+        subject: commit.subject || '（无提交说明）',
+        committedAt: commit.committedAt,
+        tags: commit.tags,
+      })),
+      // 取满了才可能还有更早的提交；再往上取由 git-service 的上限收口。
+      { refreshing, hasMore: commits.length >= limit && limit < MAX_COMMIT_LIST },
+    );
+  };
+
+  /** 先出本地缓存再后台刷新：本地已有跟踪分支时用户不必等一次完整网络往返。 */
+  const loadHistory = async (limit: number, refresh: boolean) => {
+    const configuration = configurationStore.get();
+    if (!configuration.repositoryUrl) {
+      await sidebar.postHistoryError('请填写 Git 仓库地址。');
+      return;
+    }
     try {
-      let commits: RepositoryCommit[] = [];
-      // 取历史要动本地仓库并联网，与同步互斥。
-      const listed = await coordinator!.runExclusive(async () => {
-        await configurationRepository.prepare(configuration);
-        commits = await configurationRepository.listCommits(configuration, environment.kind);
+      let cached: RepositoryCommit[] | undefined;
+      const acquired = await coordinator!.runExclusive(async () => {
+        cached = await configurationRepository.listCachedCommits(configuration, environment.kind, limit);
       });
-      if (!listed) {
-        applyStatus({ message: '另一窗口正在执行同步，请稍后重试查看历史。' }, false);
+      if (!acquired) {
+        await sidebar.postHistoryError('另一窗口正在执行同步，请稍后重试查看历史。');
         return;
       }
-      if (!commits.length) {
-        void vscode.window.showInformationMessage('云端还没有本宿主的配置提交。');
+      // 没有本地缓存时不推列表，页面停在加载中，避免先闪一次「云端还没有提交」。
+      if (cached) await publishHistory(cached, limit, refresh);
+      if (!refresh) {
+        if (!cached) await sidebar.postHistoryError('本地还没有云端记录的缓存，请点刷新重新获取。');
         return;
       }
 
-      const picked = await vscode.window.showQuickPick(
-        commits.map((commit) => ({
-          label: commit.subject || '（无提交说明）',
-          description: formatRelativeSyncTime(commit.committedAt),
-          detail: `${commit.shortHash} · ${new Date(commit.committedAt).toLocaleString()}`,
-          commit,
-        })),
-        { title: '云端提交历史', placeHolder: '选择要还原到的提交' },
-      );
-      if (!picked) return;
+      let refreshed: RepositoryCommit[] = [];
+      const refreshedLock = await coordinator!.runExclusive(async () => {
+        refreshed = await configurationRepository.refreshCommits(configuration, environment.kind, limit);
+      });
+      if (!refreshedLock) {
+        await sidebar.postHistoryError('另一窗口正在执行同步，云端记录暂未刷新。');
+        return;
+      }
+      await publishHistory(refreshed, limit, false);
+    } catch (error) {
+      // 查看历史失败不影响同步本身，不升级为同步失败状态。
+      await sidebar.postHistoryError(error instanceof Error ? error.message : String(error));
+    }
+  };
 
-      const backupOnly = configuration.mode === 'backup';
-      const confirmed = await vscode.window.showWarningMessage(
-        `是否还原到 ${picked.commit.shortHash}？`,
-        {
-          modal: true,
-          detail: [
-            '将以该提交的配置覆盖本机，本机原配置会先备份到扩展运行目录；该提交清单里没有的扩展会在本机卸载。',
-            '随后在远端追加一条新的还原提交，远端已有历史不会被改写。',
-            ...(backupOnly ? ['当前是备份模式，平时不会写回本机，但还原会直接覆盖本机配置与扩展。'] : []),
-          ].join('\n'),
-        },
-        '还原',
-      );
-      if (confirmed !== '还原') return;
+  /** 标签操作共用：占住独占锁执行，成功后只读本地重渲染列表，不再联网。 */
+  const runHistoryOperation = async (operation: () => Promise<void>, lockBusyMessage: string) => {
+    historyBusy = true;
+    await sidebar.postHistoryBusy(true);
+    try {
+      const acquired = await coordinator!.runExclusive(operation);
+      if (!acquired) {
+        await sidebar.postHistoryError(lockBusyMessage);
+        return;
+      }
+      await loadHistory(historyLimit, false);
+    } catch (error) {
+      await sidebar.postHistoryError(error instanceof Error ? error.message : String(error));
+    } finally {
+      historyBusy = false;
+      await sidebar.postHistoryBusy(false);
+    }
+  };
 
+  const restoreFromHistory = async (hash: string) => {
+    if (historyBusy) return;
+    // Webview 只回传标识，提交实体一律以扩展这边列出来的那份为准。
+    const target = historyCommits.find((commit) => commit.hash === hash);
+    if (!target) {
+      await sidebar.postHistoryError('该提交已不在当前列表中，请刷新后重试。');
+      return;
+    }
+    const backupOnly = configurationStore.get().mode === 'backup';
+    const confirmed = await vscode.window.showWarningMessage(
+      `是否还原到 ${target.shortHash}？`,
+      {
+        modal: true,
+        detail: [
+          '将以该提交的配置覆盖本机，本机原配置会先备份到扩展运行目录；该提交清单里没有的扩展会在本机卸载。',
+          '随后在远端追加一条新的还原提交，远端已有历史不会被改写。',
+          ...(backupOnly ? ['当前是备份模式，平时不会写回本机，但还原会直接覆盖本机配置与扩展。'] : []),
+        ].join('\n'),
+      },
+      '还原',
+    );
+    if (confirmed !== '还原') return;
+
+    historyBusy = true;
+    await sidebar.postHistoryBusy(true);
+    // 还原的进度与结果显示在主页面的状态区，先切回去用户才看得到。
+    await sidebar.closeHistoryPage();
+    try {
       let outcome: SyncOutcome | undefined;
       const acquired = await coordinator!.runExclusive(async () => {
-        outcome = await engine.restoreCommit(picked.commit);
+        outcome = await engine.restoreCommit(target);
         // 写回后必须刷新指纹，否则本机改动检测会把还原结果当成新改动，再空跑一轮同步；
         // 本机在还原期间被改过时保留旧指纹，让本机检测的下一拍立刻发现并同步那次改动。
         if (outcome?.blockReason !== 'local-changed') localFingerprint = await adapter.fingerprint();
@@ -384,13 +456,60 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       dispatch({ type: 'sync-finished', outcome });
       if (outcome?.ok) {
-        applyStatus({ message: `已还原到 ${picked.commit.shortHash} 并推送新提交。` }, coordinator!.isLeader);
+        applyStatus({ message: `已还原到 ${target.shortHash} 并推送新提交。` }, coordinator!.isLeader);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       applyStatus({ message }, false);
       dispatch({ type: 'sync-failed', message });
+    } finally {
+      historyBusy = false;
+      await sidebar.postHistoryBusy(false);
     }
+  };
+
+  const createHistoryTag = async (hash: string) => {
+    if (historyBusy) return;
+    const target = historyCommits.find((commit) => commit.hash === hash);
+    if (!target) {
+      await sidebar.postHistoryError('该提交已不在当前列表中，请刷新后重试。');
+      return;
+    }
+    const existing = new Set(historyCommits.flatMap((commit) => commit.tags));
+    const input = await vscode.window.showInputBox({
+      title: `为 ${target.shortHash} 新增标签`,
+      prompt: '标签会推送到远端仓库，其他机器刷新历史后也能看到。',
+      validateInput: (value) => {
+        const name = value.trim();
+        if (!name) return '请输入标签名称。';
+        if (!isValidTagName(name)) return '标签名称只能包含字母、数字与 . _ / -，且不能以 - 或 . 开头。';
+        if (existing.has(name)) return '该标签已存在。';
+        return undefined;
+      },
+    });
+    const name = input?.trim();
+    if (!name) return;
+    await runHistoryOperation(
+      async () => configurationRepository.createTag(configurationStore.get(), name, target.hash),
+      '另一窗口正在执行同步，请稍后重试新增标签。',
+    );
+  };
+
+  const deleteHistoryTag = async (hash: string, tag: string) => {
+    if (historyBusy) return;
+    const confirmed = await vscode.window.showWarningMessage(
+      `是否删除标签 ${tag}？`,
+      {
+        modal: true,
+        detail: '会同时删除远端仓库中的该标签，其他机器刷新历史后也会消失。提交本身与配置内容不受影响。',
+      },
+      '删除',
+    );
+    if (confirmed !== '删除') return;
+    await runHistoryOperation(
+      async () => configurationRepository.deleteTag(configurationStore.get(), tag),
+      '另一窗口正在执行同步，请稍后重试删除标签。',
+    );
   };
 
   const rebuildRepository = async () => {
@@ -509,7 +628,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       requestSync('user');
     }),
     vscode.commands.registerCommand('profileGitSync.toggleEnabled', () => void setEnabled(!machine.enabled)),
-    vscode.commands.registerCommand('profileGitSync.showHistory', () => void showHistory()),
+    vscode.commands.registerCommand('profileGitSync.showHistory', () => void openHistory()),
     vscode.commands.registerCommand('profileGitSync.rebuildRepository', () => void rebuildRepository()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
     vscode.workspace.onDidChangeConfiguration((event) => {
