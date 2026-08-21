@@ -8,17 +8,19 @@ import { Stage, SyncContext } from './types';
  * 只报告发生了什么，链路状态与最终阶段由调度层根据 SyncOutcome 决定。
  */
 export async function runPipeline(context: SyncContext, stages: Stage[]): Promise<SyncOutcome> {
-  const { updateStatus } = context.dependencies;
+  const { isCancellationRequested, updateStatus } = context.dependencies;
   for (const stage of stages) {
+    if (isCancellationRequested()) return { ok: false, cancelled: true };
     updateStatus({ sync: { kind: 'running', stage: stage.name } });
     const outcome = await stage.run(context);
+    if (isCancellationRequested()) return { ok: false, cancelled: true };
     if (outcome.kind === 'continue') continue;
 
     updateStatus({ message: outcome.message ?? blockReasonLabel(outcome.reason) });
-    // 不同源无法靠重试解决，必须交回调度层询问用户，与其它可自动恢复的阻塞区分开。
-    return outcome.reason === 'unrelated'
-      ? { ok: false, unrelated: true, blockReason: 'unrelated' }
-      : { ok: false, retry: true, blockReason: outcome.reason };
+    // 不同源与「两边都改了」都无法靠重试解决，必须交回调度层询问用户，与其它可自动恢复的阻塞区分开。
+    if (outcome.reason === 'unrelated') return { ok: false, unrelated: true, blockReason: 'unrelated' };
+    if (outcome.reason === 'both-changed') return { ok: false, bothChanged: true, blockReason: 'both-changed' };
+    return { ok: false, retry: true, blockReason: outcome.reason };
   }
 
   const report = context.report;

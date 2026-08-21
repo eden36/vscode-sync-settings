@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { findPotentialSecrets } from '../secret-scanner';
 import { readManifest } from '../snapshot-conflict';
-import { applyStage, extensionsStage, prepareStage, pullStage, pushStage } from './stages';
+import { applyStage, extensionsStage, finalizeStage, prepareStage, pullStage, pushStage, snapshotStage } from './stages';
 import { requireValue, Stage, StageOutcome, SyncContext } from './types';
 
 const COMMIT_SUBJECT_LIMIT = 120;
@@ -39,6 +39,9 @@ const exportHistoryStage: Stage = {
 
     const subject = target.subject.slice(0, COMMIT_SUBJECT_LIMIT);
     context.artifacts.commitMessage = subject ? `还原到 ${target.shortHash}：${subject}` : `还原到 ${target.shortHash}`;
+    // 历史快照取代了「本机这一方」：仓库内容由它整份替换，后续按采用本机处理，照常推送与写回。
+    context.artifacts.choice = 'local';
+    context.report.snapshotChoice = 'local';
 
     await fs.rm(repositoryHostRoot, { recursive: true, force: true });
     await fs.mkdir(path.dirname(repositoryHostRoot), { recursive: true });
@@ -62,14 +65,19 @@ const restorePushStage: Stage = {
   },
 };
 
-/** 还原流程：对齐远端 → 导出历史快照 → 写回本机与扩展 → 在远端 tip 上追加一条新提交。 */
+/**
+ * 还原流程：对齐远端 → 导出历史快照 → 写回本机与扩展 → 在远端 tip 上追加一条新提交 → 记录基准。
+ * 开头的 snapshot 只为拿到本机指纹与清单（写回前的二次确认、finalize 的基准都要用），不参与判定。
+ */
 export const RESTORE_STAGES: Stage[] = [
+  snapshotStage,
   prepareStage,
   pullStage,
   exportHistoryStage,
   applyStage,
   extensionsStage,
   restorePushStage,
+  finalizeStage,
 ];
 
 export const testing = { exportHistoryStage, restorePushStage };

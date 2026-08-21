@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
@@ -23,6 +24,7 @@ export interface SynchronizeOptions {
  */
 export class SyncEngine {
   private running = false;
+  private cancellationRequested = false;
   private readonly dependencies: SyncDependencies;
 
   public constructor(
@@ -42,9 +44,11 @@ export class SyncEngine {
       ai,
       runtimeState,
       windowSafety,
+      isCancellationRequested: () => this.cancellationRequested,
       updateStatus,
       // 与 ProfileAdapter 的 backups 目录分开存放，避免被那边的保留策略清理。
       conflictBackupRoot: path.join(environment.runtimePath, 'conflict-backups'),
+      deviceName: os.hostname(),
     };
   }
 
@@ -52,29 +56,52 @@ export class SyncEngine {
     await this.runtimeState.update({ cloudAdoptPending: true });
   }
 
+  /**
+   * 当前安全操作结束后停止，不强制终止 Git 或扩展安装进程。
+   * 本轮可能还在抢独占锁、尚未真正开始，因此停止意图必须留到下一次 synchronize 才消费。
+   */
+  public requestStop(): void {
+    this.cancellationRequested = true;
+  }
+
+  /** 重新开启同步时清除遗留的停止意图，否则新一轮会被上一次的停止直接取消。 */
+  public clearStop(): void {
+    this.cancellationRequested = false;
+  }
+
   public async synchronize(options: SynchronizeOptions = {}): Promise<SyncOutcome | undefined> {
     if (this.running) return undefined;
+    if (this.cancellationRequested) {
+      // 停止意图在这一轮就算兑现，必须就地清除；否则一旦某条开关路径漏掉 clearStop，本窗口之后每一轮都会被取消。
+      this.cancellationRequested = false;
+      return { ok: false, cancelled: true };
+    }
     this.running = true;
     const configuration = this.configurationStore.get();
+    const backupOnly = configuration.mode === 'backup';
     let temporaryRoot: string | undefined;
     try {
       if (!configuration.repositoryUrl) {
         this.updateStatus({ message: '请填写 Git 仓库地址。' });
         return { ok: false };
       }
-      if (options.adoptCloud) await this.beginCloudAdopt();
+      if (options.adoptCloud && !backupOnly) await this.beginCloudAdopt();
 
       const blocked = await this.blockedByWindows();
       if (blocked) return blocked;
 
       // 其他窗口可能刚标记过重建，必须读共享文件的最新值而不是本窗口缓存。
       await this.runtimeState.reload();
-      const backupOnly = configuration.mode === 'backup';
-      // 备份模式永不写回本机，采用云端无从谈起；置为 false 才能保证本机内容仍要过凭据扫描。
+      // 备份模式永不写回本机，采用云端无从谈起；标记留着会在切回同步模式的第一轮整包覆盖本机，必须就地清除。
+      if (backupOnly && this.runtimeState.get().cloudAdoptPending) {
+        await this.runtimeState.update({ cloudAdoptPending: false });
+      }
       const adoptCloud = !backupOnly && (options.adoptCloud === true || this.runtimeState.get().cloudAdoptPending);
+      // 用户对「两边都改了」的选择存在共享状态里：可能是别的窗口点的，也可能是上一轮推送失败后留下的。
+      const resolution = backupOnly ? undefined : this.runtimeState.get().pendingResolution;
 
       temporaryRoot = await this.prepareTemporaryRoot();
-      const context = this.buildContext(configuration, temporaryRoot, { adoptCloud });
+      const context = this.buildContext(configuration, temporaryRoot, { adoptCloud, ...(resolution ? { resolution } : {}) });
       return await runPipeline(context, backupOnly ? BACKUP_STAGES : SYNC_STAGES);
     } catch (error) {
       this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
@@ -143,17 +170,17 @@ export class SyncEngine {
   private buildContext(
     configuration: PluginConfiguration,
     temporaryRoot: string,
-    options: { adoptCloud: boolean; restoreTarget?: RepositoryCommit },
+    options: { adoptCloud: boolean; resolution?: 'local' | 'cloud'; restoreTarget?: RepositoryCommit },
   ): SyncContext {
     return {
       dependencies: this.dependencies,
       configuration,
       adoptCloud: options.adoptCloud,
+      ...(options.resolution ? { resolution: options.resolution } : {}),
       ...(options.restoreTarget ? { restoreTarget: options.restoreTarget } : {}),
       paths: {
         temporaryRoot,
         localHostRoot: path.join(temporaryRoot, this.environment.kind),
-        baseHostRoot: path.join(temporaryRoot, 'base'),
         repositoryHostRoot: path.join(
           this.dependencies.git.repositoryPath,
           '.profile-git-sync',

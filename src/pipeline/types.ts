@@ -10,6 +10,7 @@ import {
   LinkState,
   PluginConfiguration,
   RuntimeStatus,
+  SnapshotChoice,
   SnapshotManifest,
   StageName,
   SyncReport,
@@ -23,15 +24,17 @@ export interface SyncDependencies {
   ai: AiService;
   runtimeState: RuntimeStateStore;
   windowSafety: () => Promise<WindowSafetySnapshot>;
+  isCancellationRequested: () => boolean;
   updateStatus: (patch: Partial<RuntimeStatus>) => void;
   conflictBackupRoot: string;
+  /** 设备名，写入提交信息前缀，便于在多台机器间区分改动来源。 */
+  deviceName: string;
 }
 
 /** 一轮同步涉及的目录，全部在进入流程前算好，stage 不再自行拼路径。 */
 export interface SyncPaths {
   temporaryRoot: string;
   localHostRoot: string;
-  baseHostRoot: string;
   repositoryHostRoot: string;
 }
 
@@ -40,8 +43,12 @@ export interface SyncArtifacts {
   localManifest?: SnapshotManifest;
   pull?: PullResult;
   strategy?: CloudAdoptDecision;
-  /** 远端是否已有本宿主的快照；决定本轮是三方合并还是用本机内容初始化。 */
+  /** 远端是否已有本宿主的快照；决定本轮是与云端比较还是用本机内容初始化。 */
   remoteExists?: boolean;
+  /** 本轮采用了哪一方的快照；决定后续是否推送与写回。 */
+  choice?: Exclude<SnapshotChoice, 'conflict'>;
+  /** 轮初的本机指纹，写回前用它确认本机没有在同步期间被改动。 */
+  localFingerprint?: string;
   restore?: RestoreResult;
   /** 预置的提交说明；有值时不再调用 AI 生成（还原历史提交时使用）。 */
   commitMessage?: string;
@@ -51,6 +58,8 @@ export interface SyncContext {
   readonly dependencies: SyncDependencies;
   readonly configuration: PluginConfiguration;
   readonly adoptCloud: boolean;
+  /** 用户对「两边都改了」的选择，本轮据此直接落地，不再询问。 */
+  readonly resolution?: 'local' | 'cloud';
   /** 本轮要还原的历史提交，只有还原流程会设置。 */
   readonly restoreTarget?: RepositoryCommit;
   readonly paths: SyncPaths;

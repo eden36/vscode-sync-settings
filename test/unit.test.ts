@@ -8,14 +8,14 @@ import { MultiWindowCoordinator } from '../src/coordinator';
 import { ConfigurationStore } from '../src/configuration';
 import { parseUtilityModelSetting } from '../src/ai-model';
 import { fallbackCommitMessage } from '../src/sync-fallback';
-import { ConfigurationRepositoryGitService } from '../src/git-service';
+import { ConfigurationRepositoryGitService, testing as gitTesting } from '../src/git-service';
 import { resolveHostStoragePaths } from '../src/host-paths';
 import { ProfileAdapter, testing } from '../src/profile-adapter';
 import { runProcess } from '../src/process';
-import { parseRuntimeState, RuntimeStateStore } from '../src/runtime-state';
+import { DEFAULT_RUNTIME_STATE, parseRuntimeState, RuntimeStateStore } from '../src/runtime-state';
 import { containsPotentialSecret, findPotentialSecrets } from '../src/secret-scanner';
 import { atomicWriteJson, readJsonFile } from '../src/json-store';
-import { classifyThreeWay, parseManifest, resolveConflictFallback } from '../src/snapshot-conflict';
+import { parseManifest, readManifest, snapshotDigest } from '../src/snapshot-conflict';
 import {
   compareConfigurationRecords,
   createConfigurationRecord,
@@ -29,19 +29,22 @@ import { parseExtensionIds, selectMissingExtensionIds, selectRemovableExtensionI
 import { withFileLock } from '../src/file-lock';
 import { displayIcon, displayPhase, displayTone, formatRelativeSyncTime } from '../src/sidebar-status';
 import { AiService } from '../src/ai';
-import { mergeStage } from '../src/pipeline/merge';
+import { chooseStage } from '../src/pipeline/choose';
 import { testing as restoreTesting } from '../src/pipeline/restore';
 import { runPipeline } from '../src/pipeline/pipeline';
 import { BACKUP_STAGES, SYNC_STAGES, testing as stageTesting } from '../src/pipeline/stages';
 import { Stage, SyncContext, SyncDependencies } from '../src/pipeline/types';
 import { createMachine, reduce, SchedulerEvent, SchedulerMachine } from '../src/scheduler';
+import { SyncEngine } from '../src/sync-engine';
 import { finalSyncMessage } from '../src/sync-message';
-import { decideCloudAdopt } from '../src/sync-strategy';
+import { decideCloudAdopt, decideSnapshotChoice } from '../src/sync-strategy';
 import {
   createSyncReport,
   DEFAULT_CONFIGURATION,
   PluginConfiguration,
   RuntimeStatus,
+  SnapshotManifest,
+  SyncBaseline,
   SyncConfiguration,
   SyncState,
 } from '../src/types';
@@ -74,7 +77,7 @@ test('同一运行目录只选出一个 leader', async () => {
   try {
     await Promise.all([first.start(), second.start()]);
     assert.equal(Number(first.isLeader) + Number(second.isLeader), 1);
-    assert.equal(await first.activeWindowCount(), 2);
+    assert.equal((await first.windowSafety()).activeWindows, 2);
   } finally {
     await Promise.all([first.dispose(), second.dispose()]);
     await rm(root, { recursive: true, force: true });
@@ -278,11 +281,14 @@ test('扩展在启动后激活并固定运行于 UI extension host', async () =>
     displayName?: string;
     activationEvents?: string[];
     extensionKind?: string[];
+    contributes?: { configuration?: { properties?: Record<string, unknown> } };
   };
   assert.equal(manifest.name, 'my-setting-sync');
   assert.equal(manifest.displayName, 'My Setting Sync');
   assert.equal(manifest.activationEvents?.includes('onStartupFinished'), true);
+  assert.equal(manifest.activationEvents?.includes('onView:profileGitSync.sidebar'), true);
   assert.deepEqual(manifest.extensionKind, ['ui']);
+  assert.equal(manifest.contributes?.configuration?.properties?.['profileGitSync.includeProfileAssociations'], undefined);
 });
 
 test('默认与命名 Profile 解析到同一扩展运行目录', () => {
@@ -322,6 +328,81 @@ test('按 location 枚举命名 Profile，并恢复文件修改和删除', async
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('工作区关联不进快照，恢复 Profile 结构也不覆盖本机关联', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-associations-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const storagePath = path.join(userDataPath, 'globalStorage', 'storage.json');
+  const associations = {
+    workspaces: { 'file:///d%3A/local': '__default__profile__' },
+    emptyWindows: { '1787144855726': '__default__profile__' },
+  };
+  await mkdir(runtimePath, { recursive: true });
+  await writeFile(storagePath, JSON.stringify({ userDataProfiles: [], profileAssociations: associations }));
+  await writeFile(path.join(userDataPath, 'settings.json'), '{"editor.fontSize": 15}');
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    // 工作区路径和空窗口 id 都是本机专属数据，进了快照就会让两台机器永远互相判成有改动。
+    const manifest = await adapter.createSnapshot(snapshot);
+    assert.equal('profileAssociations' in manifest, false);
+    const written = JSON.parse(await readFile(path.join(snapshot, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal('profileAssociations' in written, false);
+
+    await writeFile(path.join(snapshot, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      profiles: [...manifest.profiles, { id: 'abc123', name: '开发', isDefault: false }],
+      profileMetadata: [{ location: 'abc123', name: '开发' }],
+      profileAssociations: { workspaces: { 'file:///d%3A/remote': '__default__profile__' } },
+    }, null, 2));
+    const restored = await adapter.restoreSnapshot(snapshot, true);
+    assert.equal(restored.structuralApplied, true);
+    const storage = JSON.parse(await readFile(storagePath, 'utf8')) as Record<string, unknown>;
+    assert.deepEqual(storage.profileAssociations, associations);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照与指纹按 LF 归一，换行符差异不算改动', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-eol-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const settings = '{\r\n  "editor.fontSize": 15\r\n}\r\n';
+  const snippet = '{\r\n  "循环": { "prefix": "for" }\r\n}\r\n';
+  await Promise.all([mkdir(runtimePath, { recursive: true }), mkdir(path.join(userDataPath, 'snippets'), { recursive: true })]);
+  await writeFile(path.join(userDataPath, 'settings.json'), settings);
+  await writeFile(path.join(userDataPath, 'snippets', 'markdown.json'), snippet);
+  const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+  const snapshot = path.join(root, 'snapshot');
+  try {
+    const manifest = await adapter.createSnapshot(snapshot);
+    assert.equal(
+      manifest.files['profiles/default/settings.json'],
+      testing.sha256(Buffer.from(settings.replaceAll('\r\n', '\n'), 'utf8')),
+    );
+    assert.equal(
+      manifest.files['profiles/default/snippets/markdown.json'],
+      testing.sha256(Buffer.from(snippet.replaceAll('\r\n', '\n'), 'utf8')),
+    );
+    assert.equal(await readFile(path.join(snapshot, 'profiles', 'default', 'settings.json'), 'utf8'), settings.replaceAll('\r\n', '\n'));
+
+    // 只把本机文件换成 LF，指纹不应变化，否则两台机器的 Git 换行符配置不同就会互相判成有改动。
+    const before = await adapter.fingerprint();
+    await writeFile(path.join(userDataPath, 'settings.json'), settings.replaceAll('\r\n', '\n'));
+    await writeFile(path.join(userDataPath, 'snippets', 'markdown.json'), snippet.replaceAll('\r\n', '\n'));
+    assert.equal(await adapter.fingerprint(), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('换行符归一只改写 CRLF，其余内容原样返回', () => {
+  assert.equal(testing.normalizeLineEndings(Buffer.from('a\r\nb\r\n', 'utf8')).toString('utf8'), 'a\nb\n');
+  const untouched = Buffer.from('a\rb\nc', 'utf8');
+  assert.equal(testing.normalizeLineEndings(untouched), untouched);
 });
 
 test('快照采集宿主级已安装扩展清单，只保留标识且不写回本机', async () => {
@@ -377,6 +458,48 @@ test('未提供扩展清单路径时快照不含扩展信息', async () => {
     const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
     const manifest = await adapter.createSnapshot(path.join(root, 'snapshot'));
     assert.equal(manifest.files['extensions.json'], undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('旧快照里的 Profile 级扩展清单不写回本机', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-adapter-legacy-extensions-'));
+  const userDataPath = path.join(root, 'User');
+  const runtimePath = path.join(userDataPath, 'globalStorage', 'local.profile-git-sync');
+  const snapshot = path.join(root, 'snapshot');
+  await mkdir(runtimePath, { recursive: true });
+  await mkdir(path.join(snapshot, 'profiles', 'default'), { recursive: true });
+  await writeFile(path.join(userDataPath, 'settings.json'), '{}');
+  try {
+    // 0.1.x 版本的云端快照里带 Profile 级 extensions.json，记录的是本机启用状态，跨机器写回会引用本机没有的扩展。
+    await writeFile(path.join(snapshot, 'profiles', 'default', 'extensions.json'), '[{"identifier":{"id":"stale.one"}}]');
+    await writeFile(path.join(snapshot, 'profiles', 'default', 'settings.json'), '{"editor.fontSize": 21}');
+    await writeFile(path.join(snapshot, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      host: 'vscode',
+      createdAt: '',
+      profiles: [{ id: 'default', name: '默认', isDefault: true }],
+      files: { 'profiles/default/extensions.json': 'x', 'profiles/default/settings.json': 'y' },
+    }));
+
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const restored = await adapter.restoreSnapshot(snapshot, false);
+    assert.equal(await readFile(path.join(userDataPath, 'settings.json'), 'utf8'), '{"editor.fontSize": 21}');
+    assert.equal(restored.changedFiles.some((file) => file.endsWith('extensions.json')), false);
+    await assert.rejects(() => readFile(path.join(userDataPath, 'extensions.json'), 'utf8'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照清单不是 JSON 时给出中文错误', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-manifest-'));
+  try {
+    await writeFile(path.join(root, 'manifest.json'), '{ 不是 JSON');
+    await assert.rejects(() => readManifest(root), /快照清单不是有效的 JSON/);
+    await rm(path.join(root, 'manifest.json'));
+    await assert.rejects(() => readManifest(root), /未找到快照清单/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -690,6 +813,12 @@ test('配置同步仓库 Git 操作不会修改当前项目仓库', async () => 
   }
 });
 
+test('Git 错误消息脱敏远程仓库地址且空地址不改写原文', () => {
+  const url = 'git@github.com:user/settings.git';
+  assert.equal(gitTesting.redact(`fatal: ${url} Permission denied`, url), 'fatal: <远程仓库> Permission denied');
+  assert.equal(gitTesting.redact('fatal: Permission denied', ''), 'fatal: Permission denied');
+});
+
 test('扩展产物不包含 jsonc-parser 的未打包相对加载', async () => {
   const bundle = await readFile(path.join(process.cwd(), 'dist', 'extension.js'), 'utf8');
   assert.doesNotMatch(bundle, /require\w*\(["']\.\/impl\//);
@@ -707,33 +836,6 @@ test('解析 chat.utilitySmallModel 的 vendor/id 设置', () => {
 test('AI 不可用时仍可生成稳定的提交信息', () => {
   assert.equal(fallbackCommitMessage('vscode'), 'chore(sync): 同步 VS Code 配置');
   assert.equal(fallbackCommitMessage('cursor'), 'chore(sync): 同步 Cursor 配置');
-});
-
-test('冲突回退按本机优先并保证收敛到实际存在的一方', () => {
-  assert.equal(resolveConflictFallback('local', 'cloud'), 'local');
-  assert.equal(resolveConflictFallback(undefined, 'cloud'), 'cloud');
-  assert.equal(resolveConflictFallback('local', undefined), 'local');
-  assert.throws(() => resolveConflictFallback(undefined, undefined), /无法自动合并/);
-});
-
-test('自动合并后的状态文案说明处理方式并提示备份', () => {
-  assert.equal(
-    finalSyncMessage({
-      ...createSyncReport('sync'),
-      changedFileCount: 2,
-      merge: { conflicts: ['a', 'b'], aiMerged: ['a'], autoMerged: ['b'] },
-    }),
-    '同步完成（AI 已自动合并 1 项冲突；1 项冲突按本机优先自动处理；冲突前的两份配置已备份到扩展运行目录）。',
-  );
-  assert.equal(finalSyncMessage(createSyncReport('sync')), '配置已是最新。');
-  assert.equal(
-    finalSyncMessage({
-      ...createSyncReport('sync'),
-      changedFileCount: 1,
-      structuralMessage: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
-    }),
-    '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
-  );
 });
 
 test('首次接入的状态文案说明已按云端覆盖并提示备份', () => {
@@ -832,7 +934,6 @@ test('同步配置解析缺省回落到备份模式并拒绝非法模式', () =>
     autoSync: true,
     debounceSeconds: 10,
     pollIntervalSeconds: 300,
-    includeProfileAssociations: false,
   });
   assert.equal(parsed?.mode, 'backup');
   assert.equal(parsePluginConfiguration({
@@ -844,7 +945,6 @@ test('同步配置解析缺省回落到备份模式并拒绝非法模式', () =>
     autoSync: true,
     debounceSeconds: 10,
     pollIntervalSeconds: 300,
-    includeProfileAssociations: false,
   })?.mode, 'sync');
   assert.equal(parsePluginConfiguration({
     repositoryUrl: 'git@github.com:user/settings.git',
@@ -855,7 +955,6 @@ test('同步配置解析缺省回落到备份模式并拒绝非法模式', () =>
     autoSync: true,
     debounceSeconds: 10,
     pollIntervalSeconds: 300,
-    includeProfileAssociations: false,
   }), undefined);
 });
 
@@ -892,24 +991,59 @@ test('独立 Profile 配置实例通过共享锁传播因果更新', async () =>
 
 test('备份模式的流程止于推送，不含写回本机的步骤', () => {
   const names = BACKUP_STAGES.map((stage) => stage.name);
-  assert.deepEqual(names, ['snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'merge', 'push']);
-  assert.deepEqual(SYNC_STAGES.map((stage) => stage.name).slice(0, names.length), names);
+  assert.deepEqual(names, ['snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'choose', 'push', 'finalize']);
+  // 备份模式只少了写回本机与装卸扩展两步，其余步骤和顺序必须与同步模式一致。
+  const sync = SYNC_STAGES.map((stage) => stage.name).filter((name) => name !== 'apply' && name !== 'extensions');
+  assert.deepEqual(sync, names);
 });
 
-test('备份模式不导出合并基准', async () => {
-  let exportedBase = false;
-  const context = stageContext({
-    configuration: { ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'backup' },
-    dependencies: stageDependencies({
-      git: fakeGit({
-        prepare: async () => undefined,
-        pull: async () => ({ state: 'synced', recoveredFromDivergence: false, mergeBase: 'abc123' }),
-        exportHostTree: async () => { exportedBase = true; return true; },
-      }),
-    }),
-  });
-  assert.deepEqual(await stageTesting.pullStage.run(context), { kind: 'continue' });
-  assert.equal(exportedBase, false);
+test('备份模式同步前会清除遗留的采用云端标记', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-backup-pending-'));
+  try {
+    const runtimeState = new RuntimeStateStore(root);
+    await runtimeState.initialize();
+    await runtimeState.update({ cloudAdoptPending: true });
+    const engine = new SyncEngine(
+      { kind: 'vscode', userDataPath: root, runtimePath: root },
+      { createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
+      fakeGit({ prepare: async () => undefined, pull: async () => ({ state: 'synced', recoveredFromDivergence: false }) }),
+      {} as unknown as AiService,
+      { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'backup' }) } as unknown as ConfigurationStore,
+      runtimeState,
+      () => undefined,
+      async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    );
+    const outcome = await engine.synchronize();
+    assert.equal(runtimeState.get().cloudAdoptPending, false);
+    assert.equal(outcome?.ok, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('尚未开始的同步也会响应停止请求，且停止意图只兑现一次', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-stop-'));
+  try {
+    const engine = new SyncEngine(
+      { kind: 'vscode', userDataPath: root, runtimePath: root },
+      { createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
+      fakeGit({}),
+      {} as unknown as AiService,
+      { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git' }) } as unknown as ConfigurationStore,
+      { reload: async () => undefined, get: () => ({ cloudAdoptPending: false }) } as unknown as RuntimeStateStore,
+      () => undefined,
+      async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    );
+    engine.requestStop();
+    assert.deepEqual(await engine.synchronize(), { ok: false, cancelled: true });
+    // 意图已经兑现，不能粘住让之后每一轮都被直接取消。
+    assert.deepEqual(await engine.synchronize(), { ok: false });
+    engine.requestStop();
+    engine.clearStop();
+    assert.deepEqual(await engine.synchronize(), { ok: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('备份模式直接用本机内容覆盖仓库快照', async () => {
@@ -931,14 +1065,13 @@ test('备份模式直接用本机内容覆盖仓库快照', async () => {
       paths: {
         temporaryRoot: path.join(root, 'tmp'),
         localHostRoot,
-        baseHostRoot: path.join(root, 'tmp', 'base'),
         repositoryHostRoot,
       },
     });
 
-    assert.deepEqual(await mergeStage.run(context), { kind: 'continue' });
-    // 云端快照存在也不参与合并：备份模式下本机是仓库内容的唯一来源。
-    assert.equal(context.report.merge, undefined);
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    // 云端快照存在也不参与比较：备份模式下本机是仓库内容的唯一来源。
+    assert.equal(context.report.snapshotChoice, 'local');
     assert.deepEqual(await readJsonFile(path.join(repositoryHostRoot, 'manifest.json')), localManifest);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1161,6 +1294,18 @@ test('快照清单缺字段或类型不符时拒绝解析', () => {
   assert.equal(parseManifest(undefined), undefined);
 });
 
+test('快照清单丢弃工作区关联，指纹不受其影响', () => {
+  const base = {
+    schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [{ id: 'default', name: '默认', isDefault: true }], files: {},
+  };
+  const local = parseManifest({ ...base, profileAssociations: { workspaces: { 'file:///d%3A/local': '__default__profile__' } } });
+  const cloud = parseManifest({ ...base, profileAssociations: { emptyWindows: { '1787144855726': '__default__profile__' } } });
+  if (!local || !cloud) throw new Error('清单应当解析成功');
+  assert.equal('profileAssociations' in local, false);
+  // 旧版本推上去的快照仍带这个字段，解析时丢弃即可，两侧指纹要相同。
+  assert.equal(snapshotDigest(local).snapshot, snapshotDigest(cloud).snapshot);
+});
+
 test('检测 URL 中嵌入的明文凭据', () => {
   assert.equal(hasEmbeddedCredentials('https://user:ghp_token@github.com/user/repo.git'), true);
   assert.equal(hasEmbeddedCredentials('git@github.com:user/repo.git'), false);
@@ -1195,16 +1340,6 @@ test('格式化同步相对时间', () => {
   assert.equal(formatRelativeSyncTime('2026-08-07T12:00:00.000Z', now), '2天前');
   assert.equal(formatRelativeSyncTime('2026-08-09T12:01:00.000Z', now), '刚刚');
   assert.equal(formatRelativeSyncTime('invalid', now), '时间无效');
-});
-
-test('三方判定在冲突检测与合并中给出一致结果', () => {
-  assert.equal(classifyThreeWay('base', 'base', 'cloud'), 'cloud');
-  assert.equal(classifyThreeWay('base', 'local', 'base'), 'local');
-  assert.equal(classifyThreeWay('base', 'same', 'same'), 'local');
-  assert.equal(classifyThreeWay('base', 'local', 'cloud'), 'conflict');
-  assert.equal(classifyThreeWay('base', undefined, 'base'), 'local');
-  assert.equal(classifyThreeWay(undefined, 'local', undefined), 'local');
-  assert.equal(classifyThreeWay('base', undefined, 'cloud'), 'conflict');
 });
 
 test('推送失败留下的本地提交会被重新对齐并保留共同基准', async () => {
@@ -1243,11 +1378,6 @@ test('推送失败留下的本地提交会被重新对齐并保留共同基准',
     const pull = await second.pull(configuration);
     assert.equal(pull.recoveredFromDivergence, true);
     assert.equal(await readFile(manifestPath(second), 'utf8'), '{"schemaVersion":1,"files":{"a":"cloud"}}');
-    assert.ok(pull.mergeBase);
-
-    const baseRoot = path.join(root, 'base');
-    assert.equal(await second.exportHostTree(pull.mergeBase, 'vscode', baseRoot), true);
-    assert.equal(await readFile(path.join(baseRoot, 'manifest.json'), 'utf8'), '{"schemaVersion":1,"files":{"a":"base"}}');
 
     // 恢复后必须能继续正常推送，同步不会停留在失败状态。
     await writeFile(manifestPath(second), '{"schemaVersion":1,"files":{"a":"merged"}}');
@@ -1286,13 +1416,12 @@ test('本地没有历史时拉取判定为首次克隆且没有共同基准', as
     await second.prepare(configuration);
     const pull = await second.pull(configuration);
     assert.equal(pull.state, 'cloned');
-    assert.equal(pull.mergeBase, undefined);
     assert.equal(
       await readFile(path.join(second.repositoryPath, '.profile-git-sync', 'hosts', 'vscode', 'manifest.json'), 'utf8'),
       '{"schemaVersion":1,"files":{"a":"cloud"}}',
     );
 
-    // 克隆完成后再次拉取即视为同源，从这一轮起才允许三方合并。
+    // 克隆完成后再次拉取即视为同源，从这一轮起才按基准比较两侧。
     assert.equal((await second.pull(configuration)).state, 'synced');
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1335,7 +1464,6 @@ test('本地仓库与远端没有共同祖先时拒绝合并且不改写本地�
     await local.prepare(configuration);
     const pull = await local.pull(configuration);
     assert.equal(pull.state, 'unrelated');
-    assert.equal(pull.mergeBase, undefined);
     assert.equal(await local.head(), head);
     assert.equal(await readFile(manifestPath(local), 'utf8'), '{"schemaVersion":1,"files":{"a":"local"}}');
 
@@ -1463,6 +1591,26 @@ test('文件锁只在持有者已退出或长期不释放时才被清理', async
     let recovered = false;
     await withFileLock(lockPath, async () => { recovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
     assert.equal(recovered, true);
+
+    // 空锁文件没有 pid，只能按修改时间判定残留，否则共享状态会永久无法写入。
+    await writeFile(lockPath, '');
+    await utimes(lockPath, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+    let emptyRecovered = false;
+    await withFileLock(lockPath, async () => { emptyRecovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
+    assert.equal(emptyRecovered, true);
+
+    await writeFile(lockPath, '{');
+    await utimes(lockPath, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+    let brokenRecovered = false;
+    await withFileLock(lockPath, async () => { brokenRecovered = true; }, { timeoutMs: 500, staleMs: 60_000 });
+    assert.equal(brokenRecovered, true);
+
+    // 刚创建的空锁视为写入中途，不能立刻抢走。
+    await writeFile(lockPath, '');
+    await assert.rejects(
+      () => withFileLock(lockPath, async () => undefined, { timeoutMs: 120, staleMs: 60_000, busyMessage: '锁被占用' }),
+      /锁被占用/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1536,14 +1684,20 @@ test('拉取到不同源的远端时暂停同步而不是直接失败', async ()
 
 test('整包采用云端时不产生新的远端提交', async () => {
   let staged = false;
+  let pushed = false;
   const context = stageContext({
-    artifacts: { strategy: 'adopt' },
+    artifacts: { strategy: 'adopt', choice: 'cloud' },
     dependencies: stageDependencies({
-      git: fakeGit({ stageHost: async () => { staged = true; return []; } }),
+      git: fakeGit({
+        stageHost: async () => { staged = true; return []; },
+        pushIfAhead: async () => { pushed = true; },
+      }),
     }),
   });
   assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
   assert.equal(staged, false);
+  // 仓库内容没被改写，但上次推送失败留下的提交仍要补推。
+  assert.equal(pushed, true);
 });
 
 test('提交前发现未保存的配置文档时暂停且不推送', async () => {
@@ -1567,7 +1721,10 @@ test('强制采用云端但云端没有本宿主快照时中止并清除重建�
     adoptCloud: true,
     artifacts: { pull: { state: 'synced', recoveredFromDivergence: false } },
     dependencies: stageDependencies({
-      runtimeState: { update: async (patch: Record<string, unknown>) => { updates.push(patch); } } as unknown as RuntimeStateStore,
+      runtimeState: {
+        get: () => ({ ...DEFAULT_RUNTIME_STATE }),
+        update: async (patch: Record<string, unknown>) => { updates.push(patch); },
+      } as unknown as RuntimeStateStore,
     }),
   });
   await assert.rejects(() => stageTesting.decideStage.run(context), /云端没有 VS Code 的配置快照/);
@@ -1589,14 +1746,13 @@ test('远端还没有本宿主快照时直接用本机内容初始化', async ()
       paths: {
         temporaryRoot: path.join(root, 'tmp'),
         localHostRoot,
-        baseHostRoot: path.join(root, 'tmp', 'base'),
         repositoryHostRoot,
       },
     });
 
-    // 远端缺少 manifest.json，走合并会直接读文件失败，这里必须跳过合并。
-    assert.deepEqual(await mergeStage.run(context), { kind: 'continue' });
-    assert.equal(context.report.merge, undefined);
+    // 远端缺少 manifest.json，读云端快照会直接失败，这里必须跳过比较。
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    assert.equal(context.report.snapshotChoice, 'local');
     assert.deepEqual(await readJsonFile(path.join(repositoryHostRoot, 'manifest.json')), {
       schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [], files: {},
     });
@@ -1604,6 +1760,23 @@ test('远端还没有本宿主快照时直接用本机内容初始化', async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function writeExtensionSnapshot(root: string, ids: string[] | undefined, hash: string): Promise<void> {
+  await mkdir(root, { recursive: true });
+  const files: Record<string, string> = {};
+  if (ids) {
+    await writeFile(path.join(root, 'extensions.json'), `${JSON.stringify(ids.map((id) => ({ identifier: { id } })), null, 2)}
+`);
+    files['extensions.json'] = hash;
+  }
+  await writeFile(path.join(root, 'manifest.json'), JSON.stringify({
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [{ id: 'default', name: '默认', isDefault: true }],
+    files,
+  }));
+}
 
 test('扩展同步只认宿主级清单，忽略 Profile 目录下的启用状态', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-stage-'));
@@ -1624,7 +1797,6 @@ test('扩展同步只认宿主级清单，忽略 Profile 目录下的启用状�
       paths: {
         temporaryRoot: path.join(root, 'tmp'),
         localHostRoot: path.join(root, 'tmp', 'cursor'),
-        baseHostRoot: path.join(root, 'tmp', 'base'),
         repositoryHostRoot,
       },
       dependencies: stageDependencies({
@@ -1681,6 +1853,23 @@ test('同步顺利结束时报告完成并给出状态说明', async () => {
   assert.equal(patches.at(-1)?.message, '配置已是最新。');
 });
 
+test('请求停止后当前阶段结束且不再执行后续阶段', async () => {
+  let cancellationRequested = false;
+  const executed: string[] = [];
+  const context = stageContext({
+    dependencies: stageDependencies({ isCancellationRequested: () => cancellationRequested }),
+  });
+  const stages: Stage[] = [
+    { name: 'snapshot', run: async () => { executed.push('snapshot'); cancellationRequested = true; return { kind: 'continue' }; } },
+    { name: 'scan-secrets', run: async () => { executed.push('scan-secrets'); return { kind: 'continue' }; } },
+  ];
+
+  const outcome = await runPipeline(context, stages);
+
+  assert.deepEqual(executed, ['snapshot']);
+  assert.deepEqual(outcome, { ok: false, cancelled: true });
+});
+
 test('关闭同步开关后不再发起任何同步', () => {
   const machine = { ...leaderMachine(), enabled: false, sync: { kind: 'disabled' } as SyncState };
   for (const event of [
@@ -1694,15 +1883,40 @@ test('关闭同步开关后不再发起任何同步', () => {
   }
 });
 
-test('同步进行中关闭开关不打断当前这一轮', () => {
+test('同步进行中关闭开关后等待当前安全操作完成再停止', () => {
   const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
   const closed = reduce(running, { type: 'enabled-changed', enabled: false });
-  // 仍在 running：已经提交但未推送的中间态不能被切断。
+  // 仍在 running：已经提交但未推送的安全操作不能被切断。
   assert.deepEqual(closed.next.sync, { kind: 'running', stage: 'push' });
   assert.deepEqual(closed.commands.map((command) => command.type), ['stop-schedules', 'cancel-retry']);
 
   const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
   assert.deepEqual(finished.next.sync, { kind: 'disabled' });
+});
+
+test('取消后重新开启不算失败，并且补跑一轮', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
+  const closed = reduce(running, { type: 'enabled-changed', enabled: false });
+  const reopened = reduce(closed.next, { type: 'enabled-changed', enabled: true });
+  const finished = reduce(reopened.next, { type: 'sync-finished', outcome: { ok: false, cancelled: true } });
+  assert.deepEqual(finished.next.sync, { kind: 'running', stage: 'snapshot' });
+  assert.equal(finished.next.retryAttempt, 0);
+  assert.deepEqual(finished.commands, [{ type: 'cancel-retry' }, { type: 'start-sync', adoptCloud: false }]);
+});
+
+test('取消的一轮结束时开关仍关着则停在关闭状态', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'push' } };
+  const closed = reduce(running, { type: 'enabled-changed', enabled: false });
+  const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: false, cancelled: true } });
+  assert.deepEqual(finished.next.sync, { kind: 'disabled' });
+  assert.deepEqual(finished.commands, [{ type: 'stop-schedules' }]);
+});
+
+test('follower 上取消的一轮不会自行补跑', () => {
+  const running: SchedulerMachine = { ...leaderMachine(), isLeader: false, sync: { kind: 'running', stage: 'push' } };
+  const finished = reduce(running, { type: 'sync-finished', outcome: { ok: false, cancelled: true } });
+  assert.deepEqual(finished.next.sync, { kind: 'idle' });
+  assert.deepEqual(finished.commands, [{ type: 'cancel-retry' }]);
 });
 
 test('开启开关后立即同步一次并启动定时器', () => {
@@ -1713,7 +1927,7 @@ test('开启开关后立即同步一次并启动定时器', () => {
 });
 
 test('同步期间的请求排队，结束后再跑一轮', () => {
-  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'merge' } };
+  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'choose' } };
   const queued = reduce(running, { type: 'sync-requested', source: 'timer' });
   assert.equal(queued.next.pending, true);
   assert.deepEqual(queued.commands, []);
@@ -1828,6 +2042,276 @@ test('重载窗口时不再并行开启排队的同步', () => {
   assert.equal(next.pending, false);
 });
 
+test('择一判定只看两侧相对基准有没有改动', () => {
+  const baseline = { localSnapshot: 'L', localExtensions: 'LE', cloudSnapshot: 'C', cloudExtensions: 'CE' };
+  const digest = (snapshot: string, extensions: string) => ({ snapshot, extensions });
+  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE'), digest('C', 'CE'), { ignoreExtensions: false }), 'none');
+  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE'), digest('C2', 'CE'), { ignoreExtensions: false }), 'cloud');
+  assert.equal(decideSnapshotChoice(baseline, digest('L2', 'LE'), digest('C', 'CE'), { ignoreExtensions: false }), 'local');
+  assert.equal(decideSnapshotChoice(baseline, digest('L2', 'LE'), digest('C2', 'CE'), { ignoreExtensions: false }), 'conflict');
+  // 用户已经选定一方时直接落地，不再询问。
+  assert.equal(
+    decideSnapshotChoice(baseline, digest('L2', 'LE'), digest('C2', 'CE'), { ignoreExtensions: false, resolution: 'cloud' }),
+    'cloud',
+  );
+  // 扩展还在装卸时，清单变化不算这一侧改过。
+  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE2'), digest('C', 'CE'), { ignoreExtensions: false }), 'local');
+  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE2'), digest('C', 'CE'), { ignoreExtensions: true }), 'none');
+  // 没有基准时两侧一致就直接立基准，不一致只能交给用户。
+  assert.equal(decideSnapshotChoice(undefined, digest('S', 'E'), digest('S', 'E'), { ignoreExtensions: false }), 'none');
+  assert.equal(decideSnapshotChoice(undefined, digest('S', 'E'), digest('S2', 'E'), { ignoreExtensions: false }), 'conflict');
+});
+
+test('快照指纹忽略键序与采集时间，扩展清单单独记录', () => {
+  const left = testManifest({ 'profiles/default/settings.json': 'x', 'extensions.json': 'e1' });
+  const right: SnapshotManifest = {
+    ...left,
+    createdAt: '2026-08-18T00:00:00.000Z',
+    profileMetadata: [{ name: 'A', location: 'a' }],
+    files: { 'extensions.json': 'e2', 'profiles/default/settings.json': 'x' },
+  };
+  // 两台机器写出的元数据键序可能不同，内容其实一样，不归一就会被判成改动。
+  assert.equal(snapshotDigest(left).snapshot, snapshotDigest(right).snapshot);
+  assert.equal(snapshotDigest(left).extensions, 'e1');
+  assert.equal(snapshotDigest(right).extensions, 'e2');
+  assert.notEqual(
+    snapshotDigest(testManifest({ 'profiles/default/settings.json': 'y' })).snapshot,
+    snapshotDigest(left).snapshot,
+  );
+});
+
+test('本机没改时采用云端且不改写仓库内容', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-choose-cloud-'));
+  try {
+    const localManifest = testManifest({ 'profiles/default/settings.json': 'local' });
+    const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
+    const { context } = await chooseContext(root, localManifest, cloudManifest, {
+      localSnapshot: snapshotDigest(localManifest).snapshot,
+      localExtensions: '',
+      cloudSnapshot: 'stale',
+      cloudExtensions: '',
+    });
+
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    assert.equal(context.report.snapshotChoice, 'cloud');
+    assert.deepEqual(await readJsonFile(path.join(context.paths.repositoryHostRoot, 'manifest.json')), cloudManifest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('两边都改时暂停并先备份双方，不改写任何一侧', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-choose-conflict-'));
+  try {
+    const localManifest = testManifest({ 'profiles/default/settings.json': 'local' });
+    const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
+    const { context, conflictBackupRoot } = await chooseContext(root, localManifest, cloudManifest, {
+      localSnapshot: 'stale-local',
+      localExtensions: '',
+      cloudSnapshot: 'stale-cloud',
+      cloudExtensions: '',
+    });
+
+    const outcome = await chooseStage.run(context);
+    assert.equal(outcome.kind, 'blocked');
+    assert.equal(outcome.kind === 'blocked' ? outcome.reason : undefined, 'both-changed');
+    // 用户可能过很久才选择，暂停期间两份内容都要有副本。
+    assert.equal((await readdir(conflictBackupRoot)).length, 1);
+    assert.deepEqual(await readJsonFile(path.join(context.paths.repositoryHostRoot, 'manifest.json')), cloudManifest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('用户选定本机后按本机覆盖云端，不再询问', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-choose-resolved-'));
+  try {
+    const localManifest = testManifest({ 'profiles/default/settings.json': 'local' });
+    const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
+    const { context } = await chooseContext(root, localManifest, cloudManifest, {
+      localSnapshot: 'stale-local',
+      localExtensions: '',
+      cloudSnapshot: 'stale-cloud',
+      cloudExtensions: '',
+    }, 'local');
+
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    assert.equal(context.report.snapshotChoice, 'local');
+    assert.equal(context.report.resolvedConflict, true);
+    assert.deepEqual(await readJsonFile(path.join(context.paths.repositoryHostRoot, 'manifest.json')), localManifest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('同步期间本机被改动时放弃写回', async () => {
+  const context = stageContext({
+    artifacts: { strategy: 'merge', choice: 'cloud', localFingerprint: 'round-start' },
+    dependencies: stageDependencies({
+      adapter: {
+        fingerprint: async () => 'changed-midway',
+        restoreSnapshot: async () => { throw new Error('本机已改动时不应写回'); },
+      } as unknown as ProfileAdapter,
+    }),
+  });
+  assert.deepEqual(await stageTesting.applyStage.run(context), { kind: 'blocked', reason: 'local-changed' });
+});
+
+test('结构没完整落地时不前移基准', async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  const context = stageContext({
+    report: { ...createSyncReport('sync'), waitingForWindows: true },
+    dependencies: stageDependencies({
+      runtimeState: {
+        get: () => ({ ...DEFAULT_RUNTIME_STATE }),
+        update: async (patch: Record<string, unknown>) => { updates.push(patch); },
+      } as unknown as RuntimeStateStore,
+    }),
+  });
+  assert.deepEqual(await stageTesting.finalizeStage.run(context), { kind: 'continue' });
+  assert.deepEqual(updates, []);
+});
+
+test('没有写回本机时基准取本轮推送的快照，并记录待收敛的扩展', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-finalize-'));
+  try {
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    const localManifest = testManifest({ 'profiles/default/settings.json': 'local', 'extensions.json': 'ext' });
+    const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
+    await mkdir(repositoryHostRoot, { recursive: true });
+    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify(cloudManifest));
+
+    const updates: Array<Record<string, unknown>> = [];
+    const context = stageContext({
+      artifacts: { localManifest },
+      report: { ...createSyncReport('sync'), extensionsPending: ['missing.one'] },
+      paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot: path.join(root, 'tmp', 'vscode'), repositoryHostRoot },
+      dependencies: stageDependencies({
+        adapter: {
+          createSnapshot: async () => { throw new Error('没有写回本机就不该重新采集'); },
+        } as unknown as ProfileAdapter,
+        runtimeState: {
+          get: () => ({ ...DEFAULT_RUNTIME_STATE }),
+          update: async (patch: Record<string, unknown>) => { updates.push(patch); },
+        } as unknown as RuntimeStateStore,
+      }),
+    });
+
+    assert.deepEqual(await stageTesting.finalizeStage.run(context), { kind: 'continue' });
+    assert.deepEqual(updates, [{
+      baseline: {
+        localSnapshot: snapshotDigest(localManifest).snapshot,
+        localExtensions: 'ext',
+        cloudSnapshot: snapshotDigest(cloudManifest).snapshot,
+        cloudExtensions: '',
+      },
+      extensionsPending: ['missing.one'],
+      extensionsPendingRounds: 1,
+      pendingResolution: undefined,
+    }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('扩展连续多轮装不上后不再排除在改动判定之外', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-finalize-settle-'));
+  try {
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    const manifest = testManifest({ 'profiles/default/settings.json': 'x' });
+    await mkdir(repositoryHostRoot, { recursive: true });
+    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify(manifest));
+
+    const updates: Array<Record<string, unknown>> = [];
+    const context = stageContext({
+      artifacts: { localManifest: manifest },
+      report: { ...createSyncReport('sync'), extensionsPending: ['gone.one'] },
+      paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot: path.join(root, 'tmp', 'vscode'), repositoryHostRoot },
+      dependencies: stageDependencies({
+        runtimeState: {
+          get: () => ({ ...DEFAULT_RUNTIME_STATE, extensionsPending: ['gone.one'], extensionsPendingRounds: 2 }),
+          update: async (patch: Record<string, unknown>) => { updates.push(patch); },
+        } as unknown as RuntimeStateStore,
+      }),
+    });
+
+    assert.deepEqual(await stageTesting.finalizeStage.run(context), { kind: 'continue' });
+    assert.equal(updates[0]?.extensionsPending, undefined);
+    assert.equal(updates[0]?.extensionsPendingRounds, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('两边都改时暂停并只询问一次，选定一方后才继续', () => {
+  const blocked = reduce(leaderMachine(), {
+    type: 'sync-finished',
+    outcome: { ok: false, bothChanged: true, blockReason: 'both-changed' },
+  });
+  assert.deepEqual(blocked.next.sync, { kind: 'blocked', reason: 'both-changed' });
+  assert.deepEqual(blocked.commands, [{ type: 'prompt-version-choice' }]);
+
+  // 没选定一方就重跑只会又撞上同一个冲突，还会反复备份、白占独占锁。
+  const again = reduce(blocked.next, { type: 'sync-requested', source: 'timer' });
+  assert.deepEqual(again.next.sync, { kind: 'blocked', reason: 'both-changed' });
+  assert.deepEqual(again.commands, []);
+
+  const resolved = reduce(blocked.next, { type: 'sync-requested', source: 'user', resolved: true });
+  assert.deepEqual(resolved.next.sync, { kind: 'running', stage: 'snapshot' });
+  assert.deepEqual(resolved.commands, [{ type: 'start-sync', adoptCloud: false }]);
+
+  // 关掉其他窗口或保存文档都解不开这种阻塞，只有用户选择才行。
+  const windows = reduce(blocked.next, {
+    type: 'windows-changed',
+    safety: { activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 },
+  });
+  assert.deepEqual(windows.commands, []);
+});
+
+test('运行状态保存基准、待收敛扩展与用户选择', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-baseline-'));
+  try {
+    const store = new RuntimeStateStore(root);
+    await store.initialize();
+    const baseline = { localSnapshot: 'l', localExtensions: 'le', cloudSnapshot: 'c', cloudExtensions: 'ce' };
+    await store.update({ baseline, extensionsPending: ['a.b'], extensionsPendingRounds: 1, pendingResolution: 'local' });
+
+    const reloaded = new RuntimeStateStore(root);
+    await reloaded.initialize();
+    assert.deepEqual(reloaded.get().baseline, baseline);
+    assert.deepEqual(reloaded.get().extensionsPending, ['a.b']);
+    assert.equal(reloaded.get().pendingResolution, 'local');
+
+    // 显式传 undefined 表示删除，否则用户的选择会一直粘着，下一轮又按它执行一次。
+    await store.update({ pendingResolution: undefined, extensionsPending: undefined, extensionsPendingRounds: undefined });
+    await reloaded.reload();
+    assert.equal(reloaded.get().pendingResolution, undefined);
+    assert.equal(reloaded.get().extensionsPending, undefined);
+    assert.deepEqual(reloaded.get().baseline, baseline);
+
+    // 残缺的基准与非法的选择一律拒绝，避免据此误判两侧改没改。
+    const valid = { schemaVersion: 1, enabled: true, link: 'in-sync', cloudAdoptPending: false };
+    assert.ok(parseRuntimeState(valid));
+    assert.equal(parseRuntimeState({ ...valid, baseline: { localSnapshot: 'l' } }), undefined);
+    assert.equal(parseRuntimeState({ ...valid, pendingResolution: 'both' }), undefined);
+    assert.equal(parseRuntimeState({ ...valid, extensionsPending: [1] }), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('按用户选择处理后的文案说明方向并提示备份', () => {
+  assert.equal(
+    finalSyncMessage({ ...createSyncReport('sync'), changedFileCount: 1, resolvedConflict: true, snapshotChoice: 'local' }),
+    '同步完成（已按你的选择用本机配置覆盖云端；另一份配置已备份到扩展运行目录）。',
+  );
+  assert.equal(
+    finalSyncMessage({ ...createSyncReport('sync'), snapshotChoice: 'cloud' }),
+    '同步完成（已按云端配置覆盖本机）。',
+  );
+  assert.equal(finalSyncMessage({ ...createSyncReport('sync'), snapshotChoice: 'none' }), '配置已是最新。');
+});
+
 test('云端历史只列出动过本宿主目录的提交', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-history-'));
   const remote = path.join(root, 'remote.git');
@@ -1864,6 +2348,11 @@ test('云端历史只列出动过本宿主目录的提交', async () => {
     assert.equal(Number.isNaN(Date.parse(commits[0]!.committedAt)), false);
     assert.equal((await service.listCommits(configuration, 'vscode', 1)).length, 1);
     assert.deepEqual(await service.listCommits({ ...configuration, branch: 'missing' }, 'vscode'), []);
+
+    // 导出历史宿主树只取该提交里的内容，越界路径与其他宿主目录都不参与。
+    const exported = path.join(root, 'exported');
+    assert.equal(await service.exportHostTree(commits[1]!.hash, 'vscode', exported), true);
+    assert.equal(await readFile(path.join(exported, 'manifest.json'), 'utf8'), '{"schemaVersion":1}');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1932,7 +2421,7 @@ test('多窗口时包含 Profile 增删的历史快照不还原', async () => {
   }
 });
 
-test('还原把历史快照换进仓库目录并预置提交说明', async () => {
+test('还原把历史快照换进仓库目录并按采用本机处理', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-restore-export-'));
   try {
     const repositoryHostRoot = path.join(root, 'repository', 'vscode');
@@ -1952,6 +2441,8 @@ test('还原把历史快照换进仓库目录并预置提交说明', async () =>
     });
     assert.deepEqual(await restoreTesting.exportHistoryStage.run(context), { kind: 'continue' });
     assert.equal(context.artifacts.commitMessage, '还原到 abcdefg：第一次 备份：初始配置');
+    assert.equal(context.artifacts.choice, 'local');
+    assert.equal(context.report.snapshotChoice, 'local');
     assert.equal(
       await readFile(path.join(repositoryHostRoot, 'profiles', 'default', 'settings.json'), 'utf8'),
       '{"editor.fontSize": 14}',
@@ -1966,7 +2457,7 @@ test('还原使用预置的提交说明，不再调用 AI', async () => {
   let committed: string | undefined;
   let aiCalled = false;
   const context = stageContext({
-    artifacts: { commitMessage: '还原到 abcdefg：初始配置' },
+    artifacts: { choice: 'local', commitMessage: '还原到 abcdefg：初始配置' },
     dependencies: stageDependencies({
       git: fakeGit({
         stageHost: async () => ['profiles/default/settings.json'],
@@ -1976,13 +2467,14 @@ test('还原使用预置的提交说明，不再调用 AI', async () => {
     }),
   });
   assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
-  assert.equal(committed, '还原到 abcdefg：初始配置');
+  assert.equal(committed, '[test-device] 还原到 abcdefg：初始配置');
   assert.equal(aiCalled, false);
 });
 
 test('本机 Profile 结构未应用时放弃推送还原提交', async () => {
   let staged = false;
   const context = stageContext({
+    artifacts: { choice: 'local' },
     report: { ...createSyncReport('sync'), waitingForWindows: true },
     dependencies: stageDependencies({
       git: fakeGit({ stageHost: async () => { staged = true; return []; } }),
@@ -2006,7 +2498,6 @@ function restoreContext(root: string, overrides: Partial<SyncContext> = {}): Syn
     paths: {
       temporaryRoot: path.join(root, 'tmp'),
       localHostRoot: path.join(root, 'tmp', 'vscode'),
-      baseHostRoot: path.join(root, 'tmp', 'base'),
       repositoryHostRoot: path.join(root, 'repository', 'vscode'),
     },
     ...overrides,
@@ -2034,6 +2525,47 @@ async function writeHistorySnapshot(
   }
 }
 
+function testManifest(files: Record<string, string>): SnapshotManifest {
+  return {
+    schemaVersion: 1,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [{ id: 'default', name: '默认', isDefault: true }],
+    profileMetadata: [{ location: 'a', name: 'A' }],
+    files,
+  };
+}
+
+/** 构造一轮「本机与云端都已就位」的择一场景：本机快照在临时目录，云端快照在仓库目录。 */
+async function chooseContext(
+  root: string,
+  localManifest: SnapshotManifest,
+  cloudManifest: SnapshotManifest,
+  baseline: SyncBaseline,
+  resolution?: 'local' | 'cloud',
+): Promise<{ context: SyncContext; conflictBackupRoot: string }> {
+  const localHostRoot = path.join(root, 'tmp', 'vscode');
+  const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+  const conflictBackupRoot = path.join(root, 'conflict-backups');
+  await mkdir(localHostRoot, { recursive: true });
+  await mkdir(repositoryHostRoot, { recursive: true });
+  await writeFile(path.join(localHostRoot, 'manifest.json'), JSON.stringify(localManifest));
+  await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify(cloudManifest));
+  const context = stageContext({
+    artifacts: { strategy: 'merge', remoteExists: true, localManifest },
+    ...(resolution ? { resolution } : {}),
+    paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot, repositoryHostRoot },
+    dependencies: stageDependencies({
+      conflictBackupRoot,
+      runtimeState: {
+        get: () => ({ ...DEFAULT_RUNTIME_STATE, baseline }),
+        update: async () => undefined,
+      } as unknown as RuntimeStateStore,
+    }),
+  });
+  return { context, conflictBackupRoot };
+}
+
 function leaderMachine(): SchedulerMachine {
   return { ...createMachine({ enabled: true, configured: true, link: 'no-repository' }), isLeader: true };
 }
@@ -2044,10 +2576,15 @@ function stageDependencies(overrides: Partial<SyncDependencies> = {}): SyncDepen
     adapter: {} as unknown as ProfileAdapter,
     git: fakeGit({}),
     ai: {} as unknown as AiService,
-    runtimeState: { update: async () => undefined } as unknown as RuntimeStateStore,
+    runtimeState: {
+      get: () => ({ ...DEFAULT_RUNTIME_STATE }),
+      update: async () => undefined,
+    } as unknown as RuntimeStateStore,
     windowSafety: async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    isCancellationRequested: () => false,
     updateStatus: () => undefined,
     conflictBackupRoot: '/runtime/conflict-backups',
+    deviceName: 'test-device',
     ...overrides,
   };
 }
@@ -2060,7 +2597,6 @@ function stageContext(overrides: Partial<SyncContext> = {}): SyncContext {
     paths: {
       temporaryRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp'),
       localHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp', 'vscode'),
-      baseHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'tmp', 'base'),
       repositoryHostRoot: path.join(tmpdir(), 'profile-git-sync-absent', 'repository'),
     },
     report: createSyncReport('sync'),

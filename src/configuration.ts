@@ -163,7 +163,6 @@ export class ConfigurationStore {
       ...base,
       pollIntervalSeconds: settings.get<number>('pollIntervalSeconds', base.pollIntervalSeconds),
       debounceSeconds: settings.get<number>('debounceSeconds', base.debounceSeconds),
-      includeProfileAssociations: true,
     };
   }
 
@@ -173,7 +172,6 @@ export class ConfigurationStore {
     for (const [key, value] of [
       ['pollIntervalSeconds', configuration.pollIntervalSeconds],
       ['debounceSeconds', configuration.debounceSeconds],
-      ['includeProfileAssociations', configuration.includeProfileAssociations],
     ] as const) {
       if (settings.get(key) !== value) {
         updates.push(settings.update(key, value, vscode.ConfigurationTarget.Global));

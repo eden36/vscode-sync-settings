@@ -3,13 +3,6 @@ import { parseUtilityModelSetting } from './ai-model';
 
 const AI_REQUEST_TIMEOUT_MS = 60_000;
 
-/** 模型经常无视提示词，把 JSON 包在 Markdown 代码块里，解析前先剥掉围栏。 */
-export function stripJsonFence(text: string): string {
-  const trimmed = text.trim();
-  const fenced = /^```[^\n]*\n([\s\S]*?)\n?```$/.exec(trimmed);
-  return (fenced?.[1] ?? trimmed).trim();
-}
-
 export class AiService {
   public async createCommitMessage(summary: string): Promise<string> {
     const prompt = [
@@ -21,18 +14,6 @@ export class AiService {
     const message = response.replace(/[\r\n]+/g, ' ').trim().slice(0, 72);
     if (!message) throw new Error('AI 未返回有效的提交信息。');
     return message;
-  }
-
-  public async resolveConflict(path: string, base: string, ours: string, theirs: string): Promise<string> {
-    const prompt = [
-      '请合并同一个 VS Code 配置文件的三个版本。保留双方不冲突的修改；冲突时选择语义更完整且不泄露凭据的结果。',
-      '只输出合并后的文件原文，不要 Markdown 代码块或解释。',
-      `文件：${path}`,
-      `共同基础：\n${base}`,
-      `本机版本：\n${ours}`,
-      `远程版本：\n${theirs}`
-    ].join('\n\n');
-    return this.complete(prompt);
   }
 
   private async complete(prompt: string): Promise<string> {

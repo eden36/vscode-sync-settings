@@ -2,17 +2,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
-import { parseExtensionIds } from './extension-manifest';
+import { formatExtensionManifest, HOST_EXTENSIONS_FILE, parseExtensionIds, sortExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
-import { parseManifest } from './snapshot-conflict';
+import { readManifest } from './snapshot-conflict';
 import { ProfileDescriptor, SnapshotManifest } from './types';
 
 // Profile 目录下的 extensions.json 是 IDE 维护的启用状态，跨机器同步会引用本机没有的扩展；
 // 扩展改由快照根目录的宿主级清单统一处理。
 const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'mcp.json'];
 const DIRECTORY_RESOURCES = ['snippets', 'prompts'];
-/** 宿主级的已安装扩展清单，放在快照根目录，不属于任何 Profile。 */
-export const HOST_EXTENSIONS_FILE = 'extensions.json';
 const TEMPORARY_MARKER = '.profile-git-sync-';
 const PLUGIN_SETTING_PREFIX = 'profileGitSync.';
 const BACKUP_RETENTION = 10;
@@ -26,7 +24,6 @@ interface StoredProfile {
 
 interface StorageFile {
   userDataProfiles?: StoredProfile[];
-  profileAssociations?: unknown;
 }
 
 export interface RestoreResult {
@@ -98,7 +95,7 @@ export class ProfileAdapter {
     return hash;
   }
 
-  public async createSnapshot(hostRoot: string, includeAssociations = false): Promise<SnapshotManifest> {
+  public async createSnapshot(hostRoot: string): Promise<SnapshotManifest> {
     const profiles = await this.listProfiles();
     const storage = await this.readStorage();
     const staging = `${hostRoot}.staging-${process.pid}-${Date.now()}`;
@@ -128,9 +125,6 @@ export class ProfileAdapter {
       createdAt: '',
       profiles: profiles.map(({ id, name, isDefault }) => ({ id, name, isDefault })),
       profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })) ?? [],
-      ...(includeAssociations && storage.profileAssociations !== undefined
-        ? { profileAssociations: storage.profileAssociations }
-        : {}),
       files
     };
     await fs.writeFile(path.join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
@@ -139,11 +133,8 @@ export class ProfileAdapter {
   }
 
   public async restoreSnapshot(hostRoot: string, allowStructural: boolean, applyMatchingFiles = false): Promise<RestoreResult> {
-    const manifestPath = path.join(hostRoot, 'manifest.json');
-    const manifest = parseManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')) as unknown);
-    if (!manifest || manifest.host !== this.environment.kind) {
-      throw new Error('远程快照格式或宿主类型不兼容。');
-    }
+    const manifest = await readManifest(hostRoot);
+    if (manifest.host !== this.environment.kind) throw new Error('远程快照的宿主类型与本机不一致。');
 
     const localProfiles = await this.listProfiles();
     const localIds = new Set(localProfiles.map((profile) => profile.id));
@@ -196,7 +187,8 @@ export class ProfileAdapter {
     for (const relative of Object.keys(manifest.files)) {
       const normalized = normalizeRelative(relative);
       // 扩展清单由 IDE 自己维护，只用来决定装哪些扩展，绝不能写回本机。
-      if (normalized === HOST_EXTENSIONS_FILE) continue;
+      // 旧版本的云端快照里还带 Profile 级 extensions.json（记录的是本机启用状态），一并跳过。
+      if (normalized === HOST_EXTENSIONS_FILE || normalized.endsWith(`/${HOST_EXTENSIONS_FILE}`)) continue;
       const parts = normalized.split('/');
       if (parts[0] !== 'profiles' || parts.length < 3) {
         throw new Error(`快照包含非法路径：${relative}`);
@@ -248,7 +240,6 @@ export class ProfileAdapter {
 
     const storage = await this.readStorage();
     storage.userDataProfiles = metadata as StoredProfile[];
-    if (manifest.profileAssociations !== undefined) storage.profileAssociations = manifest.profileAssociations;
     await atomicWrite(storagePath, Buffer.from(`${JSON.stringify(storage, null, 2)}\n`, 'utf8'), this.stagingPath);
     const allowed = new Set(locations as string[]);
     for (const entry of await fs.readdir(profilesPath).catch(() => [])) {
@@ -288,7 +279,7 @@ export class ProfileAdapter {
     const sorted = (await collectFiles(root)).sort((left, right) => left.localeCompare(right));
     for (const absolute of sorted) {
       const relative = path.relative(root, absolute);
-      const content = await stableRead(absolute);
+      const content = normalizeLineEndings(await stableRead(absolute));
       const target = path.join(targetRoot, resource, relative);
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, content);
@@ -308,7 +299,7 @@ export class ProfileAdapter {
       throw error;
     });
     if (!content) return [];
-    return [...new Set(parseExtensionIds(content.toString('utf8')))].sort((left, right) => left.localeCompare(right));
+    return sortExtensionIds(parseExtensionIds(content.toString('utf8')));
   }
 
   /**
@@ -318,8 +309,7 @@ export class ProfileAdapter {
   private async readInstalledExtensions(): Promise<Buffer | undefined> {
     const ids = await this.listInstalledExtensionIds();
     if (!ids.length) return undefined;
-    const normalized = ids.map((id) => ({ identifier: { id } }));
-    return Buffer.from(`${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+    return Buffer.from(formatExtensionManifest(ids), 'utf8');
   }
 
   private async readStorage(): Promise<StorageFile> {
@@ -337,18 +327,17 @@ export class ProfileAdapter {
   }
 
   private prepareForRepository(resource: string, content: Buffer): Buffer {
+    const normalized = normalizeLineEndings(content);
     // 插件自身设置由版本化配置记录负责收敛，随 settings.json 同步会与之互相覆盖。
-    if (resource === 'settings.json') return Buffer.from(stripPluginSettings(content.toString('utf8')), 'utf8');
-    if (resource !== 'extensions.json' || !this.environment.extensionDataUri) return content;
-    return Buffer.from(content.toString('utf8').replaceAll(this.environment.extensionDataUri, '%%EXTENSION_DATA_PATH%%'), 'utf8');
+    if (resource === 'settings.json') return Buffer.from(stripPluginSettings(normalized.toString('utf8')), 'utf8');
+    return normalized;
   }
 
   private prepareForLocal(relative: string, content: Buffer, current: Buffer | undefined): Buffer {
     if (relative.endsWith('/settings.json')) {
       return Buffer.from(restorePluginSettings(content.toString('utf8'), current?.toString('utf8') ?? ''), 'utf8');
     }
-    if (!relative.endsWith('/extensions.json') || !this.environment.extensionDataUri) return content;
-    return Buffer.from(content.toString('utf8').replaceAll('%%EXTENSION_DATA_PATH%%', this.environment.extensionDataUri), 'utf8');
+    return content;
   }
 }
 
@@ -498,6 +487,17 @@ function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
+/**
+ * 仓库形态统一按 LF 存放：两台机器的 Git 换行符配置不同时，
+ * 同一份配置会被写成 CRLF 与 LF 两种字节，不归一就会算出两个哈希，判成双方都有改动。
+ * 不含 CRLF 的内容原样返回，避免对二进制内容做无谓的编解码。
+ */
+function normalizeLineEndings(content: Buffer): Buffer {
+  const text = content.toString('utf8');
+  if (!text.includes('\r\n')) return content;
+  return Buffer.from(text.replaceAll('\r\n', '\n'), 'utf8');
+}
+
 function setsEqual(left: Set<string>, right: Set<string>): boolean {
   return left.size === right.size && [...left].every((item) => right.has(item));
 }
@@ -510,4 +510,4 @@ function resolveProfileMetadata(manifest: SnapshotManifest): Array<Record<string
     .map((profile) => ({ location: profile.id, name: profile.name }));
 }
 
-export const testing = { normalizeRelative, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };
+export const testing = { normalizeRelative, normalizeLineEndings, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };

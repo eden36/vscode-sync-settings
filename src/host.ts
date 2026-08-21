@@ -7,7 +7,6 @@ export interface HostEnvironment {
   kind: HostKind;
   userDataPath: string;
   runtimePath: string;
-  extensionDataUri?: string;
   /** 已安装扩展的全局清单，与 Profile 无关，位于扩展安装目录下。 */
   extensionsManifestPath?: string;
 }
@@ -23,12 +22,6 @@ export function detectHost(context: vscode.ExtensionContext): HostEnvironment {
     kind,
     userDataPath,
     runtimePath,
-    extensionDataUri: production ? toUriPath(path.dirname(extensionsRoot)) : undefined,
     extensionsManifestPath: production ? path.join(extensionsRoot, 'extensions.json') : undefined,
   };
-}
-
-function toUriPath(filePath: string): string {
-  const normalized = filePath.replaceAll('\\', '/');
-  return process.platform === 'win32' ? `/${normalized}` : normalized;
 }
