@@ -3,8 +3,12 @@
   "tasks": [
     {
       "label": "准备调试目录",
-      "type": "shell",
-      "command": "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '${workspaceFolder}/.debug/user-data' | Out-Null\"",
+      "type": "process",
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/scripts/launch-debug-host.mjs",
+        "--prepare"
+      ],
       "problemMatcher": [],
       "presentation": {
         "reveal": "silent",

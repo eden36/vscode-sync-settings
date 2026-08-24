@@ -2,13 +2,14 @@ import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
 import { ConfigurationStore } from './configuration';
 import { hasEmbeddedCredentials, isValidBranch, isValidTagName } from './configuration-record';
-import { MAX_COMMIT_LIST } from './git-service';
 import { displayPhase, displayTone, modeLabel, modeNote, stageLabel } from './sidebar-status';
 import { RuntimeStatus, SyncConfiguration, SyncMode } from './types';
 
-/** 历史页面每次向扩展索要的条数，上限由 git-service 收口。 */
+/** 历史页面每次向扩展索要的条数，「加载更多」在此基础上累加，翻页次数不封顶。 */
 export const HISTORY_PAGE_SIZE = 30;
-const HISTORY_MESSAGES: string[] = ['loadHistory', 'restoreCommit', 'createTag', 'deleteTag'];
+// 翻页不设固定条数上限，但单次请求必须有上限：这一段跨信任边界，畸形消息传入超大数字会让 git log 遍历整个历史。
+const HISTORY_LIMIT_MAX = 10_000;
+const HISTORY_MESSAGES: string[] = ['loadHistory', 'loadMoreHistory', 'restoreCommit', 'createTag', 'deleteTag'];
 
 interface AutomationSettings {
   debounceSeconds: number;
@@ -27,6 +28,7 @@ export interface HistoryEntry {
 /** 历史页面上的操作全部转交扩展执行，侧边栏只做参数校验与转发。 */
 export interface HistoryHandlers {
   load: (limit: number, refresh: boolean) => Promise<void>;
+  loadMore: () => Promise<void>;
   restore: (hash: string) => Promise<void>;
   createTag: (hash: string) => Promise<void>;
   deleteTag: (hash: string, tag: string) => Promise<void>;
@@ -39,6 +41,7 @@ type IncomingMessage =
   | { type: 'setMode'; mode: SyncMode }
   | { type: 'resolveConflict'; resolution: 'local' | 'cloud' }
   | { type: 'loadHistory'; limit: number; refresh: boolean }
+  | { type: 'loadMoreHistory' }
   | { type: 'restoreCommit'; hash: string }
   | { type: 'createTag'; hash: string }
   | { type: 'deleteTag'; hash: string; tag: string };
@@ -93,6 +96,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           await this.pushState();
         } else if (message.type === 'loadHistory') {
           await this.history.load(message.limit, message.refresh);
+        } else if (message.type === 'loadMoreHistory') {
+          await this.history.loadMore();
         } else if (message.type === 'restoreCommit') {
           await this.history.restore(message.hash);
         } else if (message.type === 'createTag') {
@@ -183,7 +188,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     await this.view?.webview.postMessage({ type: 'history-close' });
   }
 
-  public async postHistoryList(entries: HistoryEntry[], options: { refreshing: boolean; hasMore: boolean }): Promise<void> {
+  /** append 为真时 entries 只是新增的一页，Webview 需要追加渲染而不是整份替换。 */
+  public async postHistoryList(
+    entries: HistoryEntry[],
+    options: { refreshing: boolean; hasMore: boolean; append: boolean },
+  ): Promise<void> {
     await this.view?.webview.postMessage({ type: 'history-list', entries, ...options });
   }
 
@@ -197,7 +206,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async showHistoryPage(): Promise<void> {
-    await this.view?.webview.postMessage({ type: 'history-open', pageSize: HISTORY_PAGE_SIZE });
+    await this.view?.webview.postMessage({ type: 'history-open', pageSize: HISTORY_PAGE_SIZE, limitMax: HISTORY_LIMIT_MAX });
     await this.history.load(HISTORY_PAGE_SIZE, true);
   }
 
@@ -245,7 +254,8 @@ button.toggle-switch.enabled{background:var(--vscode-testing-iconPassed)}button.
 .history-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}.history-header strong{flex:1;min-width:0}
 button.icon-button{margin:0;padding:3px 8px;background:transparent;color:var(--vscode-foreground);font-size:14px;line-height:1.2}button.icon-button:hover:enabled{background:var(--vscode-toolbar-hoverBackground)}
 .history-list{margin:0;padding:0;list-style:none}
-.history-item{display:flex;align-items:flex-start;gap:8px;padding:8px 0;border-bottom:1px solid var(--vscode-panel-border)}
+.history-item{display:flex;align-items:flex-start;gap:8px;padding:8px 6px;margin:0 -6px;border-radius:4px;border-bottom:1px solid var(--vscode-panel-border)}
+.history-item:hover{background:var(--vscode-list-hoverBackground)}
 .history-item>button{flex:none;margin:0;padding:4px 9px}
 .history-main{flex:1;min-width:0}.history-subject{overflow-wrap:anywhere}.history-meta{margin-top:3px;opacity:.7;font-size:11px;overflow-wrap:anywhere}
 .history-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
@@ -284,10 +294,10 @@ button.icon-button{margin:0;padding:3px 8px;background:transparent;color:var(--v
 <div id="tagMenu" class="context-menu" hidden></div>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];const toggleEnabled=document.getElementById('toggleEnabled');const editRepository=document.getElementById('editRepository');const configurationDialog=document.getElementById('configurationDialog');const configurationForm=document.getElementById('configurationForm');const cancelConfiguration=document.getElementById('cancelConfiguration');const saveConfiguration=document.getElementById('saveConfiguration');const modeButtons=[document.getElementById('modeBackup'),document.getElementById('modeSync')];const choicePanel=document.getElementById('choicePanel');const chooseLocal=document.getElementById('chooseLocal');const chooseCloud=document.getElementById('chooseCloud');let configuration={};let enabled=false;let lastSyncAt;
-const mainPage=document.getElementById('mainPage');const historyPage=document.getElementById('historyPage');const historyBody=document.getElementById('historyBody');const historyError=document.getElementById('historyError');const historyRefreshing=document.getElementById('historyRefreshing');const historyMore=document.getElementById('historyMore');const historyBack=document.getElementById('historyBack');const historyRefresh=document.getElementById('historyRefresh');const tagMenu=document.getElementById('tagMenu');let historyPageSize=30;let historyLimit=30;let historyBusy=false;
+const mainPage=document.getElementById('mainPage');const historyPage=document.getElementById('historyPage');const historyBody=document.getElementById('historyBody');const historyError=document.getElementById('historyError');const historyRefreshing=document.getElementById('historyRefreshing');const historyMore=document.getElementById('historyMore');const historyBack=document.getElementById('historyBack');const historyRefresh=document.getElementById('historyRefresh');const tagMenu=document.getElementById('tagMenu');let historyPageSize=30;let historyLimit=30;let historyLimitMax=10000;let historyBusy=false;
 historyBack.onclick=()=>showHistoryPage(false);
 historyRefresh.onclick=()=>requestHistory(historyLimit,true);
-historyMore.onclick=()=>requestHistory(historyLimit+historyPageSize,false);
+historyMore.onclick=()=>{if(historyBusy)return;historyMore.disabled=true;vscode.postMessage({type:'loadMoreHistory'})};
 addEventListener('click',closeTagMenu);
 addEventListener('keydown',(event)=>{if(event.key==='Escape')closeTagMenu()});
 addEventListener('scroll',closeTagMenu,true);
@@ -299,9 +309,9 @@ editRepository.onclick=()=>{for(const id of ids)document.getElementById(id).valu
 cancelConfiguration.onclick=()=>configurationDialog.close();
 configurationForm.onsubmit=(event)=>{event.preventDefault();const next={};for(const id of ids)next[id]=document.getElementById(id).value;const automation={debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};saveConfiguration.disabled=true;cancelConfiguration.disabled=true;vscode.postMessage({type:'save',configuration:next,automation})};
 addEventListener('message',({data})=>{if(data.type==='failure'){document.getElementById('phase').textContent='启动失败';document.getElementById('detail').textContent=data.message;document.getElementById('syncPhase').textContent='启动失败';document.getElementById('syncDot').className='dot error';document.getElementById('lastSyncAt').textContent='—';document.getElementById('syncMode').textContent='—';return}if(data.type==='configuration-saved'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;configurationDialog.close();return}if(data.type==='save-failed'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;return}
-if(data.type==='history-open'){historyPageSize=data.pageSize;historyLimit=data.pageSize;showHistoryPage(true);renderHistoryLoading();return}
+if(data.type==='history-open'){historyPageSize=data.pageSize;historyLimit=data.pageSize;historyLimitMax=data.limitMax;showHistoryPage(true);renderHistoryLoading();return}
 if(data.type==='history-close'){showHistoryPage(false);return}
-if(data.type==='history-list'){renderHistory(data.entries,data.hasMore===true,data.refreshing===true);return}
+if(data.type==='history-list'){renderHistory(data.entries,data.hasMore===true,data.refreshing===true,data.append===true);return}
 if(data.type==='history-error'){renderHistoryError(data.message);return}
 if(data.type==='history-busy'){applyHistoryBusy(data.busy===true);return}
 if(data.type!=='state')return;configuration=data.configuration;enabled=data.enabled===true;toggleEnabled.className=enabled?'toggle-switch enabled':'toggle-switch';toggleEnabled.setAttribute('aria-checked',String(enabled));toggleEnabled.setAttribute('aria-label',enabled?'停止同步':'开启同步');toggleEnabled.disabled=false;document.getElementById('repositorySummary').textContent=configuration.repositoryUrl||'未配置远程仓库';document.getElementById('branchSummary').textContent=configuration.branch||'未配置分支';for(const button of modeButtons){const active=button.dataset.mode===configuration.mode;button.className=active?'active':'';button.setAttribute('aria-pressed',String(active));button.disabled=false}document.getElementById('syncMode').textContent=data.modeLabel;document.getElementById('modeNote').textContent=data.modeNote;const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;choicePanel.hidden=s.needsChoice!==true;chooseLocal.disabled=false;chooseCloud.disabled=false;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
@@ -310,10 +320,10 @@ setInterval(renderLastSyncAt,60_000);
 function renderLastSyncAt(){const last=document.getElementById('lastSyncAt');if(!lastSyncAt){last.textContent='尚未同步';last.removeAttribute('title');return}const date=new Date(lastSyncAt);if(Number.isNaN(date.getTime())){last.textContent='时间无效';last.removeAttribute('title');return}last.textContent=date.toLocaleString()+'（'+relativeTime(date.getTime())+'）';last.title=lastSyncAt}
 function relativeTime(timestamp){const elapsed=Math.max(0,Date.now()-timestamp);if(elapsed<60_000)return'刚刚';if(elapsed<3_600_000)return Math.floor(elapsed/60_000)+'分钟前';if(elapsed<86_400_000)return Math.floor(elapsed/3_600_000)+'小时前';return Math.floor(elapsed/86_400_000)+'天前'}
 function showHistoryPage(open){mainPage.hidden=open;historyPage.hidden=!open;closeTagMenu()}
-function requestHistory(limit,refresh){if(historyBusy)return;historyLimit=limit;vscode.postMessage({type:'loadHistory',limit,refresh})}
+function requestHistory(limit,refresh){if(historyBusy)return;historyLimit=Math.min(limit,historyLimitMax);vscode.postMessage({type:'loadHistory',limit:historyLimit,refresh})}
 function renderHistoryLoading(){historyError.hidden=true;historyRefreshing.hidden=true;historyMore.hidden=true;const box=document.createElement('div');box.className='history-loading';const spinner=document.createElement('div');spinner.className='spinner';box.append(spinner);historyBody.replaceChildren(box)}
-function renderHistoryError(message){historyError.textContent=message;historyError.hidden=false;historyRefreshing.hidden=true;if(!historyBody.querySelector('.history-list'))historyBody.replaceChildren()}
-function renderHistory(entries,hasMore,refreshing){historyError.hidden=true;historyRefreshing.hidden=!refreshing;if(!entries.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='云端还没有本宿主的配置提交。';historyBody.replaceChildren(empty);historyMore.hidden=true;return}const list=document.createElement('ul');list.className='history-list';for(const entry of entries)list.append(historyItem(entry));historyBody.replaceChildren(list);historyMore.hidden=!hasMore;applyHistoryBusy(historyBusy)}
+function renderHistoryError(message){historyError.textContent=message;historyError.hidden=false;historyRefreshing.hidden=true;if(!historyBody.querySelector('.history-list'))historyBody.replaceChildren();applyHistoryBusy(historyBusy)}
+function renderHistory(entries,hasMore,refreshing,append){historyError.hidden=true;historyRefreshing.hidden=!refreshing;const current=append?historyBody.querySelector('.history-list'):null;if(current){for(const entry of entries)current.append(historyItem(entry));historyLimit+=entries.length}else if(!entries.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='云端还没有本宿主的配置提交。';historyBody.replaceChildren(empty);historyLimit=0}else{const list=document.createElement('ul');list.className='history-list';for(const entry of entries)list.append(historyItem(entry));historyBody.replaceChildren(list);historyLimit=entries.length}historyMore.hidden=!hasMore;applyHistoryBusy(historyBusy)}
 function historyItem(entry){const item=document.createElement('li');item.className='history-item';const main=document.createElement('div');main.className='history-main';const subject=document.createElement('div');subject.className='history-subject';subject.textContent=entry.subject;const meta=document.createElement('div');meta.className='history-meta';meta.textContent=entry.shortHash+' · '+historyTime(entry.committedAt);main.append(subject,meta);if(entry.tags.length){const tags=document.createElement('div');tags.className='history-tags';for(const tag of entry.tags){const badge=document.createElement('span');badge.className='history-tag';badge.textContent=tag;tags.append(badge)}main.append(tags)}const rollback=document.createElement('button');rollback.type='button';rollback.textContent='回滚';rollback.onclick=()=>{if(historyBusy)return;vscode.postMessage({type:'restoreCommit',hash:entry.hash})};item.append(main,rollback);item.oncontextmenu=(event)=>{event.preventDefault();openTagMenu(event,entry)};return item}
 function historyTime(value){const date=new Date(value);if(Number.isNaN(date.getTime()))return'时间无效';return date.toLocaleString()+'（'+relativeTime(date.getTime())+'）'}
 function openTagMenu(event,entry){if(historyBusy)return;tagMenu.replaceChildren(menuItem('新增标签…',()=>vscode.postMessage({type:'createTag',hash:entry.hash})));for(const tag of entry.tags)tagMenu.append(menuItem('删除标签 '+tag,()=>vscode.postMessage({type:'deleteTag',hash:entry.hash,tag})));tagMenu.hidden=false;tagMenu.style.left=Math.max(0,Math.min(event.clientX,innerWidth-tagMenu.offsetWidth-4))+'px';tagMenu.style.top=Math.max(0,Math.min(event.clientY,innerHeight-tagMenu.offsetHeight-4))+'px'}
@@ -341,11 +351,13 @@ function parseMessage(raw: unknown): IncomingMessage | undefined {
   }
   if (value.type === 'loadHistory') {
     const limit = value.limit;
-    const valid = typeof limit === 'number' && Number.isInteger(limit)
-      && limit >= HISTORY_PAGE_SIZE && limit <= MAX_COMMIT_LIST
+    // 翻页靠 loadMoreHistory 累加，单次请求仍收在 HISTORY_LIMIT_MAX 内，同时挡掉 Infinity / NaN。
+    const valid = typeof limit === 'number' && Number.isSafeInteger(limit)
+      && limit >= HISTORY_PAGE_SIZE && limit <= HISTORY_LIMIT_MAX
       && typeof value.refresh === 'boolean';
     return valid ? { type: 'loadHistory', limit: limit as number, refresh: value.refresh as boolean } : undefined;
   }
+  if (value.type === 'loadMoreHistory') return { type: 'loadMoreHistory' };
   if (value.type === 'restoreCommit' || value.type === 'createTag' || value.type === 'deleteTag') {
     if (typeof value.hash !== 'string' || !/^[0-9a-f]{40}$/.test(value.hash)) return undefined;
     if (value.type === 'restoreCommit') return { type: 'restoreCommit', hash: value.hash };
