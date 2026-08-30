@@ -2,6 +2,7 @@
 .gitignore
 .vscode/**
 .github/**
+.debug/**
 src/**
 test/**
 tmp
