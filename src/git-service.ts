@@ -9,7 +9,6 @@ export type PullState = 'cloned' | 'unrelated' | 'synced';
 
 /** 提交说明可能包含空格与换行，字段之间用不会出现在文本里的分隔符，避免解析歧义。 */
 const COMMIT_FIELD_SEPARATOR = '\x1f';
-export const MAX_COMMIT_LIST = 100;
 
 /** 云端历史中的一条提交，只用于展示和选择还原目标。 */
 export interface RepositoryCommit {
@@ -90,16 +89,18 @@ export class ConfigurationRepositoryGitService {
    * 只读本地 origin 跟踪分支上的历史，不发起任何网络调用。
    * 本地还没有该跟踪分支时返回 undefined，与「有分支但没有本宿主提交」的空数组区分开：
    * 前者要让界面显示加载中，后者要显示「云端还没有提交」。
+   * offset 用于「加载更多」只取新的一页，不必把已经取过的那部分重新遍历一遍。
    */
   public async listCachedCommits(
     configuration: SyncConfiguration,
     host: HostKind,
     limit = 30,
+    offset = 0,
   ): Promise<RepositoryCommit[] | undefined> {
     await this.ensureOrigin(configuration);
     const localTip = await this.git(['rev-parse', '--verify', `origin/${configuration.branch}`], true);
     if (localTip.exitCode !== 0) return undefined;
-    return this.readCommits(configuration, host, limit);
+    return this.readCommits(configuration, host, limit, offset);
   }
 
   /**
@@ -130,7 +131,8 @@ export class ConfigurationRepositoryGitService {
     // 显式给出标签 refspec 才能让远端删掉的标签在本机同步消失：给了分支 refspec 后 --prune-tags 不再生效。
     // 本地不会有未推送的标签，createTag 推送失败会回滚，因此按远端整份对齐是安全的。
     if (needed) await this.git(['fetch', '--prune', 'origin', configuration.branch, '+refs/tags/*:refs/tags/*']);
-    return this.readCommits(configuration, host, limit);
+    // 刷新永远是重新核对最前面这一段，「加载更多」不会触发刷新，因此 offset 固定为 0。
+    return this.readCommits(configuration, host, limit, 0);
   }
 
   /** 给指定提交打标签并推到远端。标签是共享的，只存在本机没有意义。 */
@@ -241,12 +243,17 @@ export class ConfigurationRepositoryGitService {
     return result.exitCode === 0 ? result.stdout : undefined;
   }
 
-  /** 从本地 origin 跟踪分支读取历史，%D 带出指向各提交的标签。 */
-  private async readCommits(configuration: SyncConfiguration, host: HostKind, limit: number): Promise<RepositoryCommit[]> {
-    const count = Math.min(Math.max(Math.trunc(limit), 1), MAX_COMMIT_LIST);
+  /**
+   * 从本地 origin 跟踪分支读取历史，%D 带出指向各提交的标签。不设条数上限，交给调用方按需分页。
+   * offset 用 `--skip` 实现：只让 Git 遍历新的一页，不重新遍历前面已经取过的部分。
+   */
+  private async readCommits(configuration: SyncConfiguration, host: HostKind, limit: number, offset: number): Promise<RepositoryCommit[]> {
+    const count = Math.max(Math.trunc(limit), 1);
+    const skip = Math.max(Math.trunc(offset), 0);
     const log = await this.git([
       'log',
       `--max-count=${count}`,
+      `--skip=${skip}`,
       '--no-color',
       '--decorate=full',
       '-z',

@@ -2350,6 +2350,12 @@ test('云端历史只列出动过本宿主目录的提交', async () => {
     // 没有本地跟踪分支时返回 undefined，界面据此显示加载中而不是「云端没有提交」。
     assert.equal(await service.listCachedCommits({ ...configuration, branch: 'missing' }, 'vscode'), undefined);
 
+    // 「加载更多」用 offset 只取新的一页：跳过已经取过的第一条，正好读到第二条。
+    const nextPage = await service.listCachedCommits(configuration, 'vscode', 1, 1);
+    assert.deepEqual(nextPage?.map((commit) => commit.subject), ['第一次 备份：初始配置']);
+    // offset 超过总数时返回空数组，界面据此隐藏「加载更多」，而不是报错。
+    assert.deepEqual(await service.listCachedCommits(configuration, 'vscode', 30, 2), []);
+
     // 导出历史宿主树只取该提交里的内容，越界路径与其他宿主目录都不参与。
     const exported = path.join(root, 'exported');
     assert.equal(await service.exportHostTree(commits[1]!.hash, 'vscode', exported), true);

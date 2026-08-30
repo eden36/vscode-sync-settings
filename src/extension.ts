@@ -5,7 +5,7 @@ import { AiService } from './ai';
 import { ConfigurationStore } from './configuration';
 import { isValidTagName } from './configuration-record';
 import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
-import { ConfigurationRepositoryGitService, MAX_COMMIT_LIST, RepositoryCommit } from './git-service';
+import { ConfigurationRepositoryGitService, RepositoryCommit } from './git-service';
 import { detectHost } from './host';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
@@ -51,6 +51,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     async (resolution) => applyResolution(resolution),
     {
       load: async (limit, refresh) => loadHistory(limit, refresh),
+      loadMore: async () => loadMoreHistory(),
       restore: async (hash) => restoreFromHistory(hash),
       createTag: async (hash) => createHistoryTag(hash),
       deleteTag: async (hash, tag) => deleteHistoryTag(hash, tag),
@@ -112,6 +113,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let historyCommits: RepositoryCommit[] = [];
   let historyLimit = HISTORY_PAGE_SIZE;
   let historyBusy = false;
+  // 「加载更多」是纯本地的增量读取，与 historyBusy（还原/标签这类需要独占锁的操作）分开防抖，避免连点造成重复追加。
+  let historyLoadingMore = false;
+  // 整份加载（首次打开、刷新）与「加载更多」必须互斥：两者都要独占锁，交叉执行会互相抢锁报错，
+  // 而且刷新回来的整份列表会把刚追加的那一页覆盖掉。
+  let historyLoading = false;
 
   // 同步全过程不弹通知，状态只落在状态栏和侧边栏，避免打断用户。
   const statusBar = vscode.window.createStatusBarItem('profileGitSync.status', vscode.StatusBarAlignment.Right, 100);
@@ -342,19 +348,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await sidebar.openHistoryPage();
   };
 
+  const toHistoryEntry = (commit: RepositoryCommit) => ({
+    hash: commit.hash,
+    shortHash: commit.shortHash,
+    subject: commit.subject || '（无提交说明）',
+    committedAt: commit.committedAt,
+    tags: commit.tags,
+  });
+
+  /** 整份替换：用于初次打开、刷新、以及标签操作后的重渲染，起点固定是 offset 0。 */
   const publishHistory = async (commits: RepositoryCommit[], limit: number, refreshing: boolean) => {
     historyCommits = commits;
     historyLimit = limit;
     await sidebar.postHistoryList(
-      commits.map((commit) => ({
-        hash: commit.hash,
-        shortHash: commit.shortHash,
-        subject: commit.subject || '（无提交说明）',
-        committedAt: commit.committedAt,
-        tags: commit.tags,
-      })),
-      // 取满了才可能还有更早的提交；再往上取由 git-service 的上限收口。
-      { refreshing, hasMore: commits.length >= limit && limit < MAX_COMMIT_LIST },
+      commits.map(toHistoryEntry),
+      // 取满了才可能还有更早的提交；不设固定封顶，一直点「加载更多」直到某次取到的条数不足 limit 为止。
+      { refreshing, hasMore: commits.length >= limit, append: false },
     );
   };
 
@@ -365,6 +374,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await sidebar.postHistoryError('请填写 Git 仓库地址。');
       return;
     }
+    // 上一轮整份加载还没结束（刷新要走一次网络往返），重复进入只会互相抢锁失败。
+    if (historyLoading) return;
+    historyLoading = true;
     try {
       let cached: RepositoryCommit[] | undefined;
       const acquired = await coordinator!.runExclusive(async () => {
@@ -381,18 +393,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
+      // 进来时列表可能已经被「加载更多」追加过若干页，按已加载的条数刷新，避免整份替换把这些页截掉。
+      const refreshLimit = Math.max(limit, historyCommits.length);
       let refreshed: RepositoryCommit[] = [];
       const refreshedLock = await coordinator!.runExclusive(async () => {
-        refreshed = await configurationRepository.refreshCommits(configuration, environment.kind, limit);
+        refreshed = await configurationRepository.refreshCommits(configuration, environment.kind, refreshLimit);
       });
       if (!refreshedLock) {
         await sidebar.postHistoryError('另一窗口正在执行同步，云端记录暂未刷新。');
         return;
       }
-      await publishHistory(refreshed, limit, false);
+      await publishHistory(refreshed, refreshLimit, false);
     } catch (error) {
       // 查看历史失败不影响同步本身，不升级为同步失败状态。
       await sidebar.postHistoryError(error instanceof Error ? error.message : String(error));
+    } finally {
+      historyLoading = false;
+    }
+  };
+
+  /**
+   * 「加载更多」：只按当前已加载的条数作为 offset 向本地仓库要新的一页，不联网、也不重新遍历前面已经取过的提交。
+   * historyLoadingMore 防止连点时两次请求都读到同一个 offset，重复追加出两份相同的行。
+   */
+  const loadMoreHistory = async () => {
+    // Webview 一点下按钮就把它禁用了，这里放弃这次追加时必须回一条状态，否则按钮再也恢复不了。
+    if (historyBusy || historyLoading || historyLoadingMore) {
+      await sidebar.postHistoryBusy(historyBusy);
+      return;
+    }
+    historyLoadingMore = true;
+    try {
+      const configuration = configurationStore.get();
+      const offset = historyCommits.length;
+      let more: RepositoryCommit[] | undefined;
+      const acquired = await coordinator!.runExclusive(async () => {
+        more = await configurationRepository.listCachedCommits(configuration, environment.kind, HISTORY_PAGE_SIZE, offset);
+      });
+      if (!acquired) {
+        await sidebar.postHistoryError('仓库正被同步占用，请稍后重试加载更多。');
+        return;
+      }
+      const added = more ?? [];
+      historyCommits = historyCommits.concat(added);
+      historyLimit = historyCommits.length;
+      await sidebar.postHistoryList(
+        added.map(toHistoryEntry),
+        { refreshing: false, hasMore: added.length >= HISTORY_PAGE_SIZE, append: true },
+      );
+    } catch (error) {
+      await sidebar.postHistoryError(error instanceof Error ? error.message : String(error));
+    } finally {
+      historyLoadingMore = false;
     }
   };
 
