@@ -2,7 +2,7 @@
   "name": "my-setting-sync",
   "displayName": "My Setting Sync",
   "description": "在 VS Code 与 Cursor 中通过 Git 自动同步全部用户配置文件。",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "publisher": "saltcoreyan",
   "license": "MIT",
   "icon": "media/profile-git-sync.png",
@@ -117,7 +117,8 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "test": "npm run build && node esbuild.test.mjs && node --test dist/test.cjs",
-    "package": "npm run check && npm run test && vsce package --no-dependencies"
+    "vscode:prepublish": "npm run check && npm run test",
+    "package": "vsce package --no-dependencies"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1"

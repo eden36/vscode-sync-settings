@@ -825,6 +825,11 @@ test('扩展产物不包含 jsonc-parser 的未打包相对加载', async () => 
   assert.doesNotMatch(bundle, /require\w*\(["']\.\/impl\//);
 });
 
+test('扩展产物注册云端提交历史命令', async () => {
+  const bundle = await readFile(path.join(process.cwd(), 'dist', 'extension.js'), 'utf8');
+  assert.match(bundle, /registerCommand\(["']profileGitSync\.showHistory["']/);
+});
+
 test('解析 chat.utilitySmallModel 的 vendor/id 设置', () => {
   assert.deepEqual(parseUtilityModelSetting('copilot/gpt-4o-mini'), {
     vendor: 'copilot',
