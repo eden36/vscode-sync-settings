@@ -11,4 +11,5 @@ tsconfig.json
 esbuild.mjs
 esbuild.test.mjs
 *.vsix
-dist/test*
+dist/test/**
+scripts/**

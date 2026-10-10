@@ -490,9 +490,11 @@ function sha256(content: Buffer): string {
 /**
  * 仓库形态统一按 LF 存放：两台机器的 Git 换行符配置不同时，
  * 同一份配置会被写成 CRLF 与 LF 两种字节，不归一就会算出两个哈希，判成双方都有改动。
- * 不含 CRLF 的内容原样返回，避免对二进制内容做无谓的编解码。
+ * 含 NUL 字节的按二进制处理、原样返回：按 UTF-8 解码再编码是有损的，会把非文本文件改坏后推上云端。
+ * 不含 CRLF 的内容同样原样返回。
  */
 function normalizeLineEndings(content: Buffer): Buffer {
+  if (content.includes(0)) return content;
   const text = content.toString('utf8');
   if (!text.includes('\r\n')) return content;
   return Buffer.from(text.replaceAll('\r\n', '\n'), 'utf8');

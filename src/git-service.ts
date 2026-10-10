@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { isValidTagName } from './configuration-record';
-import { runProcess, runProcessBinary } from './process';
+import { runProcess } from './process';
 import { HostKind, SyncConfiguration } from './types';
 
 /** cloned：本地没有历史，已直接检出远端；unrelated：与远端没有共同祖先；synced：与远端同源。 */
@@ -50,6 +50,9 @@ export class ConfigurationRepositoryGitService {
     // 仓库只是本机缓存，检出与提交都必须是原样字节；换行符转换会让同一份配置在两台机器上算出不同哈希。
     await this.git(['config', 'core.autocrlf', 'false']);
 
+    // Git 进程被超时结束或随窗口被强制关闭时会留下 index.lock，之后每条写索引的命令都会失败。
+    // 流程在独占锁内执行，此刻不会有别的 Git 进程在用这个仓库，残留的锁可以直接清掉。
+    await fs.rm(path.join(this.repositoryPath, '.git', 'index.lock'), { force: true });
     // 插件进程被强制关闭时，Git 可能残留未完成的操作；内部仓库可安全中止后重建快照。
     await this.git(['rebase', '--abort'], true);
     await this.git(['merge', '--abort'], true);
@@ -175,25 +178,37 @@ export class ConfigurationRepositoryGitService {
     await fs.rm(path.join(this.repositoryPath, '.git'), { recursive: true, force: true });
   }
 
-  /** 把指定提交里的宿主目录导出到独立目录，用于还原历史配置。 */
+  /**
+   * 把指定提交里的宿主目录导出到独立目录，用于还原历史配置。
+   * 借一个临时目录当工作区一次检出整棵子树，不必为每个文件起一个进程；
+   * 只写那个临时工作区、不带 --staged，仓库自己的工作区与索引都不受影响。
+   */
   public async exportHostTree(commit: string, host: string, targetRoot: string): Promise<boolean> {
+    if (!/^[0-9a-f]{40}$/.test(commit)) return false;
     const prefix = `.profile-git-sync/hosts/${host}`;
     const listed = await this.git(['ls-tree', '-r', '-z', '--name-only', commit, '--', prefix], true);
-    if (listed.exitCode !== 0) return false;
-    const files = listed.stdout.split('\0').filter(Boolean);
-    if (!files.length) return false;
+    if (listed.exitCode !== 0 || !listed.stdout) return false;
+
     const resolvedRoot = path.resolve(targetRoot);
-    await fs.mkdir(resolvedRoot, { recursive: true });
-    for (const file of files) {
-      const relative = file.slice(prefix.length + 1);
-      const target = path.resolve(resolvedRoot, ...relative.split('/'));
-      if (!relative || !target.startsWith(`${resolvedRoot}${path.sep}`)) return false;
-      const blob = await runProcessBinary('git', ['show', `${commit}:${file}`], this.repositoryPath);
-      if (blob.exitCode !== 0) return false;
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(target, blob.stdout);
+    const checkoutRoot = `${resolvedRoot}.checkout`;
+    await fs.rm(checkoutRoot, { recursive: true, force: true });
+    await fs.mkdir(checkoutRoot, { recursive: true });
+    try {
+      const restored = await this.git([
+        // 提交内容来自远端，不可信：符号链接一律按普通文件检出，否则后续读取会顺着它读到快照目录之外。
+        '-c', 'core.symlinks=false',
+        '-c', 'core.autocrlf=false',
+        `--work-tree=${checkoutRoot}`,
+        'restore', `--source=${commit}`, '--worktree', '--', prefix,
+      ], true);
+      if (restored.exitCode !== 0) return false;
+      await fs.rm(resolvedRoot, { recursive: true, force: true });
+      await fs.mkdir(path.dirname(resolvedRoot), { recursive: true });
+      await fs.rename(path.join(checkoutRoot, '.profile-git-sync', 'hosts', host), resolvedRoot);
+      return true;
+    } finally {
+      await fs.rm(checkoutRoot, { recursive: true, force: true });
     }
-    return true;
   }
 
   public async discardPendingHostChanges(host: string): Promise<boolean> {

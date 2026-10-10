@@ -7,6 +7,7 @@ import { findPotentialSecrets } from '../secret-scanner';
 import { readManifest, snapshotDigest } from '../snapshot-conflict';
 import { fallbackCommitMessage } from '../sync-fallback';
 import { decideCloudAdopt } from '../sync-strategy';
+import { SnapshotManifest, SyncBaseline } from '../types';
 import { chooseStage } from './choose';
 import { requireValue, Stage, StageOutcome, SyncContext } from './types';
 
@@ -83,7 +84,7 @@ const decideStage: Stage = {
 export const pushStage: Stage = {
   name: 'push',
   async run(context: SyncContext): Promise<StageOutcome> {
-    const { git, ai, environment, windowSafety, updateStatus, deviceName } = context.dependencies;
+    const { git, ai, environment, windowSafety, updateStatus, deviceName, runtimeState } = context.dependencies;
     // 采用云端或两侧都没改时仓库内容没被改写，但上次推送失败留下的提交仍要补推。
     const changed = context.artifacts.choice === 'local' ? await git.stageHost(environment.kind) : [];
     context.report.changedFileCount = changed.length;
@@ -111,6 +112,17 @@ export const pushStage: Stage = {
 
     if (message) await git.commitAndPush(context.configuration, message);
     else await git.pushIfAhead(context.configuration);
+
+    // 采用本机并推送成功后，仓库内容就是本机这份快照，基准此刻就要前移。
+    // 留到 finalize 才写的话，之后被写回前的二次确认拦住、被取消或扩展步骤抛错，下一轮都会把自己刚推的内容判成云端改动。
+    // 还原流程的仓库内容是历史快照而不是本机清单，仍由 finalize 记录。
+    if (context.artifacts.choice === 'local' && !context.restoreTarget) {
+      await runtimeState.update({
+        baseline: await computeBaseline(context, requireValue(context.artifacts.localManifest, 'localManifest')),
+        // 用户的选择到这里已经兑现，留着会被下一次真正的冲突自动沿用。
+        pendingResolution: undefined,
+      });
+    }
     return { kind: 'continue' };
   },
 };
@@ -185,21 +197,13 @@ export const finalizeStage: Stage = {
     const local = wroteBack
       ? await adapter.createSnapshot(context.paths.localHostRoot)
       : requireValue(context.artifacts.localManifest, 'localManifest');
-    const cloud = await readManifest(context.paths.repositoryHostRoot);
-    const localDigest = snapshotDigest(local);
-    const cloudDigest = snapshotDigest(cloud);
     const pending = context.report.extensionsPending ?? [];
     const previous = runtimeState.get();
     const rounds = pending.length ? (previous.extensionsPendingRounds ?? 0) + 1 : 0;
     // 扩展迟迟装不上（例如已下架）时不能无限等待，否则清单会永远被排除在改动判定之外。
     const settling = pending.length > 0 && rounds < EXTENSION_SETTLE_ROUNDS;
     await runtimeState.update({
-      baseline: {
-        localSnapshot: localDigest.snapshot,
-        localExtensions: localDigest.extensions,
-        cloudSnapshot: cloudDigest.snapshot,
-        cloudExtensions: cloudDigest.extensions,
-      },
+      baseline: await computeBaseline(context, local),
       extensionsPending: settling ? pending : undefined,
       extensionsPendingRounds: settling ? rounds : undefined,
       // 用户的选择在这里才算兑现：中途失败保留它，下一轮直接沿用，不再重复询问。
@@ -264,6 +268,18 @@ function windowBlock(safety: WindowSafetySnapshot): StageOutcome | undefined {
     };
   }
   return undefined;
+}
+
+/** 基准的两处写入（推送成功后、整轮结束时）必须是同一种算法，否则下一轮会把自己写下的基准判成改动。 */
+async function computeBaseline(context: SyncContext, local: SnapshotManifest): Promise<SyncBaseline> {
+  const localDigest = snapshotDigest(local);
+  const cloudDigest = snapshotDigest(await readManifest(context.paths.repositoryHostRoot));
+  return {
+    localSnapshot: localDigest.snapshot,
+    localExtensions: localDigest.extensions,
+    cloudSnapshot: cloudDigest.snapshot,
+    cloudExtensions: cloudDigest.extensions,
+  };
 }
 
 async function exists(filePath: string): Promise<boolean> {

@@ -1,10 +1,10 @@
 import * as path from 'node:path';
 import { withFileLock } from './file-lock';
 import { atomicWriteJson, readJsonFile as readJson } from './json-store';
-import { LinkState, SyncBaseline } from './types';
+import { LINK_STATES, LinkState, SyncBaseline } from './types';
 
 const RUNTIME_STATE_LOCK_BUSY = '同步状态正在被其他窗口更新，请稍后重试。';
-const LINK_STATES = new Set<LinkState>(['no-repository', 'in-sync', 'unrelated']);
+const KNOWN_LINK_STATES = new Set<string>(LINK_STATES);
 /** 显式传 undefined 表示删除，这些键不能靠展开保留旧值。 */
 const OPTIONAL_KEYS = ['lastSyncAt', 'baseline', 'extensionsPending', 'extensionsPendingRounds', 'pendingResolution'] as const;
 
@@ -97,7 +97,7 @@ export class RuntimeStateStore {
 export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefined {
   if (!isRecord(value) || value.schemaVersion !== 1) return undefined;
   if (typeof value.enabled !== 'boolean' || typeof value.cloudAdoptPending !== 'boolean') return undefined;
-  if (typeof value.link !== 'string' || !LINK_STATES.has(value.link as LinkState)) return undefined;
+  if (typeof value.link !== 'string' || !KNOWN_LINK_STATES.has(value.link)) return undefined;
   if (value.lastSyncAt !== undefined && typeof value.lastSyncAt !== 'string') return undefined;
   const baseline = parseBaseline(value.baseline);
   const extensionsPending = parseStringArray(value.extensionsPending);

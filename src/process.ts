@@ -17,7 +17,7 @@ export async function runProcess(command: string, args: string[], cwd?: string, 
   return { stdout: result.stdout.toString('utf8').trim(), stderr: result.stderr, exitCode: result.exitCode };
 }
 
-/** 导出仓库文件内容时不能按文本裁剪，否则写回的文件与仓库版本不一致。 */
+/** 标准输出原样按字节返回，不解码也不裁剪首尾空白。 */
 export function runProcessBinary(command: string, args: string[], cwd?: string, timeoutMs = 60_000): Promise<BinaryProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -29,7 +29,13 @@ export function runProcessBinary(command: string, args: string[], cwd?: string, 
     const stdout: Buffer[] = [];
     let stderr = '';
     const timer = setTimeout(() => {
-      child.kill();
+      // Windows 上 kill 只结束进程本体，Git 拉起的 git-remote-https、ssh 会留下来继续占着仓库锁，必须连进程树一起结束。
+      if (process.platform === 'win32' && child.pid !== undefined) {
+        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' })
+          .on('error', () => child.kill());
+      } else {
+        child.kill();
+      }
       reject(new Error(`命令执行超时：${command}`));
     }, timeoutMs);
     child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));

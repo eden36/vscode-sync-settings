@@ -3,39 +3,48 @@ export type HostKind = 'vscode' | 'cursor';
 /** 备份模式只把本机配置提交到仓库，同步模式才会把仓库内容写回本机。 */
 export type SyncMode = 'backup' | 'sync';
 
+// 以下三组取值同时用于类型与跨窗口共享文件的解析校验，必须由同一份数组派生：
+// 分开手写时漏掉一项，其他窗口就会把带该取值的状态整份拒收。
+
 /** 同步流程内部的步骤，只用于进度展示，不参与任何判定。 */
-export type StageName =
-  | 'snapshot'
-  | 'scan-secrets'
-  | 'prepare'
-  | 'pull'
-  | 'decide'
-  | 'choose'
-  | 'ai'
-  | 'push'
-  | 'apply'
-  | 'extensions'
-  | 'finalize'
-  | 'export-history';
+export const STAGE_NAMES = [
+  'snapshot',
+  'scan-secrets',
+  'prepare',
+  'pull',
+  'decide',
+  'choose',
+  'ai',
+  'push',
+  'apply',
+  'extensions',
+  'finalize',
+  'export-history',
+] as const;
+export type StageName = (typeof STAGE_NAMES)[number];
 
 /** 同步暂停的原因，决定了何时可以自动恢复。 */
-export type BlockReason =
-  | 'dirty-windows'
-  | 'unreadable-windows'
-  | 'other-windows'
-  | 'unrelated'
-  | 'both-changed'
-  | 'local-changed'
-  | 'exclusive-lock';
+export const BLOCK_REASONS = [
+  'dirty-windows',
+  'unreadable-windows',
+  'other-windows',
+  'unrelated',
+  'both-changed',
+  'local-changed',
+  'exclusive-lock',
+] as const;
+export type BlockReason = (typeof BLOCK_REASONS)[number];
 
 /**
  * 本机仓库与远端的关系，是同步流程的输出。
  * 改变仓库的动作自身产出新值，因此不需要探测磁盘，也不会与磁盘事实脱钩。
  */
-export type LinkState =
-  | 'no-repository'
-  | 'in-sync'
-  | 'unrelated';
+export const LINK_STATES = [
+  'no-repository',
+  'in-sync',
+  'unrelated',
+] as const;
+export type LinkState = (typeof LINK_STATES)[number];
 
 /** 扩展当前在做什么。与 LinkState 正交，两者共同决定对外显示的状态。 */
 export type SyncState =

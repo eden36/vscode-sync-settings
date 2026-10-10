@@ -1,29 +1,18 @@
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
 import { ConfigurationStore } from './configuration';
-import { hasEmbeddedCredentials, isValidBranch, isValidTagName } from './configuration-record';
+import { hasEmbeddedCredentials } from './configuration-record';
+import {
+  HISTORY_LIMIT_MAX,
+  HISTORY_PAGE_SIZE,
+  HistoryEntry,
+  OutgoingMessage,
+  parseMessage,
+} from './sidebar-messages';
 import { displayPhase, displayTone, modeLabel, modeNote, stageLabel } from './sidebar-status';
-import { RuntimeStatus, SyncConfiguration, SyncMode } from './types';
+import { RuntimeStatus, SyncMode } from './types';
 
-/** 历史页面每次向扩展索要的条数，「加载更多」在此基础上累加，翻页次数不封顶。 */
-export const HISTORY_PAGE_SIZE = 30;
-// 翻页不设固定条数上限，但单次请求必须有上限：这一段跨信任边界，畸形消息传入超大数字会让 git log 遍历整个历史。
-const HISTORY_LIMIT_MAX = 10_000;
 const HISTORY_MESSAGES: string[] = ['loadHistory', 'loadMoreHistory', 'restoreCommit', 'createTag', 'deleteTag'];
-
-interface AutomationSettings {
-  debounceSeconds: number;
-  pollIntervalSeconds: number;
-}
-
-/** 历史页面上要显示的一条提交，时间格式化交给 Webview，与上次同步时间的渲染方式一致。 */
-export interface HistoryEntry {
-  hash: string;
-  shortHash: string;
-  subject: string;
-  committedAt: string;
-  tags: string[];
-}
 
 /** 历史页面上的操作全部转交扩展执行，侧边栏只做参数校验与转发。 */
 export interface HistoryHandlers {
@@ -34,17 +23,17 @@ export interface HistoryHandlers {
   deleteTag: (hash: string, tag: string) => Promise<void>;
 }
 
-type IncomingMessage =
-  | { type: 'ready' }
-  | { type: 'save'; configuration: SyncConfiguration; automation: AutomationSettings }
-  | { type: 'toggleEnabled'; enabled: boolean }
-  | { type: 'setMode'; mode: SyncMode }
-  | { type: 'resolveConflict'; resolution: 'local' | 'cloud' }
-  | { type: 'loadHistory'; limit: number; refresh: boolean }
-  | { type: 'loadMoreHistory' }
-  | { type: 'restoreCommit'; hash: string }
-  | { type: 'createTag'; hash: string }
-  | { type: 'deleteTag'; hash: string; tag: string };
+export interface SidebarOptions {
+  /** 扩展安装目录，用于定位随包发布的 Webview 脚本与样式。 */
+  extensionUri: vscode.Uri;
+  configurationStore: ConfigurationStore;
+  status: () => RuntimeStatus;
+  onConfigurationSaved: () => Promise<void>;
+  isEnabled: () => boolean;
+  setEnabled: (enabled: boolean) => Promise<void>;
+  onResolveConflict: (resolution: 'local' | 'cloud') => Promise<void>;
+  history: HistoryHandlers;
+}
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -53,19 +42,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   /** 面板尚未打开过时收到的打开历史请求，等视图就绪后补发。 */
   private historyRequested = false;
 
-  public constructor(
-    private readonly configurationStore: ConfigurationStore,
-    private readonly status: () => RuntimeStatus,
-    private readonly onConfigurationSaved: () => Promise<void>,
-    private readonly isEnabled: () => boolean,
-    private readonly setEnabled: (enabled: boolean) => Promise<void>,
-    private readonly onResolveConflict: (resolution: 'local' | 'cloud') => Promise<void>,
-    private readonly history: HistoryHandlers,
-  ) {}
+  public constructor(private readonly options: SidebarOptions) {}
 
   public resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
-    view.webview.options = { enableScripts: true };
+    view.webview.options = {
+      enableScripts: true,
+      // 只放行随包发布的两处资源目录，Webview 读不到扩展目录里的其他文件。
+      localResourceRoots: [
+        vscode.Uri.joinPath(this.options.extensionUri, 'media'),
+        vscode.Uri.joinPath(this.options.extensionUri, 'dist', 'webview'),
+      ],
+    };
     view.webview.html = this.html(view.webview);
     view.webview.onDidReceiveMessage(async (raw: unknown) => {
       const message = parseMessage(raw);
@@ -86,42 +74,42 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             await this.showHistoryPage();
           }
         } else if (message.type === 'toggleEnabled') {
-          await this.setEnabled(message.enabled);
+          await this.options.setEnabled(message.enabled);
           await this.pushState();
         } else if (message.type === 'resolveConflict') {
-          await this.onResolveConflict(message.resolution);
+          await this.options.onResolveConflict(message.resolution);
           await this.pushState();
         } else if (message.type === 'setMode') {
           await this.applyMode(message.mode);
           await this.pushState();
         } else if (message.type === 'loadHistory') {
-          await this.history.load(message.limit, message.refresh);
+          await this.options.history.load(message.limit, message.refresh);
         } else if (message.type === 'loadMoreHistory') {
-          await this.history.loadMore();
+          await this.options.history.loadMore();
         } else if (message.type === 'restoreCommit') {
-          await this.history.restore(message.hash);
+          await this.options.history.restore(message.hash);
         } else if (message.type === 'createTag') {
-          await this.history.createTag(message.hash);
+          await this.options.history.createTag(message.hash);
         } else if (message.type === 'deleteTag') {
-          await this.history.deleteTag(message.hash, message.tag);
+          await this.options.history.deleteTag(message.hash, message.tag);
         } else if (message.type === 'save') {
           if (hasEmbeddedCredentials(message.configuration.repositoryUrl)) {
             void vscode.window.showErrorMessage('配置同步仓库地址不能包含明文凭据，请使用 SSH 或系统凭据管理器。');
             return;
           }
-          await this.configurationStore.save({
-            ...this.configurationStore.get(),
+          await this.options.configurationStore.save({
+            ...this.options.configurationStore.get(),
             ...message.configuration,
             ...message.automation,
           });
-          await this.onConfigurationSaved();
-          await this.view?.webview.postMessage({ type: 'configuration-saved' });
+          await this.options.onConfigurationSaved();
+          await this.post({ type: 'configuration-saved' });
           await this.pushState();
         }
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         // 处理失败时必须回显并刷新，否则侧边栏会一直停在中间态。
-        if (message.type === 'save') await this.view?.webview.postMessage({ type: 'save-failed' });
+        if (message.type === 'save') await this.post({ type: 'save-failed' });
         // 历史页面的失败显示在页面内，弹窗会盖住用户正在看的列表。
         if (HISTORY_MESSAGES.includes(message.type)) {
           await this.postHistoryError(detail);
@@ -148,27 +136,27 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   public async pushState(): Promise<void> {
     if (this.failure !== undefined) {
-      await this.view?.webview.postMessage({ type: 'failure', message: this.failure });
+      await this.post({ type: 'failure', message: this.failure });
       return;
     }
     if (!this.ready) return;
-    const status = this.status();
-    const configuration = this.configurationStore.get();
-    // 状态判定全部在此完成，内联脚本只负责按结果渲染。
-    await this.view?.webview.postMessage({
+    const status = this.options.status();
+    const configuration = this.options.configurationStore.get();
+    // 状态判定全部在此完成，Webview 脚本只负责按结果渲染。
+    await this.post({
       type: 'state',
       configuration,
-      enabled: this.isEnabled(),
+      enabled: this.options.isEnabled(),
       modeLabel: modeLabel(configuration.mode),
       modeNote: modeNote(configuration.mode),
       status: {
         ...status,
         displayPhase: displayPhase(status.sync, status.link),
         tone: displayTone(status.sync, status.link),
-        stage: status.sync.kind === 'running' ? stageLabel(status.sync.stage) : undefined,
-        // 判定放在这里：内联脚本只按结果显示或隐藏选择面板。
+        ...(status.sync.kind === 'running' ? { stage: stageLabel(status.sync.stage) } : {}),
+        // 判定放在这里：Webview 脚本只按结果显示或隐藏选择面板。
         needsChoice: status.sync.kind === 'blocked' && status.sync.reason === 'both-changed',
-      }
+      },
     });
   }
 
@@ -185,7 +173,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   public async closeHistoryPage(): Promise<void> {
-    await this.view?.webview.postMessage({ type: 'history-close' });
+    await this.post({ type: 'history-close' });
   }
 
   /** append 为真时 entries 只是新增的一页，Webview 需要追加渲染而不是整份替换。 */
@@ -193,25 +181,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     entries: HistoryEntry[],
     options: { refreshing: boolean; hasMore: boolean; append: boolean },
   ): Promise<void> {
-    await this.view?.webview.postMessage({ type: 'history-list', entries, ...options });
+    await this.post({ type: 'history-list', entries, ...options });
   }
 
   public async postHistoryError(message: string): Promise<void> {
-    await this.view?.webview.postMessage({ type: 'history-error', message });
+    await this.post({ type: 'history-error', message });
   }
 
   /** 还原与标签操作期间禁用页面按钮，避免同一条提交被连点两次。 */
   public async postHistoryBusy(busy: boolean): Promise<void> {
-    await this.view?.webview.postMessage({ type: 'history-busy', busy });
+    await this.post({ type: 'history-busy', busy });
   }
 
   private async showHistoryPage(): Promise<void> {
-    await this.view?.webview.postMessage({ type: 'history-open', pageSize: HISTORY_PAGE_SIZE, limitMax: HISTORY_LIMIT_MAX });
-    await this.history.load(HISTORY_PAGE_SIZE, true);
+    await this.post({ type: 'history-open', pageSize: HISTORY_PAGE_SIZE, limitMax: HISTORY_LIMIT_MAX });
+    await this.options.history.load(HISTORY_PAGE_SIZE, true);
   }
 
   private async applyMode(mode: SyncMode): Promise<void> {
-    const current = this.configurationStore.get();
+    const current = this.options.configurationStore.get();
     if (current.mode === mode) return;
     // 切到同步模式后云端内容会覆盖本机配置文件，属于破坏性变更，必须先确认。
     if (mode === 'sync') {
@@ -225,48 +213,26 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       );
       if (confirmed !== '切换到同步模式') return;
     }
-    await this.configurationStore.save({ ...current, mode });
-    await this.onConfigurationSaved();
+    await this.options.configurationStore.save({ ...current, mode });
+    await this.options.onConfigurationSaved();
   }
 
+  /** 发往 Webview 的消息统一从这里走，让消息结构与 Webview 脚本共用同一份类型。 */
+  private async post(message: OutgoingMessage): Promise<void> {
+    await this.view?.webview.postMessage(message);
+  }
+
+  /** 页面只有结构；样式在 media/sidebar.css，脚本由 src/webview/sidebar.ts 打包到 dist/webview。 */
   private html(webview: vscode.Webview): string {
     const nonce = randomBytes(16).toString('base64');
+    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.options.extensionUri, 'media', 'sidebar.css'));
+    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.options.extensionUri, 'dist', 'webview', 'sidebar.js'));
     return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{font-family:var(--vscode-font-family);padding:12px;color:var(--vscode-foreground)}label{display:block;margin:10px 0 4px}
-input,select{box-sizing:border-box;width:100%;padding:6px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border)}
-button{margin:12px 6px 0 0;padding:7px 11px;border:0;background:var(--vscode-button-background);color:var(--vscode-button-foreground);cursor:pointer}
-button.secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
-button:disabled{cursor:default;opacity:.6}
-.toggle-row{display:flex;align-items:center;gap:10px;margin-top:12px}.toggle-row span{flex:none}
-button.toggle-switch{position:relative;width:38px;height:22px;margin:0;padding:0;border-radius:11px;background:var(--vscode-button-secondaryBackground);transition:background .15s ease}
-button.toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--vscode-button-foreground);transition:transform .15s ease}
-button.toggle-switch.enabled{background:var(--vscode-testing-iconPassed)}button.toggle-switch.enabled::after{transform:translateX(16px)}
-.mode-switch{display:grid;grid-template-columns:1fr 1fr;gap:1px;margin-top:14px;background:var(--vscode-panel-border);border:1px solid var(--vscode-panel-border)}
-.mode-switch button{margin:0;padding:7px 6px;background:var(--vscode-sideBar-background);color:var(--vscode-foreground)}.mode-switch button.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
-.sync-summary{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;margin-bottom:10px;background:var(--vscode-panel-border)}
-.sync-metric{min-width:0;padding:10px;background:var(--vscode-sideBar-background)}.metric-label{display:block;margin-bottom:5px;opacity:.7;font-size:11px}.metric-value{display:flex;align-items:center;gap:6px;font-weight:600;overflow-wrap:anywhere}
-.dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--vscode-descriptionForeground)}.dot.muted{background:var(--vscode-descriptionForeground)}.dot.success{background:var(--vscode-testing-iconPassed)}.dot.running{background:var(--vscode-progressBar-background)}.dot.warning{background:var(--vscode-editorWarning-foreground)}.dot.error{background:var(--vscode-testing-iconFailed)}
-.status{padding:10px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-focusBorder)}.muted{opacity:.75;font-size:12px}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.repository-details{display:grid;gap:8px;margin-top:14px}.repository-item{display:grid;gap:3px}.repository-item span{opacity:.7;font-size:11px}.repository-item strong{font-weight:400;overflow-wrap:anywhere}.configuration-dialog{max-width:calc(100vw - 32px);width:420px;padding:16px;border:1px solid var(--vscode-editorWidget-border);background:var(--vscode-editorWidget-background);color:var(--vscode-editorWidget-foreground)}.configuration-dialog::backdrop{background:rgba(0,0,0,.45)}.configuration-dialog h2{margin:0 0 8px;font-size:15px}.dialog-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:4px}.dialog-actions button{margin:0}
-.history-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}.history-header strong{flex:1;min-width:0}
-button.icon-button{margin:0;padding:3px 8px;background:transparent;color:var(--vscode-foreground);font-size:14px;line-height:1.2}button.icon-button:hover:enabled{background:var(--vscode-toolbar-hoverBackground)}
-.history-list{margin:0;padding:0;list-style:none}
-.history-item{display:flex;align-items:flex-start;gap:8px;padding:8px 6px;margin:0 -6px;border-radius:4px;border-bottom:1px solid var(--vscode-panel-border)}
-.history-item:hover{background:var(--vscode-list-hoverBackground)}
-.history-item>button{flex:none;margin:0;padding:4px 9px}
-.history-main{flex:1;min-width:0}.history-subject{overflow-wrap:anywhere}.history-meta{margin-top:3px;opacity:.7;font-size:11px;overflow-wrap:anywhere}
-.history-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
-.history-tag{padding:1px 7px;border-radius:9px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-size:11px;overflow-wrap:anywhere}
-.history-loading{display:flex;justify-content:center;padding:28px 0}
-.spinner{width:22px;height:22px;border:2px solid var(--vscode-panel-border);border-top-color:var(--vscode-progressBar-background);border-radius:50%;animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.context-menu{position:fixed;z-index:10;min-width:130px;padding:4px 0;border:1px solid var(--vscode-editorWidget-border);background:var(--vscode-editorWidget-background);color:var(--vscode-editorWidget-foreground);box-shadow:0 2px 8px rgba(0,0,0,.35)}
-.context-menu button{display:block;width:100%;margin:0;padding:5px 12px;background:transparent;color:inherit;text-align:left}
-.context-menu button:hover:enabled{background:var(--vscode-list-hoverBackground)}
-</style></head><body>
+<link rel="stylesheet" href="${styleUri.toString()}">
+</head><body>
 <div id="mainPage">
 <div class="sync-summary">
   <div class="sync-metric"><span class="metric-label">同步状态</span><span class="metric-value"><span id="syncDot" class="dot"></span><span id="syncPhase">正在加载</span></span></div>
@@ -292,93 +258,7 @@ button.icon-button{margin:0;padding:3px 8px;background:transparent;color:var(--v
   <p class="muted">在某一项上点右键可以新增或删除标签。</p>
 </div>
 <div id="tagMenu" class="context-menu" hidden></div>
-<script nonce="${nonce}">
-const vscode=acquireVsCodeApi();const ids=['repositoryUrl','branch','gitUserName','gitUserEmail'];const toggleEnabled=document.getElementById('toggleEnabled');const editRepository=document.getElementById('editRepository');const configurationDialog=document.getElementById('configurationDialog');const configurationForm=document.getElementById('configurationForm');const cancelConfiguration=document.getElementById('cancelConfiguration');const saveConfiguration=document.getElementById('saveConfiguration');const modeButtons=[document.getElementById('modeBackup'),document.getElementById('modeSync')];const choicePanel=document.getElementById('choicePanel');const chooseLocal=document.getElementById('chooseLocal');const chooseCloud=document.getElementById('chooseCloud');let configuration={};let enabled=false;let lastSyncAt;
-const mainPage=document.getElementById('mainPage');const historyPage=document.getElementById('historyPage');const historyBody=document.getElementById('historyBody');const historyError=document.getElementById('historyError');const historyRefreshing=document.getElementById('historyRefreshing');const historyMore=document.getElementById('historyMore');const historyBack=document.getElementById('historyBack');const historyRefresh=document.getElementById('historyRefresh');const tagMenu=document.getElementById('tagMenu');let historyPageSize=30;let historyLimit=30;let historyLimitMax=10000;let historyBusy=false;
-historyBack.onclick=()=>showHistoryPage(false);
-historyRefresh.onclick=()=>requestHistory(historyLimit,true);
-historyMore.onclick=()=>{if(historyBusy)return;historyMore.disabled=true;vscode.postMessage({type:'loadMoreHistory'})};
-addEventListener('click',closeTagMenu);
-addEventListener('keydown',(event)=>{if(event.key==='Escape')closeTagMenu()});
-addEventListener('scroll',closeTagMenu,true);
-chooseLocal.onclick=()=>{chooseLocal.disabled=true;chooseCloud.disabled=true;vscode.postMessage({type:'resolveConflict',resolution:'local'})};
-chooseCloud.onclick=()=>{chooseLocal.disabled=true;chooseCloud.disabled=true;vscode.postMessage({type:'resolveConflict',resolution:'cloud'})};
-toggleEnabled.onclick=()=>{toggleEnabled.disabled=true;vscode.postMessage({type:'toggleEnabled',enabled:!enabled})};
-for(const button of modeButtons)button.onclick=()=>{for(const other of modeButtons)other.disabled=true;vscode.postMessage({type:'setMode',mode:button.dataset.mode})};
-editRepository.onclick=()=>{for(const id of ids)document.getElementById(id).value=configuration[id]??'';document.getElementById('debounceSeconds').value=String(configuration.debounceSeconds??'');document.getElementById('pollIntervalSeconds').value=String(configuration.pollIntervalSeconds??'');configurationDialog.showModal()};
-cancelConfiguration.onclick=()=>configurationDialog.close();
-configurationForm.onsubmit=(event)=>{event.preventDefault();const next={};for(const id of ids)next[id]=document.getElementById(id).value;const automation={debounceSeconds:Number(document.getElementById('debounceSeconds').value),pollIntervalSeconds:Number(document.getElementById('pollIntervalSeconds').value)};saveConfiguration.disabled=true;cancelConfiguration.disabled=true;vscode.postMessage({type:'save',configuration:next,automation})};
-addEventListener('message',({data})=>{if(data.type==='failure'){document.getElementById('phase').textContent='启动失败';document.getElementById('detail').textContent=data.message;document.getElementById('syncPhase').textContent='启动失败';document.getElementById('syncDot').className='dot error';document.getElementById('lastSyncAt').textContent='—';document.getElementById('syncMode').textContent='—';return}if(data.type==='configuration-saved'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;configurationDialog.close();return}if(data.type==='save-failed'){saveConfiguration.disabled=false;cancelConfiguration.disabled=false;return}
-if(data.type==='history-open'){historyPageSize=data.pageSize;historyLimit=data.pageSize;historyLimitMax=data.limitMax;showHistoryPage(true);renderHistoryLoading();return}
-if(data.type==='history-close'){showHistoryPage(false);return}
-if(data.type==='history-list'){renderHistory(data.entries,data.hasMore===true,data.refreshing===true,data.append===true);return}
-if(data.type==='history-error'){renderHistoryError(data.message);return}
-if(data.type==='history-busy'){applyHistoryBusy(data.busy===true);return}
-if(data.type!=='state')return;configuration=data.configuration;enabled=data.enabled===true;toggleEnabled.className=enabled?'toggle-switch enabled':'toggle-switch';toggleEnabled.setAttribute('aria-checked',String(enabled));toggleEnabled.setAttribute('aria-label',enabled?'停止同步':'开启同步');toggleEnabled.disabled=false;document.getElementById('repositorySummary').textContent=configuration.repositoryUrl||'未配置远程仓库';document.getElementById('branchSummary').textContent=configuration.branch||'未配置分支';for(const button of modeButtons){const active=button.dataset.mode===configuration.mode;button.className=active?'active':'';button.setAttribute('aria-pressed',String(active));button.disabled=false}document.getElementById('syncMode').textContent=data.modeLabel;document.getElementById('modeNote').textContent=data.modeNote;const s=data.status;document.getElementById('phase').textContent=s.displayPhase+' · '+s.role;const notes=['窗口 '+s.activeWindows,'Profiles '+s.profiles.join('、')];if(s.stage)notes.push(s.stage);if(s.message)notes.push(s.message);document.getElementById('detail').textContent=notes.join(' · ');document.getElementById('syncPhase').textContent=s.displayPhase;document.getElementById('syncDot').className='dot '+s.tone;choicePanel.hidden=s.needsChoice!==true;chooseLocal.disabled=false;chooseCloud.disabled=false;lastSyncAt=s.lastSyncAt;renderLastSyncAt()});
-vscode.postMessage({type:'ready'});
-setInterval(renderLastSyncAt,60_000);
-function renderLastSyncAt(){const last=document.getElementById('lastSyncAt');if(!lastSyncAt){last.textContent='尚未同步';last.removeAttribute('title');return}const date=new Date(lastSyncAt);if(Number.isNaN(date.getTime())){last.textContent='时间无效';last.removeAttribute('title');return}last.textContent=date.toLocaleString()+'（'+relativeTime(date.getTime())+'）';last.title=lastSyncAt}
-function relativeTime(timestamp){const elapsed=Math.max(0,Date.now()-timestamp);if(elapsed<60_000)return'刚刚';if(elapsed<3_600_000)return Math.floor(elapsed/60_000)+'分钟前';if(elapsed<86_400_000)return Math.floor(elapsed/3_600_000)+'小时前';return Math.floor(elapsed/86_400_000)+'天前'}
-function showHistoryPage(open){mainPage.hidden=open;historyPage.hidden=!open;closeTagMenu()}
-function requestHistory(limit,refresh){if(historyBusy)return;historyLimit=Math.min(limit,historyLimitMax);vscode.postMessage({type:'loadHistory',limit:historyLimit,refresh})}
-function renderHistoryLoading(){historyError.hidden=true;historyRefreshing.hidden=true;historyMore.hidden=true;const box=document.createElement('div');box.className='history-loading';const spinner=document.createElement('div');spinner.className='spinner';box.append(spinner);historyBody.replaceChildren(box)}
-function renderHistoryError(message){historyError.textContent=message;historyError.hidden=false;historyRefreshing.hidden=true;if(!historyBody.querySelector('.history-list'))historyBody.replaceChildren();applyHistoryBusy(historyBusy)}
-function renderHistory(entries,hasMore,refreshing,append){historyError.hidden=true;historyRefreshing.hidden=!refreshing;const current=append?historyBody.querySelector('.history-list'):null;if(current){for(const entry of entries)current.append(historyItem(entry));historyLimit+=entries.length}else if(!entries.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='云端还没有本宿主的配置提交。';historyBody.replaceChildren(empty);historyLimit=0}else{const list=document.createElement('ul');list.className='history-list';for(const entry of entries)list.append(historyItem(entry));historyBody.replaceChildren(list);historyLimit=entries.length}historyMore.hidden=!hasMore;applyHistoryBusy(historyBusy)}
-function historyItem(entry){const item=document.createElement('li');item.className='history-item';const main=document.createElement('div');main.className='history-main';const subject=document.createElement('div');subject.className='history-subject';subject.textContent=entry.subject;const meta=document.createElement('div');meta.className='history-meta';meta.textContent=entry.shortHash+' · '+historyTime(entry.committedAt);main.append(subject,meta);if(entry.tags.length){const tags=document.createElement('div');tags.className='history-tags';for(const tag of entry.tags){const badge=document.createElement('span');badge.className='history-tag';badge.textContent=tag;tags.append(badge)}main.append(tags)}const rollback=document.createElement('button');rollback.type='button';rollback.textContent='回滚';rollback.onclick=()=>{if(historyBusy)return;vscode.postMessage({type:'restoreCommit',hash:entry.hash})};item.append(main,rollback);item.oncontextmenu=(event)=>{event.preventDefault();openTagMenu(event,entry)};return item}
-function historyTime(value){const date=new Date(value);if(Number.isNaN(date.getTime()))return'时间无效';return date.toLocaleString()+'（'+relativeTime(date.getTime())+'）'}
-function openTagMenu(event,entry){if(historyBusy)return;tagMenu.replaceChildren(menuItem('新增标签…',()=>vscode.postMessage({type:'createTag',hash:entry.hash})));for(const tag of entry.tags)tagMenu.append(menuItem('删除标签 '+tag,()=>vscode.postMessage({type:'deleteTag',hash:entry.hash,tag})));tagMenu.hidden=false;tagMenu.style.left=Math.max(0,Math.min(event.clientX,innerWidth-tagMenu.offsetWidth-4))+'px';tagMenu.style.top=Math.max(0,Math.min(event.clientY,innerHeight-tagMenu.offsetHeight-4))+'px'}
-function menuItem(label,run){const button=document.createElement('button');button.type='button';button.textContent=label;button.onclick=()=>{closeTagMenu();if(!historyBusy)run()};return button}
-function closeTagMenu(){tagMenu.hidden=true;tagMenu.replaceChildren()}
-function applyHistoryBusy(busy){historyBusy=busy;historyRefresh.disabled=busy;historyMore.disabled=busy;for(const button of historyBody.querySelectorAll('button'))button.disabled=busy}
-</script></body></html>`;
+<script nonce="${nonce}" src="${scriptUri.toString()}"></script>
+</body></html>`;
   }
-}
-
-function parseMessage(raw: unknown): IncomingMessage | undefined {
-  if (!raw || typeof raw !== 'object') return undefined;
-  const value = raw as Record<string, unknown>;
-  if (value.type === 'ready') return { type: 'ready' };
-  if (value.type === 'toggleEnabled') {
-    return typeof value.enabled === 'boolean' ? { type: 'toggleEnabled', enabled: value.enabled } : undefined;
-  }
-  if (value.type === 'setMode') {
-    return value.mode === 'backup' || value.mode === 'sync' ? { type: 'setMode', mode: value.mode } : undefined;
-  }
-  if (value.type === 'resolveConflict') {
-    return value.resolution === 'local' || value.resolution === 'cloud'
-      ? { type: 'resolveConflict', resolution: value.resolution }
-      : undefined;
-  }
-  if (value.type === 'loadHistory') {
-    const limit = value.limit;
-    // 翻页靠 loadMoreHistory 累加，单次请求仍收在 HISTORY_LIMIT_MAX 内，同时挡掉 Infinity / NaN。
-    const valid = typeof limit === 'number' && Number.isSafeInteger(limit)
-      && limit >= HISTORY_PAGE_SIZE && limit <= HISTORY_LIMIT_MAX
-      && typeof value.refresh === 'boolean';
-    return valid ? { type: 'loadHistory', limit: limit as number, refresh: value.refresh as boolean } : undefined;
-  }
-  if (value.type === 'loadMoreHistory') return { type: 'loadMoreHistory' };
-  if (value.type === 'restoreCommit' || value.type === 'createTag' || value.type === 'deleteTag') {
-    if (typeof value.hash !== 'string' || !/^[0-9a-f]{40}$/.test(value.hash)) return undefined;
-    if (value.type === 'restoreCommit') return { type: 'restoreCommit', hash: value.hash };
-    if (value.type === 'createTag') return { type: 'createTag', hash: value.hash };
-    if (typeof value.tag !== 'string' || !isValidTagName(value.tag)) return undefined;
-    return { type: 'deleteTag', hash: value.hash, tag: value.tag };
-  }
-  if (value.type !== 'save' || !value.configuration || typeof value.configuration !== 'object' || !value.automation || typeof value.automation !== 'object') return undefined;
-  const configuration = value.configuration as Record<string, unknown>;
-  const strings = ['repositoryUrl', 'branch', 'gitUserName', 'gitUserEmail'];
-  if (!strings.every((key) => typeof configuration[key] === 'string')) return undefined;
-  if (/\r|\n/.test(configuration.repositoryUrl as string) || !isValidBranch(configuration.branch as string)) return undefined;
-  const automation = value.automation as Record<string, unknown>;
-  if (!validInterval(automation.debounceSeconds, 5) || !validInterval(automation.pollIntervalSeconds, 30)) return undefined;
-  return {
-    type: 'save',
-    configuration: configuration as unknown as SyncConfiguration,
-    automation: automation as unknown as AutomationSettings
-  };
-}
-
-function validInterval(value: unknown, minimum: number): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= minimum && value <= 86_400;
 }

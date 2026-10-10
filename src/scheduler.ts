@@ -3,6 +3,9 @@ import { BlockReason, LinkState, StageName, SyncOutcome, SyncState } from './typ
 
 const OPERATION_RETRY_MS = 5_000;
 const MAX_OPERATION_RETRY_MS = 60_000;
+// 失败多半来自网络或认证，比抢锁恢复得慢，起步与封顶都放宽，避免对持续性故障频繁重跑整轮。
+const FAILURE_RETRY_MS = 30_000;
+const MAX_FAILURE_RETRY_MS = 600_000;
 
 /**
  * 调度层的全部状态。除此之外不允许再有描述「该不该同步」的布尔量，
@@ -16,7 +19,7 @@ export interface SchedulerMachine {
   isLeader: boolean;
   /** 同步进行中又收到请求，跑完后需要再来一轮。 */
   pending: boolean;
-  /** 独占锁连续抢占失败的次数，用于指数退避。 */
+  /** 抢占独占锁失败或整轮失败的连续次数，用于指数退避；成功或取消后归零。 */
   retryAttempt: number;
   /** 本轮不同源只询问一次，用户拒绝后不再反复弹窗。 */
   cloudAdoptPrompted: boolean;
@@ -161,12 +164,12 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
       const attempt = machine.retryAttempt + 1;
       return {
         next: { ...machine, sync: { kind: 'blocked', reason: 'exclusive-lock' }, retryAttempt: attempt, pending: false },
-        commands: [{ type: 'schedule-retry', delayMs: retryDelayMs(attempt) }],
+        commands: [{ type: 'schedule-retry', delayMs: retryDelayMs(attempt, OPERATION_RETRY_MS, MAX_OPERATION_RETRY_MS) }],
       };
     }
 
     case 'sync-failed': {
-      return { next: { ...machine, sync: { kind: 'failed' }, pending: false }, commands: [] };
+      return failSync(machine);
     }
 
     case 'sync-finished': {
@@ -267,10 +270,10 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
     };
   }
 
-  if (!outcome.ok) {
-    return { next: { ...machine, sync: { kind: 'failed' }, pending: false, retryAttempt: 0 }, commands: [] };
-  }
+  if (!outcome.ok) return failSync(machine);
 
+  // 之前失败或抢锁排下的重试已经没有意义，留着只会在成功后再空跑一轮。
+  const settled: SchedulerCommand[] = machine.retryAttempt > 0 ? [{ type: 'cancel-retry' }] : [];
   const next: SchedulerMachine = {
     ...machine,
     sync: outcome.waitingForWindows ? { kind: 'blocked', reason: 'other-windows' } : { kind: 'idle' },
@@ -283,15 +286,29 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
   // 窗口即将重载，此时再开一轮同步会被中途掐断，可能留下已提交未推送的中间态。
   // 排队中的请求不在这里消费，重载后由 leader 重新认领并触发启动同步。
   if (outcome.structuralApplied) {
-    return { next: { ...next, pending: false }, commands: [{ type: 'reload-window' }] };
+    return { next: { ...next, pending: false }, commands: [...settled, { type: 'reload-window' }] };
   }
   if (machine.pending && machine.isLeader) {
     return {
       next: { ...next, sync: { kind: 'running', stage: 'snapshot' } },
-      commands: [{ type: 'start-sync', adoptCloud: false }],
+      commands: [...settled, { type: 'start-sync', adoptCloud: false }],
     };
   }
-  return { next, commands: [{ type: 'complete-sync-requests' }] };
+  return { next, commands: [...settled, { type: 'complete-sync-requests' }] };
+}
+
+/**
+ * 失败后按退避自动重试。备份模式没有远程轮询，本机指纹又已在失败的这一轮刷新，
+ * 不排重试就要等到下次改配置或重启才会再推。
+ */
+function failSync(machine: SchedulerMachine): SchedulerTransition {
+  const attempt = machine.retryAttempt + 1;
+  const next: SchedulerMachine = { ...machine, sync: { kind: 'failed' }, pending: false, retryAttempt: attempt };
+  if (!machine.enabled || !machine.configured || !machine.isLeader) return { next, commands: [] };
+  return {
+    next,
+    commands: [{ type: 'schedule-retry', delayMs: retryDelayMs(attempt, FAILURE_RETRY_MS, MAX_FAILURE_RETRY_MS) }],
+  };
 }
 
 /** 阻塞原因决定了它能否被窗口状态变化解除；退避重试和用户决策不在此列。 */
@@ -309,8 +326,8 @@ function isResolvedBlock(reason: BlockReason, safety: WindowSafetySnapshot): boo
   }
 }
 
-function retryDelayMs(attempt: number): number {
-  return Math.min(OPERATION_RETRY_MS * 2 ** (attempt - 1), MAX_OPERATION_RETRY_MS);
+function retryDelayMs(attempt: number, baseMs: number, maximumMs: number): number {
+  return Math.min(baseMs * 2 ** (attempt - 1), maximumMs);
 }
 
 function resolveIdleState(enabled: boolean, configured: boolean): SyncState {

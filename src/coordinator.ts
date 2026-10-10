@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { atomicWriteJson, readJsonFile as readJson } from './json-store';
-import { BlockReason, LinkState, RuntimeStatus, StageName, SyncState } from './types';
+import { BLOCK_REASONS, BlockReason, LINK_STATES, LinkState, RuntimeStatus, STAGE_NAMES, StageName, SyncState } from './types';
 
 interface Lease {
   schemaVersion?: 2;
@@ -67,14 +67,9 @@ const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_LEASE_TTL_MS = 20_000;
 const DEFAULT_STALE_CONFIRMATION_MS = 10_000;
 const MAX_OPERATION_ACQUIRE_ATTEMPTS = 3;
-const STAGE_NAMES = new Set<StageName>([
-  'snapshot', 'scan-secrets', 'prepare', 'pull', 'decide', 'choose', 'ai', 'push', 'apply', 'extensions', 'finalize',
-  'export-history',
-]);
-const BLOCK_REASONS = new Set<BlockReason>([
-  'dirty-windows', 'unreadable-windows', 'other-windows', 'unrelated', 'exclusive-lock',
-]);
-const LINK_STATES = new Set<LinkState>(['no-repository', 'in-sync', 'unrelated']);
+const KNOWN_STAGE_NAMES = new Set<string>(STAGE_NAMES);
+const KNOWN_BLOCK_REASONS = new Set<string>(BLOCK_REASONS);
+const KNOWN_LINK_STATES = new Set<string>(LINK_STATES);
 
 export class MultiWindowCoordinator extends EventEmitter {
   public readonly instanceId = randomUUID();
@@ -484,7 +479,7 @@ function parseSharedStatus(value: unknown): SharedStatus | undefined {
   if (!isRecord(value) || value.schemaVersion !== 3 || typeof value.revision !== 'string' || typeof value.updatedAt !== 'number') return undefined;
   const sync = parseSyncState(value.sync);
   if (!sync) return undefined;
-  if (typeof value.link !== 'string' || !LINK_STATES.has(value.link as LinkState)) return undefined;
+  if (typeof value.link !== 'string' || !KNOWN_LINK_STATES.has(value.link)) return undefined;
   if (!Array.isArray(value.profiles) || !value.profiles.every((profile) => typeof profile === 'string')) return undefined;
   if (typeof value.pendingChanges !== 'number' || !Number.isInteger(value.pendingChanges) || value.pendingChanges < 0) return undefined;
   if (value.lastSyncAt !== undefined && typeof value.lastSyncAt !== 'string') return undefined;
@@ -501,11 +496,11 @@ function parseSyncState(value: unknown): SyncState | undefined {
     case 'failed':
       return { kind: value.kind };
     case 'running':
-      return typeof value.stage === 'string' && STAGE_NAMES.has(value.stage as StageName)
+      return typeof value.stage === 'string' && KNOWN_STAGE_NAMES.has(value.stage)
         ? { kind: 'running', stage: value.stage as StageName }
         : undefined;
     case 'blocked':
-      return typeof value.reason === 'string' && BLOCK_REASONS.has(value.reason as BlockReason)
+      return typeof value.reason === 'string' && KNOWN_BLOCK_REASONS.has(value.reason)
         ? { kind: 'blocked', reason: value.reason as BlockReason }
         : undefined;
     default:

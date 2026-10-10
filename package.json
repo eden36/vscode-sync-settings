@@ -113,10 +113,10 @@
     }
   },
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && tsc --noEmit -p src/webview",
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "test": "npm run build && node esbuild.test.mjs && node --test dist/test.cjs",
+    "test": "npm run build && node esbuild.test.mjs && node scripts/run-tests.mjs",
     "vscode:prepublish": "npm run check && npm run test",
     "package": "vsce package --no-dependencies"
   },

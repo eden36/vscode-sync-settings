@@ -2,14 +2,20 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { SnapshotManifest } from './types';
 
-// 直接以敏感词命名的键，例如 "apiKey"、"password"。
-const SENSITIVE_KEY = /["'](?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|passwd|client[_-]?secret|private[_-]?key|github[_-]?token|gitlab[_-]?token|bearer[_-]?token|secret|token)["']\s*:/i;
+// 直接以敏感词命名的键，例如 "apiKey"、"password"。带 g 标志供 matchAll 逐处检查取值，不要对它调用 test。
+const SENSITIVE_KEY = /["'](?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|passwd|client[_-]?secret|private[_-]?key|github[_-]?token|gitlab[_-]?token|bearer[_-]?token|secret|token)["']\s*:/gi;
 
 /**
  * 环境变量风格的键，例如 mcp.json 里的 "env": { "BRAVE_API_KEY": "…" }。
  * 只匹配全大写下划线写法，避免误伤 editor.tokenColorCustomizations 这类驼峰配置项。
  */
-const SENSITIVE_ENV_KEY = /["'][A-Z0-9_]*(?:API_?KEY|ACCESS_?TOKEN|AUTH_?TOKEN|_TOKEN|TOKEN_|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_?KEY)[A-Z0-9_]*["']\s*:/;
+const SENSITIVE_ENV_KEY = /["'][A-Z0-9_]*(?:API_?KEY|ACCESS_?TOKEN|AUTH_?TOKEN|_TOKEN|TOKEN_|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_?KEY)[A-Z0-9_]*["']\s*:/g;
+
+/**
+ * 敏感键名后面不构成凭据的取值：null、空字符串，或整串只是一个 ${input:…} / ${env:…} 引用（可带 Bearer 前缀）。
+ * 后者是 mcp.json 存放凭据的标准写法，真正的值不在文件里；只认整串匹配，引用后面再拼任何字符都照常拦截。
+ */
+const HARMLESS_VALUE = /^\s*(?:null\b|(["'])(?:(?:Bearer\s+)?\$\{(?:input|env):[^}"']+\})?\1)/;
 
 const SENSITIVE_VALUE = /(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9\-_]{20,}|sk-[A-Za-z0-9\-_]{10,}|xox[baprs]-[A-Za-z0-9\-]+)/;
 
@@ -34,5 +40,14 @@ export async function findPotentialSecrets(root: string, manifest: SnapshotManif
 }
 
 export function containsPotentialSecret(content: string): boolean {
-  return SENSITIVE_KEY.test(content) || SENSITIVE_ENV_KEY.test(content) || SENSITIVE_VALUE.test(content);
+  return hasSensitiveAssignment(content, SENSITIVE_KEY)
+    || hasSensitiveAssignment(content, SENSITIVE_ENV_KEY)
+    || SENSITIVE_VALUE.test(content);
+}
+
+function hasSensitiveAssignment(content: string, pattern: RegExp): boolean {
+  for (const match of content.matchAll(pattern)) {
+    if (!HARMLESS_VALUE.test(content.slice(match.index + match[0].length))) return true;
+  }
+  return false;
 }

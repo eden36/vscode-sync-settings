@@ -21,7 +21,7 @@ export function decideCloudAdopt(
 /**
  * 本轮采用哪一方的完整快照。不做任何内容合并：结果永远等于某一台机器的真实状态。
  * 判据是「相对上次成功同步的基准改没改」，而不是拉取成功与否——拉取失败只是让两边同时改动更容易发生。
- * 两侧都改过时交回用户选择，没有基准时若两侧内容一致同样无需打扰。
+ * 两侧都改过时交回用户选择；两侧内容一致时无论有没有基准都无需打扰。
  */
 export function decideSnapshotChoice(
   baseline: SyncBaseline | undefined,
@@ -34,6 +34,8 @@ export function decideSnapshotChoice(
     if (local.snapshot === cloud.snapshot && local.extensions === cloud.extensions) return 'none';
     return options.resolution ?? 'conflict';
   }
+  // 两侧内容已经一致就没有可选的：推送后进程在记下基准前退出、或两台机器做了相同改动，都会落到这里。
+  if (local.snapshot === cloud.snapshot && (options.ignoreExtensions || local.extensions === cloud.extensions)) return 'none';
   const localChanged = changed(local, baseline.localSnapshot, baseline.localExtensions, options.ignoreExtensions);
   const cloudChanged = changed(cloud, baseline.cloudSnapshot, baseline.cloudExtensions, options.ignoreExtensions);
   if (!localChanged && !cloudChanged) return 'none';
