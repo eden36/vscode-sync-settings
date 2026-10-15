@@ -35,8 +35,14 @@ let configuration: Partial<PluginConfiguration> = {};
 let enabled = false;
 let lastSyncAt: string | undefined;
 let historyLimit = 30;
+let historyPageSize = 30;
 let historyLimitMax = 10_000;
 let historyBusy = false;
+/** 用户点了刷新，要等这次整份加载给出列表或错误后才收起按钮动画。 */
+let historyRefreshPending = false;
+/** 「已刷新」展示期间，后续的非刷新渲染不要把它提前藏掉。 */
+let historyRefreshHold = false;
+let historyRefreshResultTimer: number | undefined;
 
 historyBack.onclick = () => showHistoryPage(false);
 historyRefresh.onclick = () => requestHistory(historyLimit, true);
@@ -108,6 +114,7 @@ addEventListener('message', ({ data }: MessageEvent<OutgoingMessage>) => {
       cancelConfiguration.disabled = false;
       return;
     case 'history-open':
+      historyPageSize = data.pageSize;
       historyLimit = data.pageSize;
       historyLimitMax = data.limitMax;
       showHistoryPage(true);
@@ -209,14 +216,57 @@ function showHistoryPage(open: boolean): void {
 }
 
 function requestHistory(limit: number, refresh: boolean): void {
-  if (historyBusy) return;
-  historyLimit = Math.min(limit, historyLimitMax);
+  if (historyBusy || historyRefreshPending) return;
+  // 渲染后 historyLimit 记的是已显示条数。不足一页时它会小于 pageSize，而扩展要求单次请求至少一页。
+  historyLimit = Math.min(Math.max(limit, historyPageSize), historyLimitMax);
+  if (refresh) startHistoryRefresh();
   vscode.postMessage({ type: 'loadHistory', limit: historyLimit, refresh });
 }
 
-function renderHistoryLoading(): void {
+function startHistoryRefresh(): void {
+  historyRefreshPending = true;
+  historyRefreshHold = false;
+  window.clearTimeout(historyRefreshResultTimer);
   historyError.hidden = true;
+  showHistoryStatus('正在刷新云端记录…');
+  setHistoryRefreshSpin(true);
+  applyHistoryBusy(historyBusy);
+}
+
+function showHistoryStatus(text: string): void {
+  historyRefreshing.textContent = text;
+  historyRefreshing.hidden = false;
+}
+
+function setHistoryRefreshSpin(spinning: boolean): void {
+  historyRefresh.classList.toggle('refreshing', spinning);
+  historyRefresh.setAttribute('aria-busy', String(spinning));
+}
+
+function finishHistoryRefresh(): void {
+  historyRefreshPending = false;
+  historyRefreshHold = true;
+  setHistoryRefreshSpin(false);
+  showHistoryStatus('已刷新');
+  window.clearTimeout(historyRefreshResultTimer);
+  historyRefreshResultTimer = window.setTimeout(() => {
+    historyRefreshHold = false;
+    historyRefreshing.hidden = true;
+  }, 2000);
+}
+
+function clearHistoryRefresh(): void {
+  historyRefreshPending = false;
+  historyRefreshHold = false;
+  window.clearTimeout(historyRefreshResultTimer);
+  setHistoryRefreshSpin(false);
   historyRefreshing.hidden = true;
+  applyHistoryBusy(historyBusy);
+}
+
+function renderHistoryLoading(): void {
+  clearHistoryRefresh();
+  historyError.hidden = true;
   historyMore.hidden = true;
   const box = document.createElement('div');
   box.className = 'history-loading';
@@ -227,16 +277,26 @@ function renderHistoryLoading(): void {
 }
 
 function renderHistoryError(message: string): void {
+  clearHistoryRefresh();
   historyError.textContent = message;
   historyError.hidden = false;
-  historyRefreshing.hidden = true;
   if (!historyBody.querySelector('.history-list')) historyBody.replaceChildren();
   applyHistoryBusy(historyBusy);
 }
 
 function renderHistory(entries: HistoryEntry[], hasMore: boolean, refreshing: boolean, append: boolean): void {
   historyError.hidden = true;
-  historyRefreshing.hidden = !refreshing;
+  if (refreshing) {
+    window.clearTimeout(historyRefreshResultTimer);
+    historyRefreshHold = false;
+    showHistoryStatus('正在刷新云端记录…');
+    setHistoryRefreshSpin(historyRefreshPending);
+  } else if (historyRefreshPending && !append) {
+    finishHistoryRefresh();
+  } else if (!historyRefreshHold) {
+    setHistoryRefreshSpin(historyRefreshPending);
+    historyRefreshing.hidden = !historyRefreshPending;
+  }
   const current = append ? historyBody.querySelector('.history-list') : null;
   if (current) {
     for (const entry of entries) current.append(historyItem(entry));
@@ -331,7 +391,7 @@ function closeTagMenu(): void {
 
 function applyHistoryBusy(busy: boolean): void {
   historyBusy = busy;
-  historyRefresh.disabled = busy;
+  historyRefresh.disabled = busy || historyRefreshPending;
   historyMore.disabled = busy;
   for (const button of historyBody.querySelectorAll('button')) button.disabled = busy;
 }

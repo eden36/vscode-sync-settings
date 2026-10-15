@@ -47,6 +47,8 @@ button.toggle-switch.enabled::after{transform:translateX(16px)}
 .history-header strong{flex:1;min-width:0}
 button.icon-button{margin:0;padding:3px 8px;background:transparent;color:var(--vscode-foreground);font-size:14px;line-height:1.2}
 button.icon-button:hover:enabled{background:var(--vscode-toolbar-hoverBackground)}
+button.icon-button.refreshing{animation:spin 1s linear infinite}
+button.icon-button.refreshing:disabled{opacity:1}
 .history-list{margin:0;padding:0;list-style:none}
 .history-item{display:flex;align-items:flex-start;gap:8px;padding:8px 6px;margin:0 -6px;border-radius:4px;border-bottom:1px solid var(--vscode-panel-border)}
 .history-item:hover{background:var(--vscode-list-hoverBackground)}
