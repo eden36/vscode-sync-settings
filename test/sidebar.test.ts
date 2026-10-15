@@ -31,6 +31,9 @@ test('侧边栏消息解析拒绝越界参数与非法标识', () => {
   assert.deepEqual(parseMessage({ type: 'restoreCommit', hash }), { type: 'restoreCommit', hash });
   assert.equal(parseMessage({ type: 'restoreCommit', hash: 'abcdefg' }), undefined);
   assert.equal(parseMessage({ type: 'restoreCommit', hash: `${hash} --force` }), undefined);
+  assert.deepEqual(parseMessage({ type: 'openRepository', url: 'https://evil.example' }), { type: 'openRepository' });
+  assert.deepEqual(parseMessage({ type: 'openCommit', hash }), { type: 'openCommit', hash });
+  assert.equal(parseMessage({ type: 'openCommit', hash: 'abcdefg' }), undefined);
   assert.deepEqual(parseMessage({ type: 'deleteTag', hash, tag: 'v1.0' }), { type: 'deleteTag', hash, tag: 'v1.0' });
   assert.equal(parseMessage({ type: 'deleteTag', hash, tag: '--delete' }), undefined);
   assert.equal(parseMessage({ type: 'deleteTag', hash }), undefined);

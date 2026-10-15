@@ -29,6 +29,7 @@ const historyRefreshing = element('historyRefreshing');
 const historyMore = element<HTMLButtonElement>('historyMore');
 const historyBack = element<HTMLButtonElement>('historyBack');
 const historyRefresh = element<HTMLButtonElement>('historyRefresh');
+const openRepository = element<HTMLButtonElement>('openRepository');
 const syncMark = element('syncMark');
 const syncResult = element('syncResult');
 const tagMenu = element('tagMenu');
@@ -48,6 +49,7 @@ let historyRefreshResultTimer: number | undefined;
 
 historyBack.onclick = () => showHistoryPage(false);
 historyRefresh.onclick = () => requestHistory(historyLimit, true);
+openRepository.onclick = () => vscode.postMessage({ type: 'openRepository' });
 historyMore.onclick = () => {
   if (historyBusy) return;
   historyMore.disabled = true;
@@ -357,7 +359,15 @@ function historyItem(entry: HistoryEntry): HTMLLIElement {
     if (historyBusy) return;
     vscode.postMessage({ type: 'restoreCommit', hash: entry.hash });
   };
-  item.append(main, rollback);
+  const view = document.createElement('button');
+  view.type = 'button';
+  view.className = 'secondary history-view';
+  view.textContent = '查看';
+  view.onclick = () => vscode.postMessage({ type: 'openCommit', hash: entry.hash });
+  const actions = document.createElement('div');
+  actions.className = 'history-actions';
+  actions.append(rollback, view);
+  item.append(main, actions);
   item.oncontextmenu = (event) => {
     event.preventDefault();
     openTagMenu(event, entry);

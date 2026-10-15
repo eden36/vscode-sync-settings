@@ -34,7 +34,9 @@ export type IncomingMessage =
   | { type: 'loadMoreHistory' }
   | { type: 'restoreCommit'; hash: string }
   | { type: 'createTag'; hash: string }
-  | { type: 'deleteTag'; hash: string; tag: string };
+  | { type: 'deleteTag'; hash: string; tag: string }
+  | { type: 'openRepository' }
+  | { type: 'openCommit'; hash: string };
 
 /** 状态判定全部在扩展这边完成，Webview 只按这些派生字段渲染。 */
 export interface DisplayStatus extends RuntimeStatus {
@@ -88,10 +90,12 @@ export function parseMessage(raw: unknown): IncomingMessage | undefined {
     return valid ? { type: 'loadHistory', limit: limit as number, refresh: value.refresh as boolean } : undefined;
   }
   if (value.type === 'loadMoreHistory') return { type: 'loadMoreHistory' };
-  if (value.type === 'restoreCommit' || value.type === 'createTag' || value.type === 'deleteTag') {
+  if (value.type === 'openRepository') return { type: 'openRepository' };
+  if (value.type === 'restoreCommit' || value.type === 'createTag' || value.type === 'deleteTag' || value.type === 'openCommit') {
     if (typeof value.hash !== 'string' || !/^[0-9a-f]{40}$/.test(value.hash)) return undefined;
     if (value.type === 'restoreCommit') return { type: 'restoreCommit', hash: value.hash };
     if (value.type === 'createTag') return { type: 'createTag', hash: value.hash };
+    if (value.type === 'openCommit') return { type: 'openCommit', hash: value.hash };
     if (typeof value.tag !== 'string' || !isValidTagName(value.tag)) return undefined;
     return { type: 'deleteTag', hash: value.hash, tag: value.tag };
   }

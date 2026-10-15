@@ -9,10 +9,12 @@ import {
   OutgoingMessage,
   parseMessage,
 } from './sidebar-messages';
+import { browseCommitUrl, browseRepositoryUrl } from './repository-browse';
 import { displayPhase, displayTone, modeLabel, modeNote, presentedSync, profileMismatchText, stageLabel, transferResultText } from './sidebar-status';
 import { ProfileMismatch, RuntimeStatus, SyncMode } from './types';
 
-const HISTORY_MESSAGES: string[] = ['loadHistory', 'loadMoreHistory', 'restoreCommit', 'createTag', 'deleteTag'];
+const HISTORY_MESSAGES: string[] = ['loadHistory', 'loadMoreHistory', 'restoreCommit', 'createTag', 'deleteTag', 'openRepository', 'openCommit'];
+const BROWSE_UNAVAILABLE = '这个仓库地址无法在浏览器中打开。';
 
 /** 历史页面上的操作全部转交扩展执行，侧边栏只做参数校验与转发。 */
 export interface HistoryHandlers {
@@ -98,6 +100,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           await this.options.history.createTag(message.hash);
         } else if (message.type === 'deleteTag') {
           await this.options.history.deleteTag(message.hash, message.tag);
+        } else if (message.type === 'openRepository' || message.type === 'openCommit') {
+          await this.openInBrowser(message.type === 'openCommit' ? message.hash : undefined);
         } else if (message.type === 'save') {
           if (hasEmbeddedCredentials(message.configuration.repositoryUrl)) {
             void vscode.window.showErrorMessage('配置同步仓库地址不能包含明文凭据，请使用 SSH 或系统凭据管理器。');
@@ -234,6 +238,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     await this.options.onConfigurationSaved();
   }
 
+  /**
+   * 打开配置里的仓库网页。链接只由扩展根据已保存的地址生成，不采用 Webview 传来的 URL。
+   */
+  private async openInBrowser(hash?: string): Promise<void> {
+    const repositoryUrl = this.options.configurationStore.get().repositoryUrl;
+    const target = hash === undefined ? browseRepositoryUrl(repositoryUrl) : browseCommitUrl(repositoryUrl, hash);
+    if (!target || !(await vscode.env.openExternal(vscode.Uri.parse(target)))) {
+      await this.postHistoryError(BROWSE_UNAVAILABLE);
+    }
+  }
+
   /** 发往 Webview 的消息统一从这里走，让消息结构与 Webview 脚本共用同一份类型。 */
   private async post(message: OutgoingMessage): Promise<void> {
     await this.view?.webview.postMessage(message);
@@ -268,7 +283,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <dialog id="configurationDialog" class="configuration-dialog"><form id="configurationForm" novalidate><h2>配置同步仓库</h2><label for="repositoryUrl">配置同步仓库地址</label><input id="repositoryUrl" placeholder="git@github.com:user/settings.git"><label for="branch">分支</label><input id="branch"><div class="row"><div><label for="gitUserName">Git 用户名（可选）</label><input id="gitUserName" placeholder="留空使用本机配置"></div><div><label for="gitUserEmail">Git 邮箱（可选）</label><input id="gitUserEmail" type="email" placeholder="留空使用本机配置"></div></div><div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div><p class="muted">保存后会自动同步。同步模式下首次接入会以云端配置覆盖本机并按云端清单装卸扩展，原有配置会先备份；备份模式只把本机配置上传到仓库。</p><div class="dialog-actions"><button id="cancelConfiguration" class="secondary" type="button">取消</button><button id="saveConfiguration" type="submit">保存更改</button></div></form></dialog>
 </div>
 <div id="historyPage" hidden>
-  <div class="history-header"><button id="historyBack" class="icon-button" type="button" title="返回">←</button><strong>云端提交历史</strong><button id="historyRefresh" class="icon-button" type="button" title="刷新">↻</button></div>
+  <div class="history-header"><button id="historyBack" class="icon-button" type="button" title="返回">←</button><strong>云端提交历史</strong><button id="openRepository" class="open-repository" type="button">打开仓库</button><button id="historyRefresh" class="icon-button" type="button" title="刷新">↻</button></div>
   <div id="historyRefreshing" class="muted" hidden>正在刷新云端记录…</div>
   <div id="historyError" class="status" hidden></div>
   <div id="historyBody"></div>
