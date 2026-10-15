@@ -10,6 +10,7 @@ const OPTIONAL_KEYS = [
   'lastSyncAt',
   'baseline',
   'pendingResolution',
+  'narrateNext',
   'profileMismatch',
   'profileResolution',
 ] as const;
@@ -32,6 +33,8 @@ export interface RuntimeStateRecord {
   syncedExtensions?: string[];
   /** 用户对「两边都改了」的选择；整轮成功后才清除，中途失败下一轮继续沿用。 */
   pendingResolution?: 'local' | 'cloud';
+  /** 用户刚选定冲突的一方。下一轮同步开跑时消费，只播报这一次，失败后的自动重试不再播报。 */
+  narrateNext?: boolean;
   /**
    * 等待用户处理的 Profile 差异。cloud-only 的名称还用来认领用户随后新建的同名 Profile：
    * 新建的 Profile 先套用云端内容，否则下一轮会把它的空配置当成本机改动推上去覆盖云端。
@@ -116,6 +119,7 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
   if (value.pendingResolution !== undefined && value.pendingResolution !== 'local' && value.pendingResolution !== 'cloud') {
     return undefined;
   }
+  if (value.narrateNext !== undefined && typeof value.narrateNext !== 'boolean') return undefined;
   if (value.baseline !== undefined && !baseline) return undefined;
   const profileMismatch = parseProfileMismatch(value.profileMismatch);
   if (value.profileMismatch !== undefined && !profileMismatch) return undefined;
@@ -132,6 +136,7 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
     ...(value.pendingResolution !== undefined
       ? { pendingResolution: value.pendingResolution as 'local' | 'cloud' }
       : {}),
+    ...(value.narrateNext === true ? { narrateNext: true } : {}),
     ...(profileMismatch ? { profileMismatch } : {}),
     ...(profileResolution ? { profileResolution } : {}),
   };
@@ -169,6 +174,7 @@ function sameRuntimeState(left: RuntimeStateRecord, right: RuntimeStateRecord): 
     && left.lastSyncAt === right.lastSyncAt
     && left.cloudAdoptPending === right.cloudAdoptPending
     && left.pendingResolution === right.pendingResolution
+    && left.narrateNext === right.narrateNext
     && sameBaseline(left.baseline, right.baseline)
     && sameIds(left.syncedExtensions, right.syncedExtensions)
     && sameMismatch(left.profileMismatch, right.profileMismatch)

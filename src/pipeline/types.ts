@@ -72,6 +72,8 @@ export interface SyncContext {
   readonly resolution?: 'local' | 'cloud';
   /** 本轮要还原的历史提交，只有还原流程会设置。 */
   readonly restoreTarget?: RepositoryCommit;
+  /** 用户点下的回滚、覆盖云端或冲突选择：从第一步就播报当前步骤。自动同步不设。 */
+  readonly narrateSteps?: boolean;
   readonly paths: SyncPaths;
   readonly report: SyncReport;
   readonly artifacts: SyncArtifacts;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { HISTORY_LIMIT_MAX, HISTORY_PAGE_SIZE, parseMessage } from '../src/sidebar-messages';
-import { displayIcon, displayPhase, displayTone } from '../src/sidebar-status';
+import { displayIcon, displayPhase, displayTone, presentedSync, transferResultText } from '../src/sidebar-status';
 
 test('侧边栏消息解析拒绝越界参数与非法标识', () => {
   const hash = 'a'.repeat(40);
@@ -81,7 +81,21 @@ test('删除本地仓库后即使留有上次同步时间也显示未同步', ()
   assert.equal(displayTone({ kind: 'idle' }, 'no-repository'), 'muted');
 });
 
+test('播报中的步骤按同步中呈现，调度层仍停在空闲时也一样', () => {
+  const sync = presentedSync({ sync: { kind: 'idle' }, narrating: true, step: 'pull' });
+  assert.deepEqual(sync, { kind: 'running', stage: 'pull' });
+  assert.equal(displayPhase(sync, 'in-sync'), '同步中');
+  assert.equal(displayIcon(sync, 'in-sync'), '$(sync~spin)');
+  assert.deepEqual(presentedSync({ sync: { kind: 'idle' }, narrating: true }), { kind: 'idle' });
+});
+
 test('关闭同步时状态不按告警呈现', () => {
   assert.equal(displayIcon({ kind: 'disabled' }, 'in-sync'), '$(circle-slash)');
   assert.equal(displayTone({ kind: 'disabled' }, 'in-sync'), 'muted');
+});
+
+test('传输结果按实际方向写成一句', () => {
+  assert.equal(transferResultText('cloud'), '同步到云端成功');
+  assert.equal(transferResultText('local'), '同步到本地成功');
+  assert.equal(transferResultText('both'), '已同步到云端和本机');
 });

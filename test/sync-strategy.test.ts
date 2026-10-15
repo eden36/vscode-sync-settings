@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fallbackCommitMessage } from '../src/sync-fallback';
-import { finalSyncMessage } from '../src/sync-message';
+import { finalSyncMessage, transferResultOf } from '../src/sync-message';
 import { decideCloudAdopt, decideSnapshotChoice } from '../src/sync-strategy';
 import { createSyncReport } from '../src/types';
 
@@ -92,4 +92,14 @@ test('按用户选择处理后的文案说明方向并提示备份', () => {
     '同步完成（已按云端配置覆盖本机）。',
   );
   assert.equal(finalSyncMessage({ ...createSyncReport('sync'), snapshotChoice: 'none' }), '配置已是最新。');
+});
+
+test('只有真正传过配置才有方向结果', () => {
+  assert.equal(transferResultOf(createSyncReport('sync')), undefined);
+  assert.equal(transferResultOf({ ...createSyncReport('backup'), transferredToCloud: true }), 'cloud');
+  assert.equal(transferResultOf({ ...createSyncReport('sync'), transferredToLocal: true }), 'local');
+  assert.equal(
+    transferResultOf({ ...createSyncReport('sync'), transferredToCloud: true, transferredToLocal: true }),
+    'both',
+  );
 });

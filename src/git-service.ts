@@ -260,16 +260,20 @@ export class ConfigurationRepositoryGitService {
     await this.push(configuration);
   }
 
-  public async pushIfAhead(configuration: SyncConfiguration): Promise<void> {
+  public async pushIfAhead(configuration: SyncConfiguration, beforePush?: () => void): Promise<void> {
     const head = await this.head();
     if (!head) return;
     const remote = await this.git(['rev-parse', '--verify', `origin/${configuration.branch}`], true);
     if (remote.exitCode !== 0) {
+      beforePush?.();
       await this.push(configuration);
       return;
     }
     const ahead = await this.git(['rev-list', '--count', `origin/${configuration.branch}..HEAD`], true);
-    if (Number(ahead.stdout) > 0) await this.push(configuration);
+    if (Number(ahead.stdout) > 0) {
+      beforePush?.();
+      await this.push(configuration);
+    }
   }
 
   public async head(): Promise<string | undefined> {

@@ -1,7 +1,15 @@
-import { BlockReason, LinkState, ProfileMismatch, StageName, SyncMode, SyncState } from './types';
+import { BlockReason, LinkState, ProfileMismatch, RuntimeStatus, StageName, SyncMode, SyncState, TransferResult } from './types';
 
 export type DisplayPhase = '已关闭' | '未配置' | '未同步' | '同步中' | '已同步' | '同步失败' | '需要处理';
 export type DisplayTone = 'success' | 'running' | 'warning' | 'error' | 'muted';
+
+/**
+ * 用户点下的还原、覆盖和冲突选择不经过调度层的 running。
+ * 播报期间按当前步骤呈现为同步中，大标题、状态栏和详情才能跟着步骤走。
+ */
+export function presentedSync(status: Pick<RuntimeStatus, 'sync' | 'narrating' | 'step'>): SyncState {
+  return status.narrating === true && status.step ? { kind: 'running', stage: status.step } : status.sync;
+}
 
 /** 对外只暴露这七个状态；内部的步骤和阻塞原因降级为详情文案。 */
 export function displayPhase(sync: SyncState, link: LinkState): DisplayPhase {
@@ -53,6 +61,14 @@ export function stageLabel(stage: StageName): string {
     case 'finalize': return '正在记录同步基准';
     case 'export-history': return '正在导出历史配置';
     case 'override-cloud': return '正在以本机覆盖云端';
+  }
+}
+
+export function transferResultText(result: TransferResult): string {
+  switch (result) {
+    case 'cloud': return '同步到云端成功';
+    case 'local': return '同步到本地成功';
+    case 'both': return '已同步到云端和本机';
   }
 }
 

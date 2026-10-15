@@ -29,6 +29,8 @@ const historyRefreshing = element('historyRefreshing');
 const historyMore = element<HTMLButtonElement>('historyMore');
 const historyBack = element<HTMLButtonElement>('historyBack');
 const historyRefresh = element<HTMLButtonElement>('historyRefresh');
+const syncMark = element('syncMark');
+const syncResult = element('syncResult');
 const tagMenu = element('tagMenu');
 
 let configuration: Partial<PluginConfiguration> = {};
@@ -100,7 +102,10 @@ addEventListener('message', ({ data }: MessageEvent<OutgoingMessage>) => {
       element('phase').textContent = '启动失败';
       element('detail').textContent = data.message;
       element('syncPhase').textContent = '启动失败';
+      element('syncDot').hidden = false;
       element('syncDot').className = 'dot error';
+      syncMark.hidden = true;
+      syncResult.hidden = true;
       element('lastSyncAt').textContent = '—';
       element('syncMode').textContent = '—';
       return;
@@ -164,8 +169,12 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   if (status.stage) notes.push(status.stage);
   if (status.message) notes.push(status.message);
   element('detail').textContent = notes.join(' · ');
-  element('syncPhase').textContent = status.displayPhase;
+  element('syncPhase').textContent = status.stepText ?? status.displayPhase;
+  element('syncDot').hidden = status.transferring === true;
   element('syncDot').className = `dot ${status.tone}`;
+  syncMark.hidden = status.transferring !== true;
+  syncResult.hidden = status.transferring === true || !status.transferResultText;
+  syncResult.textContent = status.transferResultText ?? '';
   choicePanel.hidden = !status.needsChoice;
   chooseLocal.disabled = false;
   chooseCloud.disabled = false;

@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { atomicWriteJson, readJsonFile as readJson } from './json-store';
-import { BLOCK_REASONS, BlockReason, LINK_STATES, LinkState, RuntimeStatus, STAGE_NAMES, StageName, SyncState } from './types';
+import { BLOCK_REASONS, BlockReason, LINK_STATES, LinkState, RuntimeStatus, STAGE_NAMES, StageName, SyncState, TRANSFER_RESULTS, TransferResult } from './types';
 
 interface Lease {
   schemaVersion?: 2;
@@ -40,6 +40,12 @@ interface SharedStatus {
   pendingChanges: number;
   lastSyncAt?: string;
   message?: string;
+  /** 缺省表示没在传输。旧的共享状态没有这项，按没在传输处理。 */
+  transferring?: boolean;
+  transferResult?: TransferResult;
+  /** 缺省表示不是逐步播报。 */
+  narrating?: boolean;
+  step?: StageName;
 }
 
 interface ConfigurationRevision {
@@ -165,6 +171,10 @@ export class MultiWindowCoordinator extends EventEmitter {
       pendingChanges: status.pendingChanges,
       ...(status.lastSyncAt ? { lastSyncAt: status.lastSyncAt } : {}),
       ...(status.message ? { message: status.message } : {}),
+      ...(status.transferring ? { transferring: true } : {}),
+      ...(status.transferResult ? { transferResult: status.transferResult } : {}),
+      ...(status.narrating ? { narrating: true } : {}),
+      ...(status.step ? { step: status.step } : {}),
     };
     this.lastStatusRevision = shared.revision;
     const write = this.statusWrite.catch(() => undefined).then(() => atomicWriteJson(this.sharedStatusPath, shared));
@@ -371,6 +381,10 @@ export class MultiWindowCoordinator extends EventEmitter {
         pendingChanges: sharedStatus.pendingChanges,
         lastSyncAt: sharedStatus.lastSyncAt,
         message: sharedStatus.message,
+        transferring: sharedStatus.transferring === true,
+        transferResult: sharedStatus.transferResult,
+        narrating: sharedStatus.narrating === true,
+        step: sharedStatus.step,
       } satisfies Partial<RuntimeStatus>);
     }
   }
@@ -484,7 +498,15 @@ function parseSharedStatus(value: unknown): SharedStatus | undefined {
   if (typeof value.pendingChanges !== 'number' || !Number.isInteger(value.pendingChanges) || value.pendingChanges < 0) return undefined;
   if (value.lastSyncAt !== undefined && typeof value.lastSyncAt !== 'string') return undefined;
   if (value.message !== undefined && typeof value.message !== 'string') return undefined;
+  if (value.transferring !== undefined && typeof value.transferring !== 'boolean') return undefined;
+  if (value.transferResult !== undefined && !isTransferResult(value.transferResult)) return undefined;
+  if (value.narrating !== undefined && typeof value.narrating !== 'boolean') return undefined;
+  if (value.step !== undefined && (typeof value.step !== 'string' || !KNOWN_STAGE_NAMES.has(value.step))) return undefined;
   return { ...(value as unknown as SharedStatus), sync };
+}
+
+function isTransferResult(value: unknown): value is TransferResult {
+  return typeof value === 'string' && (TRANSFER_RESULTS as readonly string[]).includes(value);
 }
 
 function parseSyncState(value: unknown): SyncState | undefined {

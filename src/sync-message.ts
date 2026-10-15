@@ -1,4 +1,12 @@
-import { SyncReport } from './types';
+import { SyncReport, TransferResult } from './types';
+
+/** 本轮实际传到了哪一侧；两边都没传过就没有结果。 */
+export function transferResultOf(report: SyncReport): TransferResult | undefined {
+  if (report.transferredToCloud && report.transferredToLocal) return 'both';
+  if (report.transferredToCloud) return 'cloud';
+  if (report.transferredToLocal) return 'local';
+  return undefined;
+}
 
 /** 把一轮同步的观察结果汇成一句状态说明；文案顺序固定，便于用户比对多次同步。 */
 export function finalSyncMessage(report: SyncReport): string {

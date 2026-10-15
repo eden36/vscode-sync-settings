@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { displayIcon, displayPhase, stageLabel } from './sidebar-status';
-import { RuntimeStatus } from './types';
+import { displayIcon, displayPhase, presentedSync, stageLabel } from './sidebar-status';
+import { RuntimeStatus, SyncState } from './types';
 
 const STATUS_BAR_ID = 'profileGitSync.status';
 
@@ -15,9 +15,10 @@ export class SyncStatusBar implements vscode.Disposable {
   }
 
   public render(status: RuntimeStatus): void {
-    const phase = displayPhase(status.sync, status.link);
-    const detail = statusDetail(status);
-    this.item.text = `${displayIcon(status.sync, status.link)} 配置同步`;
+    const sync = presentedSync(status);
+    const phase = displayPhase(sync, status.link);
+    const detail = statusDetail(sync, status.message);
+    this.item.text = `${displayIcon(sync, status.link)} 配置同步`;
     this.item.tooltip = detail ? `配置同步：${phase}\n${detail}` : `配置同步：${phase}`;
     this.item.backgroundColor = status.sync.kind === 'failed'
       ? new vscode.ThemeColor('statusBarItem.warningBackground')
@@ -44,9 +45,9 @@ export function reportActivationFailure(context: vscode.ExtensionContext, error:
 }
 
 /** 进行中的步骤在前，具体说明在后。 */
-function statusDetail(status: RuntimeStatus): string | undefined {
+function statusDetail(sync: SyncState, message: string | undefined): string | undefined {
   const lines: string[] = [];
-  if (status.sync.kind === 'running') lines.push(stageLabel(status.sync.stage));
-  if (status.message) lines.push(status.message);
+  if (sync.kind === 'running') lines.push(stageLabel(sync.stage));
+  if (message) lines.push(message);
   return lines.length ? lines.join('\n') : undefined;
 }

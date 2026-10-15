@@ -9,7 +9,7 @@ import {
   OutgoingMessage,
   parseMessage,
 } from './sidebar-messages';
-import { displayPhase, displayTone, modeLabel, modeNote, profileMismatchText, stageLabel } from './sidebar-status';
+import { displayPhase, displayTone, modeLabel, modeNote, presentedSync, profileMismatchText, stageLabel, transferResultText } from './sidebar-status';
 import { ProfileMismatch, RuntimeStatus, SyncMode } from './types';
 
 const HISTORY_MESSAGES: string[] = ['loadHistory', 'loadMoreHistory', 'restoreCommit', 'createTag', 'deleteTag'];
@@ -147,6 +147,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
     if (!this.ready) return;
     const status = this.options.status();
+    const sync = presentedSync(status);
     const configuration = this.options.configurationStore.get();
     const mismatch = status.sync.kind === 'blocked' && status.sync.reason === 'profiles-mismatch'
       ? this.options.profileMismatch()
@@ -160,9 +161,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       modeNote: modeNote(configuration.mode),
       status: {
         ...status,
-        displayPhase: displayPhase(status.sync, status.link),
-        tone: displayTone(status.sync, status.link),
-        ...(status.sync.kind === 'running' ? { stage: stageLabel(status.sync.stage) } : {}),
+        displayPhase: displayPhase(sync, status.link),
+        tone: displayTone(sync, status.link),
+        ...(sync.kind === 'running' ? { stage: stageLabel(sync.stage) } : {}),
+        transferring: status.transferring === true,
+        ...(status.narrating && status.step ? { stepText: stageLabel(status.step) } : {}),
+        ...(status.transferResult ? { transferResultText: transferResultText(status.transferResult) } : {}),
         // 判定放在这里：Webview 脚本只按结果显示或隐藏选择面板。
         needsChoice: status.sync.kind === 'blocked' && status.sync.reason === 'both-changed',
         ...(mismatch ? { profileChoice: profileMismatchText(mismatch) } : {}),
@@ -248,7 +252,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 </head><body>
 <div id="mainPage">
 <div class="sync-summary">
-  <div class="sync-metric"><span class="metric-label">同步状态</span><span class="metric-value"><span id="syncDot" class="dot"></span><span id="syncPhase">正在加载</span></span></div>
+  <div class="sync-metric"><span class="metric-label">同步状态</span><span class="metric-value sync-status-value"><span id="syncDot" class="dot"></span><span id="syncMark" class="sync-mark" hidden title="正在同步"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-9-9 9.7 9.7 0 0 0-6.7 2.7L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 9 9 9.7 9.7 0 0 0 6.7-2.7L21 16"></path><path d="M16 16h5v5"></path></svg></span><span class="sync-phase-wrap"><span id="syncPhase">正在加载</span><span id="syncResult" class="sync-result" hidden></span></span></span></div>
   <div class="sync-metric"><span class="metric-label">上次同步</span><span id="lastSyncAt" class="metric-value">尚未同步</span></div>
   <div class="sync-metric"><span class="metric-label">运行模式</span><span id="syncMode" class="metric-value">正在加载</span></div>
 </div>

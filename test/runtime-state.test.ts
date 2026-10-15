@@ -88,6 +88,9 @@ test('运行状态保存基准、上次同步的扩展与用户选择', async ()
     assert.ok(parseRuntimeState(valid));
     assert.equal(parseRuntimeState({ ...valid, baseline: { localSnapshot: 'l' } }), undefined);
     assert.equal(parseRuntimeState({ ...valid, pendingResolution: 'both' }), undefined);
+    assert.equal(parseRuntimeState({ ...valid, narrateNext: 'yes' }), undefined);
+    assert.deepEqual(parseRuntimeState({ ...valid, narrateNext: true })?.narrateNext, true);
+    assert.equal(parseRuntimeState({ ...valid, narrateNext: false })?.narrateNext, undefined);
     assert.equal(parseRuntimeState({ ...valid, syncedExtensions: [1] }), undefined);
   } finally {
     await rm(root, { recursive: true, force: true });

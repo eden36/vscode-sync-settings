@@ -275,7 +275,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   /** 用户的选择写进共享状态，本窗口不是 leader 时由 leader 读出来执行。 */
   const applyResolution = async (resolution: 'local' | 'cloud') => {
-    await runtimeState.update({ pendingResolution: resolution });
+    await runtimeState.update({ pendingResolution: resolution, narrateNext: true });
     applyStatus({
       message: resolution === 'local' ? '正在用本机配置覆盖云端。' : '正在用云端配置覆盖本机。',
     }, false);

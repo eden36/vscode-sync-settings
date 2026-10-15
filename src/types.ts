@@ -110,6 +110,10 @@ export interface SyncBaseline {
   cloudProfiles?: string[];
 }
 
+/** 上一轮真正把配置传出去之后的方向。空转检查没有这个结果。 */
+export const TRANSFER_RESULTS = ['cloud', 'local', 'both'] as const;
+export type TransferResult = (typeof TRANSFER_RESULTS)[number];
+
 /** 整轮同步累积的观察结果，只用于生成最终文案与返回值。 */
 export interface SyncReport {
   mode: SyncMode;
@@ -132,6 +136,10 @@ export interface SyncReport {
   snapshotChoice?: Exclude<SnapshotChoice, 'conflict'>;
   /** 本轮是按用户选定的一方执行的，文案要说明另一份已备份。 */
   resolvedConflict: boolean;
+  /** 本轮确实把配置提交并推到了远端。补推已有提交也算。 */
+  transferredToCloud?: boolean;
+  /** 本轮确实把配置写回了本机，或向 IDE 发出了扩展装卸。 */
+  transferredToLocal?: boolean;
 }
 
 export function createSyncReport(mode: SyncMode): SyncReport {
@@ -169,6 +177,14 @@ export interface RuntimeStatus {
   lastSyncAt?: string;
   message?: string;
   leaderId?: string;
+  /** 正在把配置传到云端或写回本机。只检查、没有变化时为假。用户点下的回滚、覆盖云端、冲突选择从第一步起就为真。 */
+  transferring?: boolean;
+  /** 上一轮真正传过配置后的方向，留到下一轮真正开始传输。 */
+  transferResult?: TransferResult;
+  /** 用户点下的操作正在逐步播报。自动同步不设。 */
+  narrating?: boolean;
+  /** narrating 时当前步骤，侧边栏据此替换「同步中」。 */
+  step?: StageName;
 }
 
 export interface ProfileDescriptor {

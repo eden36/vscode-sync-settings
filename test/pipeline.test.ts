@@ -165,6 +165,27 @@ test('提交前发现未保存的配置文档时暂停且不推送', async () =>
   assert.equal(pushed, false);
 });
 
+test('有改动但提交前被未保存文档拦住时不记成已同步到云端', async () => {
+  const patches: Array<Partial<RuntimeStatus>> = [];
+  let committed = false;
+  const context = stageContext({
+    artifacts: { strategy: 'merge', commitMessage: '回滚' },
+    dependencies: stageDependencies({
+      git: fakeGit({
+        stageHost: async () => ['profiles/default/settings.json'],
+        commitAndPush: async () => { committed = true; },
+      }),
+      windowSafety: async () => ({ activeWindows: 2, dirtyWindows: 1, unreadableWindows: 0 }),
+      updateStatus: (patch) => { patches.push(patch); },
+    }),
+  });
+  const outcome = await stageTesting.pushStage.run(context);
+  assert.equal(outcome.kind, 'blocked');
+  assert.equal(committed, false);
+  assert.equal(context.report.transferredToCloud, undefined);
+  assert.equal(patches.some((patch) => patch.transferring === true || 'transferResult' in patch), false);
+});
+
 test('强制采用云端但云端没有本宿主快照时中止并清除重建标记', async () => {
   const updates: Array<Record<string, unknown>> = [];
   const context = stageContext({
@@ -270,6 +291,27 @@ test('同步顺利结束时报告完成并给出状态说明', async () => {
   assert.equal(patches.at(-1)?.sync, undefined);
   assert.equal(patches.at(-1)?.link, undefined);
   assert.equal(patches.at(-1)?.message, '配置已是最新。');
+});
+
+test('点下的操作从第一步就播报当前步骤', async () => {
+  const patches: Array<Partial<RuntimeStatus>> = [];
+  const stages: Stage[] = [
+    { name: 'snapshot', async run() { return { kind: 'continue' }; } },
+    { name: 'pull', async run() { return { kind: 'continue' }; } },
+  ];
+  const context = stageContext({
+    narrateSteps: true,
+    dependencies: stageDependencies({ updateStatus: (patch) => { patches.push(patch); } }),
+  });
+
+  assert.equal((await runPipeline(context, stages)).ok, true);
+  assert.equal(patches[0]?.step, 'snapshot');
+  assert.equal(patches[0]?.narrating, true);
+  assert.equal(patches[0]?.transferring, true);
+  assert.equal(patches[1]?.step, 'pull');
+  assert.equal(patches.at(-1)?.narrating, false);
+  assert.equal(patches.at(-1)?.transferring, false);
+  assert.equal(patches.at(-1)?.step, undefined);
 });
 
 test('请求停止后当前阶段结束且不再执行后续阶段', async () => {
@@ -556,6 +598,7 @@ test('还原使用预置的提交说明，不再调用 AI', async () => {
   assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
   assert.equal(committed, '[test-device] 还原到 abcdefg：初始配置');
   assert.equal(aiCalled, false);
+  assert.equal(context.report.transferredToCloud, true);
 });
 
 test('云端有本机没有、也不是本机删掉的 Profile 时暂停并记下名称，不改写仓库', async () => {

@@ -102,12 +102,20 @@ export class SyncEngine {
       const adoptCloud = !backupOnly && (options.adoptCloud === true || this.runtimeState.get().cloudAdoptPending);
       // 用户对「两边都改了」的选择存在共享状态里：可能是别的窗口点的，也可能是上一轮推送失败后留下的。
       const resolution = backupOnly ? undefined : this.runtimeState.get().pendingResolution;
+      // 只播报用户刚点下的那一次。选择会留到推送成功，不能因为选择还在就把之后的自动重试也播报一遍。
+      const narrateSteps = !backupOnly && this.runtimeState.get().narrateNext === true;
+      if (this.runtimeState.get().narrateNext === true) await this.runtimeState.update({ narrateNext: undefined });
+      if (narrateSteps) this.beginNarration();
 
       temporaryRoot = await this.prepareTemporaryRoot();
-      const context = this.buildContext(configuration, temporaryRoot, { adoptCloud, ...(resolution ? { resolution } : {}) });
+      const context = this.buildContext(configuration, temporaryRoot, {
+        adoptCloud,
+        narrateSteps,
+        ...(resolution ? { resolution } : {}),
+      });
       return await runPipeline(context, backupOnly ? BACKUP_STAGES : SYNC_STAGES);
     } catch (error) {
-      this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
+      this.updateStatus({ transferring: false, narrating: false, step: undefined, message: error instanceof Error ? error.message : String(error) });
       return { ok: false };
     } finally {
       this.running = false;
@@ -153,11 +161,12 @@ export class SyncEngine {
       const blocked = await this.blockedByWindows();
       if (blocked) return blocked;
 
+      this.beginNarration();
       temporaryRoot = await this.prepareTemporaryRoot();
-      const context = this.buildContext(configuration, temporaryRoot, options);
+      const context = this.buildContext(configuration, temporaryRoot, { ...options, narrateSteps: true });
       return await runPipeline(context, stages);
     } catch (error) {
-      this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
+      this.updateStatus({ transferring: false, narrating: false, step: undefined, message: error instanceof Error ? error.message : String(error) });
       return { ok: false };
     } finally {
       this.running = false;
@@ -181,6 +190,11 @@ export class SyncEngine {
     return { ok: false, retry: true, blockReason: reason };
   }
 
+  /** 确认之后、慢步骤开始前就亮同步标，避免用户等到写回才看到反馈。 */
+  private beginNarration(): void {
+    this.updateStatus({ transferring: true, narrating: true, transferResult: undefined, step: 'snapshot' });
+  }
+
   /** 流程在独占锁内执行，进程异常退出残留的临时快照可以安全清空。 */
   private async prepareTemporaryRoot(): Promise<string> {
     const snapshotRoot = path.join(this.environment.runtimePath, 'snapshots');
@@ -191,7 +205,7 @@ export class SyncEngine {
   private buildContext(
     configuration: PluginConfiguration,
     temporaryRoot: string,
-    options: { adoptCloud: boolean; resolution?: 'local' | 'cloud'; restoreTarget?: RepositoryCommit },
+    options: { adoptCloud: boolean; resolution?: 'local' | 'cloud'; restoreTarget?: RepositoryCommit; narrateSteps?: boolean },
   ): SyncContext {
     return {
       dependencies: this.dependencies,
@@ -199,6 +213,7 @@ export class SyncEngine {
       adoptCloud: options.adoptCloud,
       ...(options.resolution ? { resolution: options.resolution } : {}),
       ...(options.restoreTarget ? { restoreTarget: options.restoreTarget } : {}),
+      ...(options.narrateSteps ? { narrateSteps: true } : {}),
       paths: {
         temporaryRoot,
         localHostRoot: path.join(temporaryRoot, this.environment.kind),

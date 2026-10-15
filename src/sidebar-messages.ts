@@ -42,6 +42,10 @@ export interface DisplayStatus extends RuntimeStatus {
   tone: DisplayTone;
   stage?: string;
   needsChoice: boolean;
+  /** 用户点下的操作正在播报的当前步骤。自动同步缺省，红框仍显示「同步中」。 */
+  stepText?: string;
+  /** 上一轮真正传过配置后的结果句；空转与失败时缺省。 */
+  transferResultText?: string;
   /** Profile 不一致时的处理面板文案；无需处理时缺省。 */
   profileChoice?: { summary: string; detail: string; action: string };
 }

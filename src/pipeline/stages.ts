@@ -99,7 +99,11 @@ export const pushStage: Stage = {
       if (context.artifacts.commitMessage) {
         message = prefix + context.artifacts.commitMessage;
       } else {
-        updateStatus({ sync: { kind: 'running', stage: 'ai' }, pendingChanges: changed.length });
+        updateStatus({
+          sync: { kind: 'running', stage: 'ai' },
+          pendingChanges: changed.length,
+          ...(context.narrateSteps ? { step: 'ai' as const } : {}),
+        });
         try {
           message = prefix + (await ai.createCommitMessage(changed.map((file) => `- ${file}`).join('\n')));
         } catch {
@@ -107,15 +111,31 @@ export const pushStage: Stage = {
           context.report.usedAiFallback = true;
         }
       }
-      updateStatus({ sync: { kind: 'running', stage: 'push' }, message, pendingChanges: changed.length });
+      updateStatus({
+        sync: { kind: 'running', stage: 'push' },
+        message,
+        pendingChanges: changed.length,
+        ...(context.narrateSteps ? { step: 'push' as const } : {}),
+      });
     }
 
     // 提交前再确认一次：等待 AI 期间用户可能又打开了未保存的配置文档。
+    // 被拦住时这一轮没有推送，不能记成已同步到云端，也不能清掉上一句成功提示。
     const blocked = windowBlock(await windowSafety());
     if (blocked) return blocked;
 
-    if (message) await git.commitAndPush(context.configuration, message);
-    else await git.pushIfAhead(context.configuration);
+    if (message) {
+      markTransferring(context);
+      await git.commitAndPush(context.configuration, message);
+      context.report.transferredToCloud = true;
+    } else {
+      let pushing = false;
+      await git.pushIfAhead(context.configuration, () => {
+        markTransferring(context);
+        pushing = true;
+      });
+      if (pushing) context.report.transferredToCloud = true;
+    }
 
     // 推送成功后云端已包含本机的扩展增删，本机此刻（轮初采集）的扩展就是下一轮判断增删的起点。
     // 不能等装卸落地后再采：那时采到的「没装上」会和「本机卸载」分不开。
@@ -154,6 +174,11 @@ export const applyStage: Stage = {
       return { kind: 'blocked', reason: 'local-changed' };
     }
 
+    const willWriteLocal = context.artifacts.choice === 'cloud'
+      || context.restoreTarget !== undefined
+      || context.artifacts.strategy === 'adopt';
+    if (willWriteLocal) markTransferring(context);
+
     const restore = await adapter.restoreSnapshot(context.paths.repositoryHostRoot);
     context.artifacts.restore = restore;
     context.report.activeWindows = safety.activeWindows;
@@ -168,6 +193,7 @@ export const applyStage: Stage = {
     }
     if (notes.length) context.report.profileMessage = notes.join('；');
     if (adopt) await runtimeState.update({ cloudAdoptPending: false });
+    if (restore.changedFiles.length > 0) context.report.transferredToLocal = true;
     return { kind: 'continue' };
   },
 };
@@ -184,10 +210,12 @@ export const extensionsStage: Stage = {
       context.report.extensionsDeferred = true;
       return { kind: 'continue' };
     }
+    markTransferring(context);
     const result = requestExtensionChanges(plan.install, plan.uninstall, context.dependencies.onExtensionFailure);
     if (result.installing.length) context.report.extensionsInstalling = result.installing;
     if (result.uninstalling.length) context.report.extensionsUninstalling = result.uninstalling;
     if (result.failed.length) context.report.extensionsFailed = result.failed;
+    if (result.installing.length || result.uninstalling.length) context.report.transferredToLocal = true;
     return { kind: 'continue' };
   },
 };
@@ -285,4 +313,10 @@ async function restorePlan(context: SyncContext): Promise<SyncArtifacts['extensi
 
 async function exists(filePath: string): Promise<boolean> {
   return fs.access(filePath).then(() => true, () => false);
+}
+
+/** 自动同步从真正传配置才亮同步标。点下去的操作一开始就在播报，不必再写一次。 */
+function markTransferring(context: SyncContext): void {
+  if (context.narrateSteps) return;
+  context.dependencies.updateStatus({ transferring: true });
 }
