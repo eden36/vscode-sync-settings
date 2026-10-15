@@ -45,6 +45,11 @@
         "icon": "$(history)"
       },
       {
+        "command": "profileGitSync.overrideCloud",
+        "title": "以本机覆盖云端",
+        "category": "My Setting Sync"
+      },
+      {
         "command": "profileGitSync.rebuildRepository",
         "title": "删除本机 .git",
         "category": "My Setting Sync",
@@ -62,6 +67,11 @@
           "command": "profileGitSync.rebuildRepository",
           "when": "view == profileGitSync.sidebar",
           "group": "navigation@2"
+        },
+        {
+          "command": "profileGitSync.overrideCloud",
+          "when": "view == profileGitSync.sidebar",
+          "group": "overflow@1"
         }
       ]
     },
@@ -91,7 +101,7 @@
           "scope": "application",
           "ignoreSync": true,
           "default": false,
-          "description": "启用配置同步。关闭后不创建本地仓库、不访问远程仓库，也不写回本机配置。"
+          "description": "启用配置同步。关闭后不会自动同步：不创建本地仓库、不访问远程仓库，也不写回本机配置；手动查看云端提交历史与覆盖云端不受此限。"
         },
         "profileGitSync.pollIntervalSeconds": {
           "type": "number",

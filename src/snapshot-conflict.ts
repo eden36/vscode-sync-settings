@@ -7,10 +7,9 @@ import { HOST_KINDS, SnapshotManifest } from './types';
 const KNOWN_HOSTS = new Set<string>(HOST_KINDS);
 const PLATFORM_KEYBINDINGS = /^profiles\/[^/]+\/keybindings\.([^/.]+)\.json$/;
 
-/** 一份快照的两个可比较部分：扩展清单单独拆出，装卸收敛期间要能把它排除在判定之外。 */
+/** 一份快照的可比较部分。扩展清单不参与择一，按增删单独合并。 */
 export interface SnapshotDigest {
   snapshot: string;
-  extensions: string;
 }
 
 /**
@@ -28,11 +27,7 @@ export function snapshotDigest(manifest: SnapshotManifest, platform: string): Sn
     ...(manifest.profileMetadata !== undefined ? { profileMetadata: manifest.profileMetadata } : {}),
     files: Object.fromEntries(files),
   });
-  return {
-    snapshot: createHash('sha256').update(JSON.stringify(canonical)).digest('hex'),
-    // 清单缺失表示这一侧采集不到扩展信息，与「没有任何扩展」不同，但对判定而言同样是「没有变化」的比较基准。
-    extensions: manifest.files[HOST_EXTENSIONS_FILE] ?? '',
-  };
+  return { snapshot: createHash('sha256').update(JSON.stringify(canonical)).digest('hex') };
 }
 
 /** 按平台分开存放的快捷键里，属于其他平台的那几份。 */

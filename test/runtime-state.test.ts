@@ -62,25 +62,25 @@ test('删除本地仓库后清空上次同步时间', async () => {
   }
 });
 
-test('运行状态保存基准、待收敛扩展与用户选择', async () => {
+test('运行状态保存基准、上次同步的扩展与用户选择', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-baseline-'));
   try {
     const store = new RuntimeStateStore(root);
     await store.initialize();
-    const baseline = { localSnapshot: 'l', localExtensions: 'le', cloudSnapshot: 'c', cloudExtensions: 'ce' };
-    await store.update({ baseline, extensionsPending: ['a.b'], extensionsPendingRounds: 1, pendingResolution: 'local' });
+    const baseline = { localSnapshot: 'l', cloudSnapshot: 'c' };
+    await store.update({ baseline, syncedExtensions: ['a.b'], pendingResolution: 'local' });
 
     const reloaded = new RuntimeStateStore(root);
     await reloaded.initialize();
     assert.deepEqual(reloaded.get().baseline, baseline);
-    assert.deepEqual(reloaded.get().extensionsPending, ['a.b']);
+    assert.deepEqual(reloaded.get().syncedExtensions, ['a.b']);
     assert.equal(reloaded.get().pendingResolution, 'local');
 
     // 显式传 undefined 表示删除，否则用户的选择会一直粘着，下一轮又按它执行一次。
-    await store.update({ pendingResolution: undefined, extensionsPending: undefined, extensionsPendingRounds: undefined });
+    await store.update({ pendingResolution: undefined, syncedExtensions: ['a.b', 'c.d'] });
     await reloaded.reload();
     assert.equal(reloaded.get().pendingResolution, undefined);
-    assert.equal(reloaded.get().extensionsPending, undefined);
+    assert.deepEqual(reloaded.get().syncedExtensions, ['a.b', 'c.d']);
     assert.deepEqual(reloaded.get().baseline, baseline);
 
     // 残缺的基准与非法的选择一律拒绝，避免据此误判两侧改没改。
@@ -88,7 +88,7 @@ test('运行状态保存基准、待收敛扩展与用户选择', async () => {
     assert.ok(parseRuntimeState(valid));
     assert.equal(parseRuntimeState({ ...valid, baseline: { localSnapshot: 'l' } }), undefined);
     assert.equal(parseRuntimeState({ ...valid, pendingResolution: 'both' }), undefined);
-    assert.equal(parseRuntimeState({ ...valid, extensionsPending: [1] }), undefined);
+    assert.equal(parseRuntimeState({ ...valid, syncedExtensions: [1] }), undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -100,7 +100,7 @@ test('运行状态保存基准里的 Profile 名单与待处理的 Profile 差�
     const store = new RuntimeStateStore(root);
     await store.initialize();
     const baseline = {
-      localSnapshot: 'l', localExtensions: '', cloudSnapshot: 'c', cloudExtensions: '', localProfiles: ['开发'], cloudProfiles: ['开发', '工作'],
+      localSnapshot: 'l', cloudSnapshot: 'c', localProfiles: ['开发'], cloudProfiles: ['开发', '工作'],
     };
     const mismatch = { kind: 'cloud-only' as const, names: ['工作'] };
     await store.update({ baseline, profileMismatch: mismatch, profileResolution: mismatch });

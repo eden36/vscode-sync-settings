@@ -1,9 +1,18 @@
 const applicationSettings = new Map<string, unknown>();
-const installedExtensions = new Map<string, { id: string }>();
 const failedInstallIds = new Set<string>();
 const failedUninstallIds = new Set<string>();
+const heldInstalls = new Map<string, Promise<void>>();
 export const installCommandCalls: string[] = [];
 export const uninstallCommandCalls: string[] = [];
+
+export const informationMessages: string[] = [];
+
+export const window = {
+  showInformationMessage: async (message: string): Promise<undefined> => {
+    informationMessages.push(message);
+    return undefined;
+  },
+};
 
 export const env = {
   machineId: 'test-machine',
@@ -29,14 +38,13 @@ export const commands = {
     if (typeof argument !== 'string') return undefined;
     if (command === 'workbench.extensions.installExtension') {
       installCommandCalls.push(argument);
+      await heldInstalls.get(argument);
       if (failedInstallIds.has(argument)) throw new Error(`无法安装 ${argument}`);
-      installedExtensions.set(argument, { id: argument });
       return undefined;
     }
     if (command === 'workbench.extensions.uninstallExtension') {
       uninstallCommandCalls.push(argument);
       if (failedUninstallIds.has(argument)) throw new Error(`无法卸载 ${argument}`);
-      installedExtensions.delete(argument);
       return undefined;
     }
     return undefined;
@@ -47,25 +55,27 @@ export function resetApplicationSettings(): void {
   applicationSettings.clear();
 }
 
+export function resetWindowStub(): void {
+  informationMessages.length = 0;
+}
+
 export function resetExtensionStub(): void {
-  installedExtensions.clear();
   failedInstallIds.clear();
   failedUninstallIds.clear();
+  heldInstalls.clear();
   installCommandCalls.length = 0;
   uninstallCommandCalls.length = 0;
 }
 
-export function markExtensionInstalled(id: string): void {
-  installedExtensions.set(id, { id });
-}
-
-/** 模拟扩展清单文件：安装命令成功后标识立刻出现在清单里。 */
-export async function installedExtensionIds(): Promise<string[]> {
-  return [...installedExtensions.keys()];
-}
-
 export function markExtensionInstallFailed(id: string): void {
   failedInstallIds.add(id);
+}
+
+/** 模拟下载很慢的安装：调用返回的函数之前安装命令一直不结束。 */
+export function holdExtensionInstall(id: string): () => void {
+  let release = (): void => undefined;
+  heldInstalls.set(id, new Promise<void>((resolve) => { release = resolve; }));
+  return release;
 }
 
 export function markExtensionUninstallFailed(id: string): void {

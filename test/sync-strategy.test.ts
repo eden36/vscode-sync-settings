@@ -60,27 +60,26 @@ test('备份模式状态文案使用备份完成前缀', () => {
 });
 
 test('择一判定只看两侧相对基准有没有改动', () => {
-  const baseline = { localSnapshot: 'L', localExtensions: 'LE', cloudSnapshot: 'C', cloudExtensions: 'CE' };
-  const digest = (snapshot: string, extensions: string) => ({ snapshot, extensions });
-  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE'), digest('C', 'CE'), { ignoreExtensions: false }), 'none');
-  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE'), digest('C2', 'CE'), { ignoreExtensions: false }), 'cloud');
-  assert.equal(decideSnapshotChoice(baseline, digest('L2', 'LE'), digest('C', 'CE'), { ignoreExtensions: false }), 'local');
-  assert.equal(decideSnapshotChoice(baseline, digest('L2', 'LE'), digest('C2', 'CE'), { ignoreExtensions: false }), 'conflict');
+  const baseline = { localSnapshot: 'L', cloudSnapshot: 'C' };
+  const digest = (snapshot: string) => ({ snapshot });
+  assert.equal(decideSnapshotChoice(baseline, digest('L'), digest('C')), 'none');
+  assert.equal(decideSnapshotChoice(baseline, digest('L'), digest('C2')), 'cloud');
+  assert.equal(decideSnapshotChoice(baseline, digest('L2'), digest('C')), 'local');
+  assert.equal(decideSnapshotChoice(baseline, digest('L2'), digest('C2')), 'conflict');
   // 用户已经选定一方时直接落地，不再询问。
-  assert.equal(
-    decideSnapshotChoice(baseline, digest('L2', 'LE'), digest('C2', 'CE'), { ignoreExtensions: false, resolution: 'cloud' }),
-    'cloud',
-  );
-  // 扩展还在装卸时，清单变化不算这一侧改过。
-  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE2'), digest('C', 'CE'), { ignoreExtensions: false }), 'local');
-  assert.equal(decideSnapshotChoice(baseline, digest('L', 'LE2'), digest('C', 'CE'), { ignoreExtensions: true }), 'none');
+  assert.equal(decideSnapshotChoice(baseline, digest('L2'), digest('C2'), { resolution: 'cloud' }), 'cloud');
   // 没有基准时两侧一致就直接立基准，不一致只能交给用户。
-  assert.equal(decideSnapshotChoice(undefined, digest('S', 'E'), digest('S', 'E'), { ignoreExtensions: false }), 'none');
-  assert.equal(decideSnapshotChoice(undefined, digest('S', 'E'), digest('S2', 'E'), { ignoreExtensions: false }), 'conflict');
+  assert.equal(decideSnapshotChoice(undefined, digest('S'), digest('S')), 'none');
+  assert.equal(decideSnapshotChoice(undefined, digest('S'), digest('S2')), 'conflict');
   // 两侧都偏离基准但彼此一致（例如推送后还没记下基准进程就退出了）：没有可选的，不打扰用户。
-  assert.equal(decideSnapshotChoice(baseline, digest('S', 'E'), digest('S', 'E'), { ignoreExtensions: false }), 'none');
-  assert.equal(decideSnapshotChoice(baseline, digest('S', 'E'), digest('S', 'E2'), { ignoreExtensions: false }), 'conflict');
-  assert.equal(decideSnapshotChoice(baseline, digest('S', 'E'), digest('S', 'E2'), { ignoreExtensions: true }), 'none');
+  assert.equal(decideSnapshotChoice(baseline, digest('S'), digest('S')), 'none');
+});
+
+test('扩展装卸请求写进同步说明', () => {
+  assert.equal(
+    finalSyncMessage({ ...createSyncReport('sync'), extensionsInstalling: ['a.one', 'b.two'], extensionsUninstalling: ['c.three'] }),
+    '同步完成（已请求安装 2 个扩展，可在扩展面板查看进度；已请求卸载扩展：c.three）。',
+  );
 });
 
 test('按用户选择处理后的文案说明方向并提示备份', () => {

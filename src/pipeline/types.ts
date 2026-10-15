@@ -1,5 +1,6 @@
 import { AiService } from '../ai';
 import { WindowSafetySnapshot } from '../coordinator';
+import { ExtensionSyncPlan } from '../extension-manifest';
 import { ConfigurationRepositoryGitService, PullResult, RepositoryCommit } from '../git-service';
 import { HostEnvironment } from '../host';
 import { ProfileAdapter, RestoreResult } from '../profile-adapter';
@@ -29,6 +30,8 @@ export interface SyncDependencies {
   conflictBackupRoot: string;
   /** 设备名，写入提交信息前缀，便于在多台机器间区分改动来源。 */
   deviceName: string;
+  /** 扩展装卸命令异步失败时调用：失败不会改变清单，不通知就没有下一轮来显示失败原因。 */
+  onExtensionFailure?: () => void;
 }
 
 /** 一轮同步涉及的目录，全部在进入流程前算好，stage 不再自行拼路径。 */
@@ -55,6 +58,10 @@ export interface SyncArtifacts {
    * （还原历史提交、按用户选择从云端删除 Profile 时使用）。
    */
   commitMessage?: string;
+  /** 本机要装卸的扩展，由扩展清单合并得出；还原流程不经过合并，由 extensions stage 自行计算。 */
+  extensionPlan?: Pick<ExtensionSyncPlan, 'install' | 'uninstall'>;
+  /** 合并改写了仓库工作区的扩展清单；即使配置采用云端或没变，也要提交这次改动。 */
+  extensionsMerged?: boolean;
 }
 
 export interface SyncContext {

@@ -20,7 +20,7 @@ import { profileMismatchText } from './sidebar-status';
 import { reportActivationFailure, SyncStatusBar } from './status-bar';
 import { SyncEngine } from './sync-engine';
 import { SyncSchedules } from './sync-schedules';
-import { RuntimeStatus, SyncOutcome } from './types';
+import { HOST_LABELS, RuntimeStatus, SyncOutcome } from './types';
 
 const CONFIGURATION_POLL_MS = 5_000;
 /** 通过「打开用户设置 (JSON)」等入口打开的配置文件使用这个协议，而不是 file。 */
@@ -175,13 +175,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (Object.keys(rest).length) applyStatus(rest, coordinator.isLeader);
     },
     () => coordinator.windowSafety(),
+    // 装卸命令异步失败不会改变清单，补一轮才能把失败原因显示出来；失败的扩展本进程内不再重发，不会循环。
+    () => requestSync('timer'),
   );
 
   const schedules = new SyncSchedules({
     fingerprint: async () => adapter.fingerprint(),
-    // 还有扩展没装完时需要整轮继续收敛，远端没动也要跑。
-    remoteChanged: async () => (runtimeState.get().extensionsPending?.length ?? 0) > 0
-      || configurationRepository.remoteChanged(configurationStore.get()),
+    remoteChanged: async () => configurationRepository.remoteChanged(configurationStore.get()),
     isLeader: () => coordinator.isLeader,
     isEnabled: () => machine.enabled,
     configuration: () => configurationStore.get(),
@@ -376,6 +376,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  /**
+   * 用户显式触发的「以本机覆盖云端」：只推送、不写回本机，同步开关关闭时也可用。
+   * 在任意窗口执行，整段包在独占锁内；收尾与还原一样经调度层。
+   */
+  const overrideCloud = async () => {
+    if (!configurationStore.get().repositoryUrl) {
+      applyStatus({ message: '请填写 Git 仓库地址。' }, false);
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      `是否以本机配置覆盖云端 ${HOST_LABELS[environment.kind]} 的配置？`,
+      {
+        modal: true,
+        detail: [
+          '将用本机当前的配置整份替换云端仓库中本宿主的快照，并追加一条新提交；远端已有历史不会被改写，之后仍可从云端提交历史还原。',
+          '云端有、本机没有的 Profile 会从云端删除；扩展清单以本机为准，云端独有的扩展会被删除，其他机器下次同步时会卸载它们。',
+          '云端其他平台的快捷键文件会保留，本机配置不会被改动。',
+          ...(machine.enabled ? [] : ['当前同步已关闭，本次覆盖不会开启同步。']),
+        ].join('\n'),
+      },
+      '覆盖云端',
+    );
+    if (confirmed !== '覆盖云端') return;
+    try {
+      let outcome: SyncOutcome | undefined;
+      const acquired = await coordinator.runExclusive(async () => {
+        outcome = await engine.overrideCloud();
+      });
+      if (!acquired) {
+        applyStatus({ message: '另一窗口正在执行同步，请稍后重试覆盖云端。' }, false);
+        return;
+      }
+      dispatch({ type: 'sync-finished', outcome });
+      if (outcome?.ok) applyStatus({ message: '已以本机配置覆盖云端。' }, coordinator.isLeader);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      applyStatus({ message }, false);
+      dispatch({ type: 'sync-failed', message });
+    }
+  };
+
   // 侧边栏的回调与这里互相引用，显式标注类型才能让推断收敛。
   const history: HistoryController = new HistoryController({
     coordinator,
@@ -459,6 +500,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand('profileGitSync.toggleEnabled', () => void setEnabled(!machine.enabled)),
     vscode.commands.registerCommand('profileGitSync.showHistory', () => void history.open()),
+    vscode.commands.registerCommand('profileGitSync.overrideCloud', () => void overrideCloud()),
     vscode.commands.registerCommand('profileGitSync.rebuildRepository', () => void rebuildRepository()),
     vscode.commands.registerCommand('profileGitSync.openSettings', () => vscode.commands.executeCommand('workbench.view.extension.profileGitSync')),
     vscode.workspace.onDidChangeConfiguration((event) => {

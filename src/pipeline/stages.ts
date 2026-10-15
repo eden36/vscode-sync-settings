@@ -1,17 +1,19 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { HOST_EXTENSIONS_FILE } from '../extension-manifest';
-import { collectExtensionIdsFromFiles, installAndWaitForExtensions, uninstallRemovedExtensions } from '../extension-wait';
+import {
+  HOST_EXTENSIONS_FILE,
+  parseExtensionIds,
+  selectMissingExtensionIds,
+  selectRemovableExtensionIds,
+} from '../extension-manifest';
+import { requestExtensionChanges } from '../extension-wait';
 import { findPotentialSecrets } from '../secret-scanner';
 import { namedProfiles, readManifest, snapshotDigest } from '../snapshot-conflict';
 import { fallbackCommitMessage } from '../sync-fallback';
 import { decideCloudAdopt } from '../sync-strategy';
 import { HOST_LABELS, SnapshotManifest, SyncBaseline } from '../types';
 import { chooseStage } from './choose';
-import { requireValue, Stage, StageOutcome, SyncContext, windowBlock } from './types';
-
-/** 扩展连续这么多轮仍没装完就放弃等待，否则扩展清单会永远被排除在改动判定之外。 */
-const EXTENSION_SETTLE_ROUNDS = 3;
+import { requireValue, Stage, StageOutcome, SyncArtifacts, SyncContext, windowBlock } from './types';
 
 export const snapshotStage: Stage = {
   name: 'snapshot',
@@ -24,7 +26,7 @@ export const snapshotStage: Stage = {
   },
 };
 
-const scanSecretsStage: Stage = {
+export const scanSecretsStage: Stage = {
   name: 'scan-secrets',
   async run(context: SyncContext): Promise<StageOutcome> {
     // 整包采用云端时不会把本机内容推上去，无需拦截本机的历史遗留凭据。
@@ -84,8 +86,10 @@ export const pushStage: Stage = {
   async run(context: SyncContext): Promise<StageOutcome> {
     const { git, ai, environment, windowSafety, updateStatus, deviceName, runtimeState } = context.dependencies;
     // 采用云端或两侧都没改时仓库内容没被改写，但上次推送失败留下的提交仍要补推。
-    // 预置了提交说明的流程（还原、从云端删除 Profile）改写过仓库，同样要提交。
-    const commitRepository = context.artifacts.choice === 'local' || context.artifacts.commitMessage !== undefined;
+    // 预置了提交说明的流程（还原、从云端删除 Profile）与扩展清单合并改写过仓库，同样要提交。
+    const commitRepository = context.artifacts.choice === 'local'
+      || context.artifacts.commitMessage !== undefined
+      || context.artifacts.extensionsMerged === true;
     const changed = commitRepository ? await git.stageHost(environment.kind) : [];
     context.report.changedFileCount = changed.length;
     let message: string | undefined;
@@ -112,6 +116,11 @@ export const pushStage: Stage = {
 
     if (message) await git.commitAndPush(context.configuration, message);
     else await git.pushIfAhead(context.configuration);
+
+    // 推送成功后云端已包含本机的扩展增删，本机此刻（轮初采集）的扩展就是下一轮判断增删的起点。
+    // 不能等装卸落地后再采：那时采到的「没装上」会和「本机卸载」分不开。
+    const localExtensions = await fs.readFile(path.join(context.paths.localHostRoot, HOST_EXTENSIONS_FILE), 'utf8').catch(() => undefined);
+    if (localExtensions !== undefined) await runtimeState.update({ syncedExtensions: parseExtensionIds(localExtensions) });
 
     // 采用本机并推送成功后，仓库内容就是本机这份快照，基准此刻就要前移。
     // 留到 finalize 才写的话，之后被写回前的二次确认拦住、被取消或扩展步骤抛错，下一轮都会把自己刚推的内容判成云端改动。
@@ -163,46 +172,29 @@ export const applyStage: Stage = {
   },
 };
 
+/** 只向 IDE 发出装卸命令就结束：装好与否由下一轮的扩展清单说明，清单变化本身会触发下一轮。 */
 export const extensionsStage: Stage = {
   name: 'extensions',
   async run(context: SyncContext): Promise<StageOutcome> {
-    const { adapter, environment, runtimeState, updateStatus } = context.dependencies;
-    const manifest = await readManifest(context.paths.repositoryHostRoot);
-    // 只认宿主级清单：Profile 目录下的 extensions.json 记录的是启用状态且可能过时，
-    // 混进来会让已卸载的扩展被重新装回，卸载判定必须有单一权威来源。
-    if (!manifest.files[HOST_EXTENSIONS_FILE]) return { kind: 'continue' };
-    // 只有采用了云端（含还原历史）时本机才要整体向清单收敛；其余轮次只继续处理上一轮没装完的那几个，
-    // 否则用户在收敛期间新装的扩展会因为不在云端清单里被卸掉。
-    const converge = context.artifacts.choice === 'cloud' || context.restoreTarget !== undefined;
-    const previous = new Set((runtimeState.get().extensionsPending ?? []).map((id) => id.toLowerCase()));
-    if (!converge && !previous.size) return { kind: 'continue' };
+    const plan = context.restoreTarget ? await restorePlan(context) : context.artifacts.extensionPlan;
+    if (!plan || (!plan.install.length && !plan.uninstall.length)) return { kind: 'continue' };
     // 装卸命令只作用于当前窗口的 Profile，而清单属于默认 Profile；在命名 Profile 窗口里装卸会装错地方。
-    if (environment.inDefaultProfile === false) {
+    // 这里不需要记任何状态：默认 Profile 窗口的下一轮会按同样的规则重新算出要装卸的扩展。
+    if (context.dependencies.environment.inDefaultProfile === false) {
       context.report.extensionsDeferred = true;
       return { kind: 'continue' };
     }
-    const targetIds = await collectExtensionIdsFromFiles([
-      path.join(context.paths.repositoryHostRoot, HOST_EXTENSIONS_FILE),
-    ]);
-    if (!targetIds.length) return { kind: 'continue' };
-    const inScope = (id: string) => converge || previous.has(id.toLowerCase());
-
-    const onProgress = (message: string) => updateStatus({ sync: { kind: 'running', stage: 'extensions' }, message });
-    const listInstalled = () => adapter.listInstalledExtensionIds();
-    // 先卸后装：云端移除的扩展必须在本机也消失，否则下一轮又会被本机推回云端，两台机器来回拉扯。
-    const installed = (await listInstalled()).filter(inScope);
-    const uninstallFailed = await uninstallRemovedExtensions(targetIds, installed, { onProgress });
-    const result = await installAndWaitForExtensions(targetIds.filter(inScope), { listInstalled, onProgress });
-    if (result.pending.length) context.report.extensionsPending = result.pending;
-    const failed = [...result.failed, ...uninstallFailed];
-    if (failed.length) context.report.extensionsFailed = failed;
+    const result = requestExtensionChanges(plan.install, plan.uninstall, context.dependencies.onExtensionFailure);
+    if (result.installing.length) context.report.extensionsInstalling = result.installing;
+    if (result.uninstalling.length) context.report.extensionsUninstalling = result.uninstalling;
+    if (result.failed.length) context.report.extensionsFailed = result.failed;
     return { kind: 'continue' };
   },
 };
 
 /**
  * 记录本轮的基准：下一轮据此判断「本机改没改」与「云端改没改」。
- * 必须在写回与扩展装卸之后重新采集，否则写回结果会在下一轮被当成用户改动。
+ * 必须在写回之后重新采集，否则写回结果会在下一轮被当成用户改动。
  */
 export const finalizeStage: Stage = {
   name: 'finalize',
@@ -215,17 +207,8 @@ export const finalizeStage: Stage = {
     const local = wroteBack
       ? await adapter.createSnapshot(context.paths.localHostRoot)
       : requireValue(context.artifacts.localManifest, 'localManifest');
-    const previous = runtimeState.get();
-    // 本轮没有装卸扩展（窗口不在默认 Profile）时上一轮的收敛状态原样保留。
-    const deferred = context.report.extensionsDeferred === true;
-    const pending = deferred ? previous.extensionsPending ?? [] : context.report.extensionsPending ?? [];
-    const rounds = deferred ? previous.extensionsPendingRounds ?? 0 : pending.length ? (previous.extensionsPendingRounds ?? 0) + 1 : 0;
-    // 扩展迟迟没出现在清单里时不能无限等待，否则清单会永远被排除在改动判定之外。
-    const settling = pending.length > 0 && rounds < EXTENSION_SETTLE_ROUNDS;
     await runtimeState.update({
       baseline: await computeBaseline(context, local),
-      extensionsPending: settling ? pending : undefined,
-      extensionsPendingRounds: settling ? rounds : undefined,
       // 用户的选择在这里才算兑现：中途失败保留它，下一轮直接沿用，不再重复询问。
       pendingResolution: undefined,
       profileResolution: undefined,
@@ -272,27 +255,31 @@ export const testing = {
   finalizeStage,
 };
 
-/**
- * 基准的两处写入（推送成功后、整轮结束时）必须是同一种算法，否则下一轮会把自己写下的基准判成改动。
- * 窗口不在默认 Profile 时本轮没有装卸扩展，扩展部分沿用上一份基准：
- * 前移的话，云端清单的变化会被记成「已同步」，之后回到默认 Profile 窗口也不会再装。
- */
+/** 基准的两处写入（推送成功后、整轮结束时）必须是同一种算法，否则下一轮会把自己写下的基准判成改动。 */
 async function computeBaseline(context: SyncContext, local: SnapshotManifest): Promise<SyncBaseline> {
-  const { environment, runtimeState } = context.dependencies;
+  const { environment } = context.dependencies;
   const platform = environment.platform ?? process.platform;
   const cloud = await readManifest(context.paths.repositoryHostRoot);
-  const localDigest = snapshotDigest(local, platform);
-  const cloudDigest = snapshotDigest(cloud, platform);
-  const frozen = environment.inDefaultProfile === false;
-  const previous = frozen ? runtimeState.get().baseline : undefined;
   return {
-    localSnapshot: localDigest.snapshot,
-    localExtensions: previous?.localExtensions ?? localDigest.extensions,
-    cloudSnapshot: cloudDigest.snapshot,
-    // 没有上一份可沿用时记成空，让默认 Profile 窗口的下一轮把云端清单判为有改动并去收敛。
-    cloudExtensions: frozen ? previous?.cloudExtensions ?? '' : cloudDigest.extensions,
+    localSnapshot: snapshotDigest(local, platform).snapshot,
+    cloudSnapshot: snapshotDigest(cloud, platform).snapshot,
     localProfiles: namedProfiles(local).sort((left, right) => left.localeCompare(right)),
     cloudProfiles: namedProfiles(cloud).sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+/** 还原不做合并：本机扩展整份向历史快照的清单收敛，多的卸载、缺的安装。 */
+async function restorePlan(context: SyncContext): Promise<SyncArtifacts['extensionPlan']> {
+  const read = (root: string) => fs.readFile(path.join(root, HOST_EXTENSIONS_FILE), 'utf8').catch(() => undefined);
+  const target = await read(context.paths.repositoryHostRoot);
+  const local = await read(context.paths.localHostRoot);
+  // 任一侧没有扩展信息时无从比较，不能当成「全部卸载」。
+  if (target === undefined || local === undefined) return undefined;
+  const targetIds = parseExtensionIds(target);
+  const localIds = parseExtensionIds(local);
+  return {
+    install: selectMissingExtensionIds(targetIds, localIds),
+    uninstall: selectRemovableExtensionIds(localIds, targetIds),
   };
 }
 

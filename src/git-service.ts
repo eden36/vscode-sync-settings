@@ -96,6 +96,7 @@ export class ConfigurationRepositoryGitService {
    * 本地还没有该跟踪分支时返回 undefined，与「有分支但没有本宿主提交」的空数组区分开：
    * 前者要让界面显示加载中，后者要显示「云端还没有提交」。
    * offset 用于「加载更多」只取新的一页，不必把已经取过的那部分重新遍历一遍。
+   * 只读本地引用，不创建仓库、不改仓库配置，因此可以在独占锁之外调用，同步进行中也能先看到缓存。
    */
   public async listCachedCommits(
     configuration: SyncConfiguration,
@@ -103,7 +104,8 @@ export class ConfigurationRepositoryGitService {
     limit = 30,
     offset = 0,
   ): Promise<RepositoryCommit[] | undefined> {
-    await this.ensureOrigin(configuration);
+    this.remoteUrl = configuration.repositoryUrl;
+    if (!(await exists(path.join(this.repositoryPath, '.git')))) return undefined;
     const localTip = await this.git(['rev-parse', '--verify', `origin/${configuration.branch}`], true);
     if (localTip.exitCode !== 0) return undefined;
     return this.readCommits(configuration, host, limit, offset);

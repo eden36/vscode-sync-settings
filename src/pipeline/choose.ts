@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { HOST_EXTENSIONS_FILE, parseExtensionIds } from '../extension-manifest';
+import { formatExtensionManifest, HOST_EXTENSIONS_FILE, parseExtensionIds, planExtensionSync } from '../extension-manifest';
 import { findPotentialSecrets } from '../secret-scanner';
 import { profileMismatchText } from '../sidebar-status';
 import { isOtherPlatformFile, namedProfiles, readManifest, snapshotDigest } from '../snapshot-conflict';
@@ -10,9 +11,10 @@ import { backupConflictSnapshots } from './backup';
 import { requireValue, Stage, StageOutcome, SyncContext, windowBlock } from './types';
 
 /**
- * 择一而不是合并：仓库里的内容永远等于某一台机器的完整真实快照。
- * 合并会产出两台机器上都不存在的中间态，配置和扩展清单一旦被拼接就无法验证，
+ * 配置文件择一而不是合并：仓库里的配置永远等于某一台机器的完整真实快照。
+ * 合并会产出两台机器上都不存在的中间态，配置一旦被拼接就无法验证，
  * 因此两侧都相对基准改过时一律停下来交给用户决定。
+ * 扩展清单是唯一的例外：同步模式下按增删合并（mergeExtensions），不参与择一；备份模式仍整份覆盖。
  */
 export const chooseStage: Stage = {
   name: 'choose',
@@ -21,20 +23,21 @@ export const chooseStage: Stage = {
     const { localHostRoot, repositoryHostRoot } = context.paths;
     const strategy = requireValue(context.artifacts.strategy, 'strategy');
     const platform = environment.platform ?? process.platform;
+    // 采用本机时仓库目录会被整份替换，云端扩展清单要先读出来。
+    const cloudExtensions = await readOptionalFile(path.join(repositoryHostRoot, HOST_EXTENSIONS_FILE));
 
-    // 首次接入或重建后整包采用云端，本轮不改写仓库内容。
+    // 首次接入或重建后整包采用云端，配置不改写仓库内容。
     if (strategy === 'adopt') {
       await backupConflictSnapshots(conflictBackupRoot, localHostRoot, repositoryHostRoot);
       context.artifacts.choice = 'cloud';
       context.report.snapshotChoice = 'cloud';
+      await mergeExtensions(context, cloudExtensions);
       return { kind: 'continue' };
     }
 
     // 备份模式与远端还没有本宿主快照时，本机是仓库内容的唯一来源，没有可比较的另一方。
     const comparable = strategy === 'merge' && requireValue(context.artifacts.remoteExists, 'remoteExists');
     const state = runtimeState.get();
-    // 扩展还在装卸、或当前窗口不在默认 Profile 而无法装卸时，本机清单不代表同步结果，既不算改动也不能推上云端。
-    const extensionsFrozen = (state.extensionsPending?.length ?? 0) > 0 || environment.inDefaultProfile === false;
     // 仓库目录马上被本机快照整份替换，这些云端条目要先留下来；值为 undefined 表示云端本来就没有。
     const preserved = new Map<string, Buffer | undefined>();
 
@@ -47,29 +50,24 @@ export const chooseStage: Stage = {
         state.baseline,
         snapshotDigest(localManifest, platform),
         snapshotDigest(cloudManifest, platform),
-        {
-          ignoreExtensions: extensionsFrozen,
-          ...(context.resolution ? { resolution: context.resolution } : {}),
-        },
+        context.resolution ? { resolution: context.resolution } : {},
       );
       if (choice === 'conflict') {
         // 用户可能过很久才做选择，双方内容先各存一份，避免暂停期间本机改动毫无副本。
         await backupConflictSnapshots(conflictBackupRoot, localHostRoot, repositoryHostRoot);
-        return {
-          kind: 'blocked',
-          reason: 'both-changed',
-          message: await conflictMessage(context, localManifest, cloudManifest, platform),
-        };
+        return { kind: 'blocked', reason: 'both-changed', message: conflictMessage(localManifest, cloudManifest, platform) };
       }
       context.artifacts.choice = choice;
       context.report.snapshotChoice = choice;
       context.report.resolvedConflict = context.resolution !== undefined;
       // 采用本机时整份推送本身就会去掉这些 Profile；否则要单独提交这次删除。
       if (dropped.length && choice !== 'local') context.artifacts.commitMessage = `从云端删除 Profile：${dropped.join('、')}`;
-      // 采用云端与两侧都没变都不改写仓库，本轮不会产生新的远端提交。
-      if (choice !== 'local') return { kind: 'continue' };
+      // 采用云端与两侧都没变都不改写配置，只有扩展清单可能因合并而变化。
+      if (choice !== 'local') {
+        await mergeExtensions(context, cloudExtensions);
+        return { kind: 'continue' };
+      }
 
-      if (extensionsFrozen) preserved.set(HOST_EXTENSIONS_FILE, await readOptionalFile(path.join(repositoryHostRoot, HOST_EXTENSIONS_FILE)));
       // 其他平台的快捷键本机既不写回也不采集，推送本机快照时必须原样保留，否则会把另一平台的快捷键删掉。
       const localIds = new Set(localManifest.profiles.map((profile) => profile.id));
       for (const relative of Object.keys(cloudManifest.files)) {
@@ -87,6 +85,8 @@ export const chooseStage: Stage = {
     await fs.mkdir(path.dirname(repositoryHostRoot), { recursive: true });
     await fs.cp(localHostRoot, repositoryHostRoot, { recursive: true });
     if (preserved.size) await restoreCloudFiles(repositoryHostRoot, preserved, cloudHashes);
+    // 备份模式按约定用本机清单整份覆盖，不合并。
+    if (strategy !== 'backup') await mergeExtensions(context, cloudExtensions);
 
     const manifest = await readManifest(repositoryHostRoot);
     const secrets = await findPotentialSecrets(repositoryHostRoot, manifest);
@@ -173,7 +173,7 @@ async function removeCloudProfiles(root: string, manifest: SnapshotManifest, nam
 }
 
 /** 把云端原有的条目写回仓库，并同步 manifest；云端本来就没有的条目一并去掉。 */
-async function restoreCloudFiles(
+export async function restoreCloudFiles(
   repositoryHostRoot: string,
   preserved: Map<string, Buffer | undefined>,
   cloudHashes: Record<string, string>,
@@ -194,27 +194,50 @@ async function restoreCloudFiles(
   await fs.writeFile(path.join(repositoryHostRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 }
 
-/** 冲突提示必须给出依据：用户要据此判断丢掉哪一边，尤其是会不会卸掉扩展。 */
-async function conflictMessage(
-  context: SyncContext,
-  local: SnapshotManifest,
-  cloud: SnapshotManifest,
-  platform: string,
-): Promise<string> {
-  const details: string[] = [];
+/**
+ * 把本机相对上次同步的扩展增删合并进仓库工作区的云端清单，并记下本机要装卸的扩展。
+ * 本机采集不到扩展信息（开发宿主）时云端清单原样保留，不能把「不知道」当成「全卸了」。
+ */
+async function mergeExtensions(context: SyncContext, cloudContent: Buffer | undefined): Promise<void> {
+  const { localHostRoot, repositoryHostRoot } = context.paths;
+  const localContent = await readOptionalFile(path.join(localHostRoot, HOST_EXTENSIONS_FILE));
+  if (localContent === undefined) {
+    await writeExtensionManifest(context, cloudContent);
+    return;
+  }
+  const local = parseExtensionIds(localContent.toString('utf8'));
+  // 云端还没有扩展信息时以本机为准，避免合并出一份空清单。
+  const cloud = cloudContent === undefined ? local : parseExtensionIds(cloudContent.toString('utf8'));
+  const plan = planExtensionSync(local, cloud, context.dependencies.runtimeState.get().syncedExtensions);
+  context.artifacts.extensionPlan = { install: plan.install, uninstall: plan.uninstall };
+  await writeExtensionManifest(context, Buffer.from(formatExtensionManifest(plan.merged), 'utf8'));
+}
+
+/** 写入仓库工作区的扩展清单并同步 manifest；内容没变时不动文件，避免产生无意义的提交。 */
+async function writeExtensionManifest(context: SyncContext, content: Buffer | undefined): Promise<void> {
+  const root = context.paths.repositoryHostRoot;
+  const manifest = await readManifest(root);
+  const hash = content === undefined ? undefined : createHash('sha256').update(content).digest('hex');
+  if (manifest.files[HOST_EXTENSIONS_FILE] === hash) return;
+  const target = path.join(root, HOST_EXTENSIONS_FILE);
+  if (content === undefined || hash === undefined) {
+    await fs.rm(target, { force: true });
+    delete manifest.files[HOST_EXTENSIONS_FILE];
+  } else {
+    await fs.writeFile(target, content);
+    manifest.files[HOST_EXTENSIONS_FILE] = hash;
+  }
+  await fs.writeFile(path.join(root, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  context.artifacts.extensionsMerged = true;
+}
+
+/** 冲突提示必须给出依据：用户要据此判断丢掉哪一边。 */
+function conflictMessage(local: SnapshotManifest, cloud: SnapshotManifest, platform: string): string {
   const changed = differentFiles(local, cloud, platform);
-  if (changed.length) {
-    const shown = changed.slice(0, 3).join('、');
-    details.push(`差异配置 ${changed.length} 项：${shown}${changed.length > 3 ? ' 等' : ''}`);
-  }
-  if (local.files[HOST_EXTENSIONS_FILE] !== cloud.files[HOST_EXTENSIONS_FILE]) {
-    const localIds = await readExtensionIds(context.paths.localHostRoot);
-    const cloudIds = await readExtensionIds(context.paths.repositoryHostRoot);
-    const onlyLocal = localIds.filter((id) => !cloudIds.includes(id)).length;
-    const onlyCloud = cloudIds.filter((id) => !localIds.includes(id)).length;
-    details.push(`扩展：本机独有 ${onlyLocal} 个，云端独有 ${onlyCloud} 个`);
-  }
-  return `本机与云端都有改动，已暂停同步，请选择以哪一方为准。${details.length ? `（${details.join('；')}）` : ''}`;
+  const detail = changed.length
+    ? `（差异配置 ${changed.length} 项：${changed.slice(0, 3).join('、')}${changed.length > 3 ? ' 等' : ''}）`
+    : '';
+  return `本机与云端都有改动，已暂停同步，请选择以哪一方为准。${detail}`;
 }
 
 function differentFiles(local: SnapshotManifest, cloud: SnapshotManifest, platform: string): string[] {
@@ -225,11 +248,6 @@ function differentFiles(local: SnapshotManifest, cloud: SnapshotManifest, platfo
     if (local.files[relative] !== cloud.files[relative]) changed.push(relative);
   }
   return changed.sort((left, right) => left.localeCompare(right));
-}
-
-async function readExtensionIds(root: string): Promise<string[]> {
-  const content = await readOptionalFile(path.join(root, HOST_EXTENSIONS_FILE));
-  return content === undefined ? [] : parseExtensionIds(content.toString('utf8'));
 }
 
 async function readOptionalFile(filePath: string): Promise<Buffer | undefined> {

@@ -35,12 +35,17 @@ export class HistoryController {
   public constructor(private readonly options: HistoryControllerOptions) {}
 
   public async open(): Promise<void> {
-    if (!this.options.isEnabled()) {
-      void vscode.window.showInformationMessage('配置同步已关闭，请先在侧边栏开启同步。');
+    const configuration = this.options.configurationStore.get();
+    if (!configuration.repositoryUrl) {
+      this.options.reportStatus('请填写 Git 仓库地址。');
       return;
     }
-    if (!this.options.configurationStore.get().repositoryUrl) {
-      this.options.reportStatus('请填写 Git 仓库地址。');
+    // 同步关闭时不再拒绝：用户主动查看历史就是要访问仓库。但没有本地缓存意味着要先建仓库，应由用户先开启同步。
+    if (
+      !this.options.isEnabled()
+      && (await this.options.repository.listCachedCommits(configuration, this.options.hostKind, 1)) === undefined
+    ) {
+      void vscode.window.showInformationMessage('本机还没有云端记录的缓存，请先开启同步后再查看历史。');
       return;
     }
     // 页面打开后由侧边栏发起首次加载：面板从未打开过时视图还要先解析，加载时机只能由那边决定。
@@ -68,7 +73,7 @@ export class HistoryController {
    * offset 以这边的条数为准，不信任 Webview 传来的数字。
    */
   public async loadMore(): Promise<void> {
-    const { sidebar, coordinator, repository, configurationStore, hostKind } = this.options;
+    const { sidebar, repository, configurationStore, hostKind } = this.options;
     // Webview 一点下按钮就把它禁用了，这里放弃这次追加时必须回一条状态，否则按钮再也恢复不了。
     if (this.activity !== 'idle') {
       await sidebar.postHistoryBusy(this.activity === 'operating');
@@ -76,17 +81,8 @@ export class HistoryController {
     }
     this.activity = 'loading-more';
     try {
-      const configuration = configurationStore.get();
-      const offset = this.commits.length;
-      let more: RepositoryCommit[] | undefined;
-      const acquired = await coordinator.runExclusive(async () => {
-        more = await repository.listCachedCommits(configuration, hostKind, HISTORY_PAGE_SIZE, offset);
-      });
-      if (!acquired) {
-        await sidebar.postHistoryError('仓库正被同步占用，请稍后重试加载更多。');
-        return;
-      }
-      const added = more ?? [];
+      // 只读本地缓存，不占独占锁：同步进行中也能继续翻页。
+      const added = await repository.listCachedCommits(configurationStore.get(), hostKind, HISTORY_PAGE_SIZE, this.commits.length) ?? [];
       this.commits = this.commits.concat(added);
       this.limit = this.commits.length;
       await sidebar.postHistoryList(
@@ -117,6 +113,7 @@ export class HistoryController {
           '将以该提交的配置覆盖本机，本机原配置会先备份到扩展运行目录；该提交清单里没有的扩展会在本机卸载。',
           '随后在远端追加一条新的还原提交，远端已有历史不会被改写。',
           ...(backupOnly ? ['当前是备份模式，平时不会写回本机，但还原会直接覆盖本机配置与扩展。'] : []),
+          ...(this.options.isEnabled() ? [] : ['当前同步已关闭，还原仍会覆盖本机配置并推送新提交。']),
         ].join('\n'),
       },
       '还原',
@@ -188,14 +185,8 @@ export class HistoryController {
       return;
     }
     try {
-      let cached: RepositoryCommit[] | undefined;
-      const acquired = await coordinator.runExclusive(async () => {
-        cached = await repository.listCachedCommits(configuration, hostKind, limit);
-      });
-      if (!acquired) {
-        await sidebar.postHistoryError('另一窗口正在执行同步，请稍后重试查看历史。');
-        return;
-      }
+      // 缓存只读本地引用、不占独占锁：别的窗口正在同步时也能先看到列表，只有联网刷新才需要排队。
+      const cached = await repository.listCachedCommits(configuration, hostKind, limit);
       // 没有本地缓存时不推列表，页面停在加载中，避免先闪一次「云端还没有提交」。
       if (cached) await this.publish(cached, limit, refresh);
       if (!refresh) {

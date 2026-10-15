@@ -52,6 +52,7 @@ export function stageLabel(stage: StageName): string {
     case 'extensions': return '正在同步扩展';
     case 'finalize': return '正在记录同步基准';
     case 'export-history': return '正在导出历史配置';
+    case 'override-cloud': return '正在以本机覆盖云端';
   }
 }
 

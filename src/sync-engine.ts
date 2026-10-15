@@ -6,10 +6,11 @@ import { ConfigurationStore } from './configuration';
 import { WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService, RepositoryCommit } from './git-service';
 import { HostEnvironment } from './host';
+import { OVERRIDE_STAGES } from './pipeline/override';
 import { runPipeline } from './pipeline/pipeline';
 import { RESTORE_STAGES } from './pipeline/restore';
 import { BACKUP_STAGES, SYNC_STAGES } from './pipeline/stages';
-import { SyncContext, SyncDependencies } from './pipeline/types';
+import { Stage, SyncContext, SyncDependencies } from './pipeline/types';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
 import { createSyncReport, PluginConfiguration, RuntimeStatus, SyncOutcome } from './types';
@@ -36,6 +37,7 @@ export class SyncEngine {
     private readonly runtimeState: RuntimeStateStore,
     private readonly updateStatus: (patch: Partial<RuntimeStatus>) => void,
     private readonly windowSafety: () => Promise<WindowSafetySnapshot>,
+    onExtensionFailure?: () => void,
   ) {
     this.dependencies = {
       environment,
@@ -49,6 +51,7 @@ export class SyncEngine {
       // 与 ProfileAdapter 的 backups 目录分开存放，避免被那边的保留策略清理。
       conflictBackupRoot: path.join(environment.runtimePath, 'conflict-backups'),
       deviceName: os.hostname(),
+      ...(onExtensionFailure ? { onExtensionFailure } : {}),
     };
   }
 
@@ -119,8 +122,26 @@ export class SyncEngine {
    * 用户显式操作，备份模式同样会写回本机；不改写远端已有历史。
    */
   public async restoreCommit(target: RepositoryCommit): Promise<SyncOutcome | undefined> {
+    return this.runManual(RESTORE_STAGES, { adoptCloud: false, restoreTarget: target });
+  }
+
+  /**
+   * 用本机配置整份覆盖云端，并在远端 tip 上追加一条新提交。
+   * 用户显式操作，不看基准、不询问冲突、不写回本机；不改写远端已有历史。
+   */
+  public async overrideCloud(): Promise<SyncOutcome | undefined> {
+    return this.runManual(OVERRIDE_STAGES, { adoptCloud: false });
+  }
+
+  /** 用户显式触发的单次流程（还原、覆盖云端）：共用重入保护、窗口安全检查与临时目录生命周期。 */
+  private async runManual(
+    stages: Stage[],
+    options: { adoptCloud: boolean; restoreTarget?: RepositoryCommit },
+  ): Promise<SyncOutcome | undefined> {
     if (this.running) return undefined;
     this.running = true;
+    // 关闭开关留下的停止意图只针对当时的自动同步；用户此刻显式发起的流程（同步关闭时也允许）不能被它取消。
+    this.cancellationRequested = false;
     const configuration = this.configurationStore.get();
     let temporaryRoot: string | undefined;
     try {
@@ -133,8 +154,8 @@ export class SyncEngine {
       if (blocked) return blocked;
 
       temporaryRoot = await this.prepareTemporaryRoot();
-      const context = this.buildContext(configuration, temporaryRoot, { adoptCloud: false, restoreTarget: target });
-      return await runPipeline(context, RESTORE_STAGES);
+      const context = this.buildContext(configuration, temporaryRoot, options);
+      return await runPipeline(context, stages);
     } catch (error) {
       this.updateStatus({ message: error instanceof Error ? error.message : String(error) });
       return { ok: false };

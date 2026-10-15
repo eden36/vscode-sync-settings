@@ -27,25 +27,16 @@ export function decideSnapshotChoice(
   baseline: SyncBaseline | undefined,
   local: SnapshotDigest,
   cloud: SnapshotDigest,
-  options: { ignoreExtensions: boolean; resolution?: 'local' | 'cloud' },
+  options: { resolution?: 'local' | 'cloud' } = {},
 ): SnapshotChoice {
-  if (!baseline) {
-    // 首次建立基准（升级、换机器、基准损坏）：两侧一致就直接立基准，不一致只能由用户定夺。
-    if (local.snapshot === cloud.snapshot && local.extensions === cloud.extensions) return 'none';
-    return options.resolution ?? 'conflict';
-  }
-  // 两侧内容已经一致就没有可选的：推送后进程在记下基准前退出、或两台机器做了相同改动，都会落到这里。
-  if (local.snapshot === cloud.snapshot && (options.ignoreExtensions || local.extensions === cloud.extensions)) return 'none';
-  const localChanged = changed(local, baseline.localSnapshot, baseline.localExtensions, options.ignoreExtensions);
-  const cloudChanged = changed(cloud, baseline.cloudSnapshot, baseline.cloudExtensions, options.ignoreExtensions);
+  // 两侧内容已经一致就没有可选的：首次建立基准、推送后进程在记下基准前退出、两台机器做了相同改动，都会落到这里。
+  if (local.snapshot === cloud.snapshot) return 'none';
+  // 首次建立基准（升级、换机器、基准损坏）且两侧不一致，只能由用户定夺。
+  if (!baseline) return options.resolution ?? 'conflict';
+  const localChanged = local.snapshot !== baseline.localSnapshot;
+  const cloudChanged = cloud.snapshot !== baseline.cloudSnapshot;
   if (!localChanged && !cloudChanged) return 'none';
   if (!localChanged) return 'cloud';
   if (!cloudChanged) return 'local';
   return options.resolution ?? 'conflict';
-}
-
-/** 扩展装卸需要时间，收敛过程中的清单变化不是用户改动，不能据此判定这一侧改过。 */
-function changed(digest: SnapshotDigest, snapshot: string, extensions: string, ignoreExtensions: boolean): boolean {
-  if (digest.snapshot !== snapshot) return true;
-  return !ignoreExtensions && digest.extensions !== extensions;
 }

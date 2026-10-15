@@ -493,3 +493,21 @@ test('远端引用解析忽略 peeled 行，tip 与标签都没变才跳过 fetc
   assert.deepEqual(gitTesting.parseDecoratedTags('HEAD -> refs/heads/main'), []);
   assert.deepEqual(gitTesting.parseDecoratedTags(''), []);
 });
+
+test('读取历史缓存时本地仓库不存在则返回 undefined，且不创建仓库', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-cache-absent-'));
+  try {
+    const service = new ConfigurationRepositoryGitService(path.join(root, 'runtime'));
+    const configuration: SyncConfiguration = {
+      repositoryUrl: path.join(root, 'remote.git'),
+      branch: 'main',
+      gitUserName: '',
+      gitUserEmail: '',
+    };
+    assert.equal(await service.listCachedCommits(configuration, 'vscode'), undefined);
+    // 读缓存可能发生在同步关闭、也可能与同步并发，不能顺手建仓库或改 origin。
+    await assert.rejects(readdir(path.join(root, 'runtime')), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

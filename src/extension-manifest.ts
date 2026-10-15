@@ -42,6 +42,41 @@ export function selectMissingExtensionIds(
   return selectAbsent(targetIds, lowerSet(installedIds), lowerSet(skipIds));
 }
 
+export interface ExtensionSyncPlan {
+  /** 合并后的云端清单。 */
+  merged: string[];
+  install: string[];
+  uninstall: string[];
+}
+
+/**
+ * 扩展清单按增删合并，不随快照整份择一，synced 是上次同步时本机的扩展：
+ * - 本机相对 synced 新装的加进云端，卸载的从云端删掉；
+ * - synced 里有、本机仍有、云端却没有的，是别的机器删掉的，本机卸载；
+ * - 云端有、本机与 synced 都没有的（装失败、还在装、市场里没有）保留在云端并在本机安装，不当成本机删除，
+ *   否则一台机器装不上就会让所有机器卸载它。
+ * synced 缺失（首次同步）时视同空集合，结果是两侧取并集，只装不卸。
+ */
+export function planExtensionSync(
+  local: readonly string[],
+  cloud: readonly string[],
+  synced: readonly string[] | undefined,
+): ExtensionSyncPlan {
+  const localSet = lowerSet(local);
+  // 没有记录时本机全部算新增：当成「本机当前」会把本机独有的扩展判成别的机器删掉的并卸载。
+  const syncedSet = lowerSet(synced ?? []);
+  const added = local.filter((id) => !syncedSet.has(id.toLowerCase()));
+  const removed = new Set([...syncedSet].filter((key) => !localSet.has(key)));
+  const merged = sortExtensionIds(selectAbsent([...cloud, ...added], new Set(), removed));
+  return {
+    merged,
+    install: selectAbsent(merged, localSet, new Set()),
+    // 本机新装的都在合并结果里，本机有而结果里没有的只可能是别的机器删掉的。
+    // 合并结果为空时视为信息缺失，不据此清空本机扩展。
+    uninstall: merged.length ? selectAbsent(local, lowerSet(merged), new Set()) : [],
+  };
+}
+
 /** 仓库形态的排序规则：本机采集与合并结果必须逐字节一致，否则每轮同步都会产生无意义的差异。 */
 export function sortExtensionIds(ids: Iterable<string>): string[] {
   return [...new Set(ids)].sort((left, right) => left.localeCompare(right));

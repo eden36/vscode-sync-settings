@@ -15,16 +15,15 @@ export function finalSyncMessage(report: SyncReport): string {
   }
   if (report.profileMessage) notes.push(report.profileMessage);
   if (report.extensionsDeferred) notes.push('当前窗口不在默认 Profile，扩展将在默认 Profile 的窗口中同步');
-  if (!report.changedFileCount && !notes.length && !report.extensionsPending?.length && !report.extensionsFailed?.length) {
+  if (report.extensionsInstalling?.length) notes.push(`已请求安装 ${report.extensionsInstalling.length} 个扩展，可在扩展面板查看进度`);
+  if (report.extensionsUninstalling?.length) notes.push(`已请求卸载扩展：${report.extensionsUninstalling.join('、')}`);
+  if (!report.changedFileCount && !notes.length && !report.extensionsFailed?.length) {
     if (report.recoveredFromDivergence) return '已重新对齐上次未推送成功的提交，配置已是最新。';
     return report.recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
   }
   if (report.usedAiFallback) notes.push('AI 不可用或结果无效，已使用兜底策略');
   if (report.recoveredPendingChanges) notes.push('已清理上次中断的暂存状态');
   if (report.recoveredFromDivergence) notes.push('已重新对齐上次未推送成功的提交');
-  if (report.extensionsPending?.length) {
-    notes.push(`部分扩展尚未安装完成：${report.extensionsPending.join('、')}`);
-  }
   if (report.extensionsFailed?.length) {
     notes.push(`部分扩展无法安装或卸载，已跳过：${report.extensionsFailed.join('、')}`);
   }

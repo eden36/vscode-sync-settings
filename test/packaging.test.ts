@@ -29,6 +29,15 @@ test('扩展产物注册云端提交历史命令', async () => {
   assert.match(bundle, /registerCommand\(["']profileGitSync\.showHistory["']/);
 });
 
+test('扩展产物注册以本机覆盖云端命令，并在 package.json 中声明', async () => {
+  const bundle = await readFile(path.join(process.cwd(), 'dist', 'extension.js'), 'utf8');
+  assert.match(bundle, /registerCommand\(["']profileGitSync\.overrideCloud["']/);
+  const manifest = JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8')) as {
+    contributes?: { commands?: Array<{ command: string }> };
+  };
+  assert.equal(manifest.contributes?.commands?.some((item) => item.command === 'profileGitSync.overrideCloud'), true);
+});
+
 test('扩展产物包含侧边栏的脚本与样式', async () => {
   // 两者都由 Webview 按路径加载，缺任何一个侧边栏都只剩静态骨架。
   const script = await readFile(path.join(process.cwd(), 'dist', 'webview', 'sidebar.js'), 'utf8');

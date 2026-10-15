@@ -9,8 +9,6 @@ const KNOWN_LINK_STATES = new Set<string>(LINK_STATES);
 const OPTIONAL_KEYS = [
   'lastSyncAt',
   'baseline',
-  'extensionsPending',
-  'extensionsPendingRounds',
   'pendingResolution',
   'profileMismatch',
   'profileResolution',
@@ -30,10 +28,8 @@ export interface RuntimeStateRecord {
   cloudAdoptPending: boolean;
   /** 上次整轮成功时两侧的状态；只有推送成功且完整落地的一轮才前移。 */
   baseline?: SyncBaseline;
-  /** 上一轮没装完或没卸完的扩展；非空期间扩展清单不参与「这一侧改没改」的判定。 */
-  extensionsPending?: string[];
-  /** 扩展连续未收敛的轮数；达到上限后放弃等待，否则清单会永远被排除在判定之外。 */
-  extensionsPendingRounds?: number;
+  /** 上次推送成功时本机的扩展，用来区分本机的增删与「还没装上」，见 planExtensionSync。 */
+  syncedExtensions?: string[];
   /** 用户对「两边都改了」的选择；整轮成功后才清除，中途失败下一轮继续沿用。 */
   pendingResolution?: 'local' | 'cloud';
   /**
@@ -115,9 +111,8 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
   if (typeof value.link !== 'string' || !KNOWN_LINK_STATES.has(value.link)) return undefined;
   if (value.lastSyncAt !== undefined && typeof value.lastSyncAt !== 'string') return undefined;
   const baseline = parseBaseline(value.baseline);
-  const extensionsPending = parseStringArray(value.extensionsPending);
-  if (value.extensionsPending !== undefined && !extensionsPending) return undefined;
-  if (value.extensionsPendingRounds !== undefined && !isCount(value.extensionsPendingRounds)) return undefined;
+  const syncedExtensions = parseStringArray(value.syncedExtensions);
+  if (value.syncedExtensions !== undefined && !syncedExtensions) return undefined;
   if (value.pendingResolution !== undefined && value.pendingResolution !== 'local' && value.pendingResolution !== 'cloud') {
     return undefined;
   }
@@ -133,10 +128,7 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
     cloudAdoptPending: value.cloudAdoptPending,
     ...(value.lastSyncAt !== undefined ? { lastSyncAt: value.lastSyncAt } : {}),
     ...(baseline ? { baseline } : {}),
-    ...(extensionsPending ? { extensionsPending } : {}),
-    ...(value.extensionsPendingRounds !== undefined
-      ? { extensionsPendingRounds: value.extensionsPendingRounds as number }
-      : {}),
+    ...(syncedExtensions ? { syncedExtensions } : {}),
     ...(value.pendingResolution !== undefined
       ? { pendingResolution: value.pendingResolution as 'local' | 'cloud' }
       : {}),
@@ -147,17 +139,14 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
 
 function parseBaseline(value: unknown): SyncBaseline | undefined {
   if (!isRecord(value)) return undefined;
-  const keys = ['localSnapshot', 'localExtensions', 'cloudSnapshot', 'cloudExtensions'] as const;
-  if (!keys.every((key) => typeof value[key] === 'string')) return undefined;
+  if (typeof value.localSnapshot !== 'string' || typeof value.cloudSnapshot !== 'string') return undefined;
   const localProfiles = parseStringArray(value.localProfiles);
   const cloudProfiles = parseStringArray(value.cloudProfiles);
   if (value.localProfiles !== undefined && !localProfiles) return undefined;
   if (value.cloudProfiles !== undefined && !cloudProfiles) return undefined;
   return {
-    localSnapshot: value.localSnapshot as string,
-    localExtensions: value.localExtensions as string,
-    cloudSnapshot: value.cloudSnapshot as string,
-    cloudExtensions: value.cloudExtensions as string,
+    localSnapshot: value.localSnapshot,
+    cloudSnapshot: value.cloudSnapshot,
     ...(localProfiles ? { localProfiles } : {}),
     ...(cloudProfiles ? { cloudProfiles } : {}),
   };
@@ -174,19 +163,14 @@ function parseStringArray(value: unknown): string[] | undefined {
   return value as string[];
 }
 
-function isCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
-}
-
 function sameRuntimeState(left: RuntimeStateRecord, right: RuntimeStateRecord): boolean {
   return left.enabled === right.enabled
     && left.link === right.link
     && left.lastSyncAt === right.lastSyncAt
     && left.cloudAdoptPending === right.cloudAdoptPending
     && left.pendingResolution === right.pendingResolution
-    && left.extensionsPendingRounds === right.extensionsPendingRounds
     && sameBaseline(left.baseline, right.baseline)
-    && sameIds(left.extensionsPending, right.extensionsPending)
+    && sameIds(left.syncedExtensions, right.syncedExtensions)
     && sameMismatch(left.profileMismatch, right.profileMismatch)
     && sameMismatch(left.profileResolution, right.profileResolution);
 }
@@ -194,9 +178,7 @@ function sameRuntimeState(left: RuntimeStateRecord, right: RuntimeStateRecord): 
 function sameBaseline(left: SyncBaseline | undefined, right: SyncBaseline | undefined): boolean {
   if (!left || !right) return left === right;
   return left.localSnapshot === right.localSnapshot
-    && left.localExtensions === right.localExtensions
     && left.cloudSnapshot === right.cloudSnapshot
-    && left.cloudExtensions === right.cloudExtensions
     && sameIds(left.localProfiles, right.localProfiles)
     && sameIds(left.cloudProfiles, right.cloudProfiles);
 }

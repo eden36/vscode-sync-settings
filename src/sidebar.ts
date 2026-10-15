@@ -256,7 +256,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <div id="choicePanel" class="status" hidden><strong>需要选择以哪一方为准</strong><div class="muted">本机与云端都有改动。选定一方后，另一份配置会先备份到扩展运行目录。</div><div><button id="chooseLocal" type="button">以本机为准</button><button id="chooseCloud" class="secondary" type="button">以云端为准</button></div></div>
 <div id="profilePanel" class="status" hidden><strong id="profileSummary"></strong><div id="profileDetail" class="muted"></div><div><button id="resolveProfiles" class="secondary" type="button"></button></div></div>
 <div class="toggle-row"><span>同步开关</span><button id="toggleEnabled" class="toggle-switch" type="button" role="switch" aria-checked="false" aria-label="正在加载"></button></div>
-<p class="muted">关闭后不创建本地仓库、不访问远程仓库，也不写回本机配置。</p>
+<p class="muted">关闭后不会自动同步：不创建本地仓库、不访问远程仓库，也不写回本机配置；手动查看云端提交历史与覆盖云端不受此限。</p>
 <div class="mode-switch" role="group" aria-label="运行模式"><button id="modeBackup" type="button" data-mode="backup" aria-pressed="false">备份模式</button><button id="modeSync" type="button" data-mode="sync" aria-pressed="false">同步模式</button></div>
 <p id="modeNote" class="muted"></p>
 <div class="repository-details"><div class="repository-item"><span>远程仓库</span><strong id="repositorySummary">正在加载</strong></div><div class="repository-item"><span>分支</span><strong id="branchSummary">正在加载</strong></div></div>

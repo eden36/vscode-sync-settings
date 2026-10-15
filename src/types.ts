@@ -33,6 +33,7 @@ export const STAGE_NAMES = [
   'extensions',
   'finalize',
   'export-history',
+  'override-cloud',
 ] as const;
 export type StageName = (typeof STAGE_NAMES)[number];
 
@@ -76,7 +77,6 @@ export interface SyncOutcome {
   retry?: boolean;
   unrelated?: boolean;
   blockReason?: BlockReason;
-  extensionsPending?: string[];
   /** 本机与云端都相对基准有改动，必须由用户选定一方，重试无法解决。 */
   bothChanged?: boolean;
   /** 两侧 Profile 不一致且插件无法自行处理（不增删 Profile），必须由用户决定。 */
@@ -97,13 +97,11 @@ export type SnapshotChoice = 'none' | 'local' | 'cloud' | 'conflict';
 
 /**
  * 上次整轮成功时两侧的状态，用于判断「本机改没改」与「云端改没改」。
- * 扩展清单单独记录：装卸需要时间，收敛过程中的中间态不能算作用户改动。
+ * 扩展清单不在其中：它按增删合并，依据是 RuntimeStateRecord.syncedExtensions。
  */
 export interface SyncBaseline {
   localSnapshot: string;
-  localExtensions: string;
   cloudSnapshot: string;
-  cloudExtensions: string;
   /**
    * 两侧命名 Profile 的名称集合，用来区分「本机删了」与「云端新增」、「云端删了」与「本机新增」。
    * 旧版本写下的基准没有这两项，此时按无法区分处理。
@@ -123,8 +121,10 @@ export interface SyncReport {
   activeWindows?: number;
   /** 两侧 Profile 不一致但本轮可以继续时给用户的说明，例如云端有本机没有的 Profile。 */
   profileMessage?: string;
-  extensionsPending?: string[];
-  /** 安装或卸载命令失败的扩展（市场里没有、平台不支持等），不再等待，只在文案里说明。 */
+  /** 本轮已向 IDE 发出安装命令的扩展；是否装好由下一轮判断。 */
+  extensionsInstalling?: string[];
+  extensionsUninstalling?: string[];
+  /** 安装或卸载命令失败的扩展（市场里没有、平台不支持等），本进程内不再重发，只在文案里说明。 */
   extensionsFailed?: string[];
   /** 当前窗口不在默认 Profile，本轮没有装卸扩展。 */
   extensionsDeferred?: boolean;

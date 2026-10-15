@@ -58,7 +58,7 @@ test('快照指纹只比较本平台的快捷键', () => {
   assert.equal(isOtherPlatformFile('profiles/default/snippets/keybindings.darwin.json', 'win32'), false);
 });
 
-test('快照指纹忽略键序与采集时间，扩展清单单独记录', () => {
+test('快照指纹忽略键序、采集时间与扩展清单', () => {
   const left = testManifest({ 'profiles/default/settings.json': 'x', 'extensions.json': 'e1' });
   const right: SnapshotManifest = {
     ...left,
@@ -67,9 +67,8 @@ test('快照指纹忽略键序与采集时间，扩展清单单独记录', () =>
     files: { 'extensions.json': 'e2', 'profiles/default/settings.json': 'x' },
   };
   // 两台机器写出的元数据键序可能不同，内容其实一样，不归一就会被判成改动。
+  // 扩展清单按增删合并，不参与择一，两侧清单不同也不算改动。
   assert.equal(snapshotDigest(left, 'win32').snapshot, snapshotDigest(right, 'win32').snapshot);
-  assert.equal(snapshotDigest(left, 'win32').extensions, 'e1');
-  assert.equal(snapshotDigest(right, 'win32').extensions, 'e2');
   assert.notEqual(
     snapshotDigest(testManifest({ 'profiles/default/settings.json': 'y' }), 'win32').snapshot,
     snapshotDigest(left, 'win32').snapshot,

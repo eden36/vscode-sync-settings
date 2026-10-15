@@ -31,8 +31,5 @@ export async function runPipeline(context: SyncContext, stages: Stage[]): Promis
     message: finalSyncMessage(report),
     ...(report.activeWindows !== undefined ? { activeWindows: report.activeWindows } : {}),
   });
-  return {
-    ok: true,
-    ...(report.extensionsPending ? { extensionsPending: report.extensionsPending } : {}),
-  };
+  return { ok: true };
 }

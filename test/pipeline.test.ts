@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -10,15 +11,17 @@ import { readJsonFile } from '../src/json-store';
 import { snapshotDigest } from '../src/snapshot-conflict';
 import { AiService } from '../src/ai';
 import { chooseStage } from '../src/pipeline/choose';
+import { OVERRIDE_STAGES, testing as overrideTesting } from '../src/pipeline/override';
 import { testing as restoreTesting } from '../src/pipeline/restore';
 import { runPipeline } from '../src/pipeline/pipeline';
 import { BACKUP_STAGES, SYNC_STAGES, testing as stageTesting } from '../src/pipeline/stages';
 import { Stage } from '../src/pipeline/types';
 import { SyncEngine } from '../src/sync-engine';
 import { decideSnapshotChoice } from '../src/sync-strategy';
-import { createSyncReport, DEFAULT_CONFIGURATION, RuntimeStatus, SyncConfiguration } from '../src/types';
+import { createSyncReport, DEFAULT_CONFIGURATION, RuntimeStatus, SnapshotManifest, SyncConfiguration } from '../src/types';
+import { formatExtensionManifest } from '../src/extension-manifest';
 import { testing as extensionWaitTesting } from '../src/extension-wait';
-import { resetExtensionStub, installCommandCalls, uninstallCommandCalls, markExtensionInstalled, installedExtensionIds } from './vscode-stub';
+import { resetExtensionStub, installCommandCalls, uninstallCommandCalls } from './vscode-stub';
 import {
   restoreContext,
   writeHistorySnapshot,
@@ -208,35 +211,20 @@ test('远端还没有本宿主快照时直接用本机内容初始化', async ()
   }
 });
 
-test('扩展同步只认宿主级清单，忽略 Profile 目录下的启用状态', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-stage-'));
-  resetExtensionStub();
-  extensionWaitTesting.resetSkippedInstallIds();
+test('扩展合并只认宿主级清单，忽略 Profile 目录下的启用状态', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-host-only-'));
   try {
-    const repositoryHostRoot = path.join(root, 'repository', 'cursor');
-    await mkdir(path.join(repositoryHostRoot, 'profiles', 'default'), { recursive: true });
-    // 仅 Profile 级清单存在时不应触发任何安装或卸载。
-    await writeFile(path.join(repositoryHostRoot, 'profiles', 'default', 'extensions.json'),
+    const local = profileManifest([]);
+    const cloud = profileManifest([], { 'profiles/default/extensions.json': 'x' });
+    const { context } = await chooseContext(root, local, cloud, { localSnapshot: snapshotDigest(local, 'win32').snapshot, cloudSnapshot: 'stale' });
+    // 仅 Profile 级清单存在时不应产生任何装卸。
+    await mkdir(path.join(context.paths.repositoryHostRoot, 'profiles', 'default'), { recursive: true });
+    await writeFile(path.join(context.paths.repositoryHostRoot, 'profiles', 'default', 'extensions.json'),
       JSON.stringify([{ identifier: { id: 'stale.one' } }]));
-    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify({
-      schemaVersion: 1, host: 'cursor', createdAt: '', profiles: [],
-      files: { 'profiles/default/extensions.json': 'x' },
-    }));
 
-    const context = stageContext({
-      paths: {
-        temporaryRoot: path.join(root, 'tmp'),
-        localHostRoot: path.join(root, 'tmp', 'cursor'),
-        repositoryHostRoot,
-      },
-      dependencies: stageDependencies({
-        adapter: { listInstalledExtensionIds: async () => ['local.only'] } as unknown as ProfileAdapter,
-      }),
-    });
-
-    assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
-    assert.deepEqual(installCommandCalls, []);
-    assert.deepEqual(uninstallCommandCalls, []);
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    assert.equal(context.artifacts.extensionPlan, undefined);
+    assert.equal(context.artifacts.extensionsMerged, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -308,9 +296,7 @@ test('本机没改时采用云端且不改写仓库内容', async () => {
     const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
     const { context } = await chooseContext(root, localManifest, cloudManifest, {
       localSnapshot: snapshotDigest(localManifest, 'win32').snapshot,
-      localExtensions: '',
       cloudSnapshot: 'stale',
-      cloudExtensions: '',
     });
 
     assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
@@ -328,9 +314,7 @@ test('两边都改时暂停并先备份双方，不改写任何一侧', async ()
     const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
     const { context, conflictBackupRoot } = await chooseContext(root, localManifest, cloudManifest, {
       localSnapshot: 'stale-local',
-      localExtensions: '',
       cloudSnapshot: 'stale-cloud',
-      cloudExtensions: '',
     });
 
     const outcome = await chooseStage.run(context);
@@ -351,9 +335,7 @@ test('用户选定本机后按本机覆盖云端，不再询问', async () => {
     const cloudManifest = testManifest({ 'profiles/default/settings.json': 'cloud' });
     const { context } = await chooseContext(root, localManifest, cloudManifest, {
       localSnapshot: 'stale-local',
-      localExtensions: '',
       cloudSnapshot: 'stale-cloud',
-      cloudExtensions: '',
     }, 'local');
 
     assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
@@ -402,14 +384,7 @@ test('采用本机并推送成功后立即前移基准，之后被拦住也不�
 
     assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
     const digest = snapshotDigest(pushed, 'win32');
-    const baseline = {
-      localSnapshot: digest.snapshot,
-      localExtensions: digest.extensions,
-      cloudSnapshot: digest.snapshot,
-      cloudExtensions: digest.extensions,
-      localProfiles: [],
-      cloudProfiles: [],
-    };
+    const baseline = { localSnapshot: digest.snapshot, cloudSnapshot: digest.snapshot, localProfiles: [], cloudProfiles: [] };
     // 用户的选择随这次推送兑现，一并清除，不留给下一次真正的冲突。
     assert.deepEqual(updates, [{ baseline, pendingResolution: undefined, profileResolution: undefined }]);
 
@@ -417,7 +392,7 @@ test('采用本机并推送成功后立即前移基准，之后被拦住也不�
     assert.deepEqual(await stageTesting.applyStage.run(context), { kind: 'blocked', reason: 'local-changed' });
     // 下一轮云端仍是刚推上去的那份，只有本机变了，应当直接采用本机而不是询问用户。
     const secondEdit = snapshotDigest(testManifest({ 'profiles/default/settings.json': 'second-edit' }), 'win32');
-    assert.equal(decideSnapshotChoice(baseline, secondEdit, digest, { ignoreExtensions: false }), 'local');
+    assert.equal(decideSnapshotChoice(baseline, secondEdit, digest), 'local');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -456,7 +431,7 @@ test('推送失败、采用云端或还原流程时推送步骤不写基准', as
   assert.deepEqual(updates, []);
 });
 
-test('没有写回本机时基准取本轮推送的快照，并记录待收敛的扩展', async () => {
+test('没有写回本机时基准取本轮推送的快照', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-finalize-'));
   try {
     const repositoryHostRoot = path.join(root, 'repository', 'vscode');
@@ -468,7 +443,6 @@ test('没有写回本机时基准取本轮推送的快照，并记录待收敛�
     const updates: Array<Record<string, unknown>> = [];
     const context = stageContext({
       artifacts: { localManifest },
-      report: { ...createSyncReport('sync'), extensionsPending: ['missing.one'] },
       paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot: path.join(root, 'tmp', 'vscode'), repositoryHostRoot },
       dependencies: stageDependencies({
         adapter: {
@@ -485,46 +459,13 @@ test('没有写回本机时基准取本轮推送的快照，并记录待收敛�
     assert.deepEqual(updates, [{
       baseline: {
         localSnapshot: snapshotDigest(localManifest, 'win32').snapshot,
-        localExtensions: 'ext',
         cloudSnapshot: snapshotDigest(cloudManifest, 'win32').snapshot,
-        cloudExtensions: '',
         localProfiles: [],
         cloudProfiles: [],
       },
-      extensionsPending: ['missing.one'],
-      extensionsPendingRounds: 1,
       pendingResolution: undefined,
       profileResolution: undefined,
     }]);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('扩展连续多轮装不上后不再排除在改动判定之外', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-finalize-settle-'));
-  try {
-    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
-    const manifest = testManifest({ 'profiles/default/settings.json': 'x' });
-    await mkdir(repositoryHostRoot, { recursive: true });
-    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify(manifest));
-
-    const updates: Array<Record<string, unknown>> = [];
-    const context = stageContext({
-      artifacts: { localManifest: manifest },
-      report: { ...createSyncReport('sync'), extensionsPending: ['gone.one'] },
-      paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot: path.join(root, 'tmp', 'vscode'), repositoryHostRoot },
-      dependencies: stageDependencies({
-        runtimeState: {
-          get: () => ({ ...DEFAULT_RUNTIME_STATE, extensionsPending: ['gone.one'], extensionsPendingRounds: 2 }),
-          update: async (patch: Record<string, unknown>) => { updates.push(patch); },
-        } as unknown as RuntimeStateStore,
-      }),
-    });
-
-    assert.deepEqual(await stageTesting.finalizeStage.run(context), { kind: 'continue' });
-    assert.equal(updates[0]?.extensionsPending, undefined);
-    assert.equal(updates[0]?.extensionsPendingRounds, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -623,7 +564,7 @@ test('云端有本机没有、也不是本机删掉的 Profile 时暂停并记�
     const local = profileManifest([]);
     const cloud = profileManifest(['工作'], { 'profiles/named-工作/settings.json': 'w' });
     const { context, updates } = await chooseContext(root, local, cloud, {
-      localSnapshot: 's', localExtensions: '', cloudSnapshot: 's', cloudExtensions: '', localProfiles: [], cloudProfiles: [],
+      localSnapshot: 's', cloudSnapshot: 's', localProfiles: [], cloudProfiles: [],
     });
     const outcome = await chooseStage.run(context);
     assert.equal(outcome.kind === 'blocked' ? outcome.reason : undefined, 'profiles-mismatch');
@@ -641,7 +582,7 @@ test('本机删掉的 Profile 随本机推送传播，不打扰用户', async ()
     const cloud = profileManifest(['工作'], { 'profiles/named-工作/settings.json': 'w' });
     const synced = snapshotDigest(cloud, 'win32').snapshot;
     const { context } = await chooseContext(root, local, cloud, {
-      localSnapshot: synced, localExtensions: '', cloudSnapshot: synced, cloudExtensions: '', localProfiles: ['工作'], cloudProfiles: ['工作'],
+      localSnapshot: synced, cloudSnapshot: synced, localProfiles: ['工作'], cloudProfiles: ['工作'],
     });
     assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
     assert.equal(context.report.snapshotChoice, 'local');
@@ -658,8 +599,7 @@ test('用户确认从云端删除 Profile 后改写仓库，没有采用本机�
     const cloud = profileManifest(['工作'], { 'profiles/default/settings.json': 'a', 'profiles/named-工作/settings.json': 'w' });
     let committed: string | undefined;
     const { context } = await chooseContext(root, local, cloud, {
-      localSnapshot: snapshotDigest(local, 'win32').snapshot, localExtensions: '', cloudSnapshot: 'stale', cloudExtensions: '',
-      localProfiles: [], cloudProfiles: [],
+      localSnapshot: snapshotDigest(local, 'win32').snapshot, cloudSnapshot: 'stale', localProfiles: [], cloudProfiles: [],
     }, undefined, {
       state: { profileResolution: { kind: 'cloud-only', names: ['工作'] } },
       dependencies: {
@@ -695,8 +635,7 @@ test('云端删掉、本机仍有的 Profile 暂停询问，用户选择保留�
     const local = profileManifest(['旧'], { 'profiles/named-旧/settings.json': 'o' });
     const cloud = profileManifest([]);
     const baseline = {
-      localSnapshot: snapshotDigest(local, 'win32').snapshot, localExtensions: '', cloudSnapshot: 'stale', cloudExtensions: '',
-      localProfiles: ['旧'], cloudProfiles: ['旧'],
+      localSnapshot: snapshotDigest(local, 'win32').snapshot, cloudSnapshot: 'stale', localProfiles: ['旧'], cloudProfiles: ['旧'],
     };
     const first = await chooseContext(root, local, cloud, baseline);
     const outcome = await chooseStage.run(first.context);
@@ -722,8 +661,7 @@ test('本机新建了云端已有的同名 Profile 时先套用云端内容再�
     const cloud = profileManifest(['工作'], files);
     let claimed: string[] | undefined;
     const { context } = await chooseContext(root, local, cloud, {
-      localSnapshot: 'stale', localExtensions: '', cloudSnapshot: snapshotDigest(cloud, 'win32').snapshot, cloudExtensions: '',
-      localProfiles: [], cloudProfiles: ['工作'],
+      localSnapshot: 'stale', cloudSnapshot: snapshotDigest(cloud, 'win32').snapshot, localProfiles: [], cloudProfiles: ['工作'],
     }, undefined, {
       dependencies: {
         adapter: {
@@ -748,7 +686,7 @@ test('本机新建了云端已有的同名 Profile 时先套用云端内容再�
   }
 });
 
-test('推送本机快照时保留云端其他平台的快捷键，非默认 Profile 窗口还保留云端扩展清单', async () => {
+test('推送本机快照时保留云端其他平台的快捷键，扩展清单按增删合并', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-preserve-'));
   try {
     const local = profileManifest([], { 'profiles/default/keybindings.win32.json': 'win-new', 'extensions.json': 'local-ext' });
@@ -758,10 +696,8 @@ test('推送本机快照时保留云端其他平台的快捷键，非默认 Prof
       'extensions.json': 'cloud-ext',
     });
     const { context } = await chooseContext(root, local, cloud, {
-      localSnapshot: 'stale', localExtensions: 'cloud-ext', cloudSnapshot: snapshotDigest(cloud, 'win32').snapshot, cloudExtensions: 'cloud-ext',
-    }, undefined, {
-      dependencies: { environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime', platform: 'win32', inDefaultProfile: false } },
-    });
+      localSnapshot: 'stale', cloudSnapshot: snapshotDigest(cloud, 'win32').snapshot,
+    }, undefined, { state: { syncedExtensions: [] } });
     const { localHostRoot, repositoryHostRoot } = context.paths;
     await mkdir(path.join(localHostRoot, 'profiles', 'default'), { recursive: true });
     await writeFile(path.join(localHostRoot, 'profiles', 'default', 'keybindings.win32.json'), '[]');
@@ -773,123 +709,371 @@ test('推送本机快照时保留云端其他平台的快捷键，非默认 Prof
     assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
     assert.equal(context.report.snapshotChoice, 'local');
     const manifest = await readJsonFile(path.join(repositoryHostRoot, 'manifest.json')) as typeof cloud;
+    const merged = formatExtensionManifest(['cloud.only', 'local.only']);
     assert.deepEqual(manifest.files, {
       'profiles/default/keybindings.win32.json': 'win-new',
+      'extensions.json': createHash('sha256').update(merged).digest('hex'),
       'profiles/default/keybindings.darwin.json': 'mac',
-      'extensions.json': 'cloud-ext',
     });
     assert.equal(await readFile(path.join(repositoryHostRoot, 'profiles', 'default', 'keybindings.darwin.json'), 'utf8'), '[{"key":"cmd+k"}]');
-    assert.equal(await readFile(path.join(repositoryHostRoot, 'extensions.json'), 'utf8'), '[{"identifier":{"id":"cloud.only"}}]');
+    // 本机新装的加进云端，云端有、本机没装过的保留并在本机安装。
+    assert.equal(await readFile(path.join(repositoryHostRoot, 'extensions.json'), 'utf8'), merged);
+    assert.deepEqual(context.artifacts.extensionPlan, { install: ['cloud.only'], uninstall: [] });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-/** 扩展步骤的上下文：仓库里有一份宿主级扩展清单，本机已安装列表来自 vscode 桩。 */
-async function extensionContext(root: string, choice: 'none' | 'cloud', overrides: { pending?: string[]; inDefaultProfile?: boolean } = {}) {
-  const repositoryHostRoot = path.join(root, 'repository', 'vscode');
-  await writeExtensionSnapshot(repositoryHostRoot, ['cloud.one'], 'x');
+test('配置采用云端时扩展清单仍合并本机的增删，并提交这次改动', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-merge-cloud-'));
+  try {
+    const local = profileManifest([], { 'profiles/default/settings.json': 'a' });
+    const cloud = profileManifest([], { 'profiles/default/settings.json': 'b' });
+    let committed: string | undefined;
+    const { context } = await chooseContext(root, local, cloud, {
+      localSnapshot: snapshotDigest(local, 'win32').snapshot, cloudSnapshot: 'stale',
+    }, undefined, {
+      state: { syncedExtensions: ['keep.one', 'removed.two'] },
+      dependencies: {
+        git: fakeGit({
+          stageHost: async () => ['extensions.json'],
+          commitAndPush: async (_configuration: SyncConfiguration, message: string) => { committed = message; },
+        }),
+        ai: { createCommitMessage: async () => '合并扩展清单' } as unknown as AiService,
+      },
+    });
+    const { localHostRoot, repositoryHostRoot } = context.paths;
+    await writeFile(path.join(localHostRoot, 'extensions.json'), formatExtensionManifest(['keep.one', 'new.three']));
+    await writeFile(path.join(repositoryHostRoot, 'extensions.json'), formatExtensionManifest(['keep.one', 'removed.two', 'gone.four']));
+
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    assert.equal(context.report.snapshotChoice, 'cloud');
+    assert.equal(
+      await readFile(path.join(repositoryHostRoot, 'extensions.json'), 'utf8'),
+      formatExtensionManifest(['gone.four', 'keep.one', 'new.three']),
+    );
+    assert.deepEqual(context.artifacts.extensionPlan, { install: ['gone.four'], uninstall: [] });
+    assert.equal(context.artifacts.extensionsMerged, true);
+
+    const updates: Array<Record<string, unknown>> = [];
+    const pushing = stageContext({
+      ...context,
+      dependencies: {
+        ...context.dependencies,
+        runtimeState: {
+          get: () => ({ ...DEFAULT_RUNTIME_STATE }),
+          update: async (patch: Record<string, unknown>) => { updates.push(patch); },
+        } as unknown as RuntimeStateStore,
+      },
+    });
+    assert.deepEqual(await stageTesting.pushStage.run(pushing), { kind: 'continue' });
+    assert.equal(committed, '[test-device] 合并扩展清单');
+    // 推送成功后，本轮开始时的本机扩展成为下一轮判断增删的起点。
+    assert.deepEqual(updates, [{ syncedExtensions: ['keep.one', 'new.three'] }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('备份模式整份覆盖云端扩展清单，不合并', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-backup-'));
+  try {
+    const local = profileManifest([], { 'extensions.json': 'local-ext' });
+    const cloud = profileManifest([], { 'extensions.json': 'cloud-ext' });
+    const { context } = await chooseContext(root, local, cloud, { localSnapshot: 'l', cloudSnapshot: 'c' }, undefined, {
+      state: { syncedExtensions: [] },
+    });
+    context.artifacts.strategy = 'backup';
+    const { localHostRoot, repositoryHostRoot } = context.paths;
+    await writeFile(path.join(localHostRoot, 'extensions.json'), formatExtensionManifest(['local.only']));
+    await writeFile(path.join(repositoryHostRoot, 'extensions.json'), formatExtensionManifest(['cloud.only']));
+
+    assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
+    assert.equal(await readFile(path.join(repositoryHostRoot, 'extensions.json'), 'utf8'), formatExtensionManifest(['local.only']));
+    assert.equal(context.artifacts.extensionPlan, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** 扩展步骤的上下文：装卸计划已由合并算好，这里只验证是否把命令发出去。 */
+function extensionContext(inDefaultProfile = true) {
   return stageContext({
-    artifacts: { choice },
-    paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot: path.join(root, 'tmp', 'vscode'), repositoryHostRoot },
+    artifacts: { extensionPlan: { install: ['cloud.one'], uninstall: ['gone.two'] } },
     dependencies: stageDependencies({
-      environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime', platform: 'win32', inDefaultProfile: overrides.inDefaultProfile ?? true },
-      adapter: { listInstalledExtensionIds: installedExtensionIds } as unknown as ProfileAdapter,
+      environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime', platform: 'win32', inDefaultProfile },
+    }),
+  });
+}
+
+test('扩展步骤按合并结果发出装卸命令后立即结束', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.reset();
+  const context = extensionContext();
+  assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
+  assert.deepEqual(installCommandCalls, ['cloud.one']);
+  assert.deepEqual(uninstallCommandCalls, ['gone.two']);
+  assert.deepEqual(context.report.extensionsInstalling, ['cloud.one']);
+  assert.deepEqual(context.report.extensionsUninstalling, ['gone.two']);
+});
+
+test('还原时本机扩展整份向历史清单收敛', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-restore-'));
+  resetExtensionStub();
+  extensionWaitTesting.reset();
+  try {
+    const context = restoreContext(root);
+    await writeExtensionSnapshot(context.paths.repositoryHostRoot, ['history.one', 'keep.two'], 'x');
+    await writeExtensionSnapshot(context.paths.localHostRoot, ['keep.two', 'local.three'], 'y');
+    assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
+    assert.deepEqual(installCommandCalls, ['history.one']);
+    assert.deepEqual(uninstallCommandCalls, ['local.three']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('窗口不在默认 Profile 时不装卸扩展', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.reset();
+  const context = extensionContext(false);
+  assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
+  assert.deepEqual(installCommandCalls, []);
+  assert.deepEqual(uninstallCommandCalls, []);
+  assert.equal(context.report.extensionsDeferred, true);
+});
+
+test('以本机覆盖云端的流程不含比较与写回本机的步骤', () => {
+  assert.deepEqual(
+    OVERRIDE_STAGES.map((stage) => stage.name),
+    ['snapshot', 'scan-secrets', 'prepare', 'pull', 'override-cloud', 'push', 'finalize'],
+  );
+});
+
+type OverrideSnapshot = { profiles: Array<{ id: string; name: string; isDefault: boolean }>; files: Record<string, string> };
+
+/** 覆盖场景：本机快照在临时目录，云端快照在仓库目录。 */
+async function overrideScenario(
+  root: string,
+  local: OverrideSnapshot,
+  cloud: OverrideSnapshot | undefined,
+  updates: Array<Record<string, unknown>> = [],
+) {
+  const localHostRoot = path.join(root, 'tmp', 'vscode');
+  const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+  await writeHistorySnapshot(localHostRoot, local.profiles, local.files);
+  if (cloud) await writeHistorySnapshot(repositoryHostRoot, cloud.profiles, cloud.files);
+  const localManifest = JSON.parse(await readFile(path.join(localHostRoot, 'manifest.json'), 'utf8')) as SnapshotManifest;
+  return stageContext({
+    artifacts: { localManifest },
+    paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot, repositoryHostRoot },
+    dependencies: stageDependencies({
       runtimeState: {
-        get: () => ({ ...DEFAULT_RUNTIME_STATE, ...(overrides.pending ? { extensionsPending: overrides.pending } : {}) }),
-        update: async () => undefined,
+        get: () => ({ ...DEFAULT_RUNTIME_STATE }),
+        update: async (patch: Record<string, unknown>) => { updates.push(patch); },
       } as unknown as RuntimeStateStore,
     }),
   });
 }
 
-test('没有采用云端也没有待收敛扩展时不装卸任何扩展，用户新装的扩展不会被卸掉', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-none-'));
-  resetExtensionStub();
-  extensionWaitTesting.resetSkippedInstallIds();
+const DEFAULT_PROFILE = { id: 'default', name: '默认', isDefault: true };
+
+test('覆盖云端用本机快照整份替换仓库目录，云端独有的 Profile 与扩展一并去掉', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-override-'));
   try {
-    markExtensionInstalled('local.new');
-    const context = await extensionContext(root, 'none');
-    assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
-    assert.deepEqual(installCommandCalls, []);
-    assert.deepEqual(uninstallCommandCalls, []);
-
-    // 收敛期间只继续处理上一轮没装完的那几个。
-    const settling = await extensionContext(root, 'none', { pending: ['cloud.one'] });
-    assert.deepEqual(await stageTesting.extensionsStage.run(settling), { kind: 'continue' });
-    assert.deepEqual(installCommandCalls, ['cloud.one']);
-    assert.deepEqual(uninstallCommandCalls, []);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('采用云端时本机扩展按清单收敛', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-cloud-'));
-  resetExtensionStub();
-  extensionWaitTesting.resetSkippedInstallIds();
-  try {
-    markExtensionInstalled('local.only');
-    const context = await extensionContext(root, 'cloud');
-    assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
-    assert.deepEqual(uninstallCommandCalls, ['local.only']);
-    assert.deepEqual(installCommandCalls, ['cloud.one']);
-    assert.equal(context.report.extensionsPending, undefined);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('窗口不在默认 Profile 时不装卸扩展，收敛状态与扩展基准原样保留', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-ext-deferred-'));
-  resetExtensionStub();
-  extensionWaitTesting.resetSkippedInstallIds();
-  try {
-    markExtensionInstalled('local.only');
-    const context = await extensionContext(root, 'cloud', { inDefaultProfile: false });
-    assert.deepEqual(await stageTesting.extensionsStage.run(context), { kind: 'continue' });
-    assert.deepEqual(installCommandCalls, []);
-    assert.deepEqual(uninstallCommandCalls, []);
-    assert.equal(context.report.extensionsDeferred, true);
-
     const updates: Array<Record<string, unknown>> = [];
-    const manifest = testManifest({ 'profiles/default/settings.json': 'x', 'extensions.json': 'now' });
-    const finalizing = stageContext({
-      artifacts: { localManifest: manifest },
-      report: { ...createSyncReport('sync'), extensionsDeferred: true },
-      paths: context.paths,
+    const context = await overrideScenario(
+      root,
+      {
+        profiles: [DEFAULT_PROFILE],
+        files: {
+          'profiles/default/settings.json': '{"editor.fontSize": 14}',
+          'extensions.json': formatExtensionManifest(['local.only']),
+        },
+      },
+      {
+        profiles: [DEFAULT_PROFILE, { id: 'named-cloud', name: '云端独有', isDefault: false }],
+        files: {
+          'profiles/default/settings.json': '{"editor.fontSize": 20}',
+          'profiles/named-cloud/settings.json': '{}',
+          'extensions.json': formatExtensionManifest(['cloud.only']),
+          'stale.json': '{}',
+        },
+      },
+      updates,
+    );
+    const { repositoryHostRoot } = context.paths;
+
+    assert.deepEqual(await overrideTesting.overrideCloudStage.run(context), { kind: 'continue' });
+
+    assert.equal(await readFile(path.join(repositoryHostRoot, 'profiles', 'default', 'settings.json'), 'utf8'), '{"editor.fontSize": 14}');
+    await assert.rejects(readFile(path.join(repositoryHostRoot, 'profiles', 'named-cloud', 'settings.json'), 'utf8'), /ENOENT/);
+    await assert.rejects(readFile(path.join(repositoryHostRoot, 'stale.json'), 'utf8'), /ENOENT/);
+    const extensions = await readFile(path.join(repositoryHostRoot, 'extensions.json'), 'utf8');
+    assert.match(extensions, /local\.only/);
+    assert.doesNotMatch(extensions, /cloud\.only/);
+    assert.equal(context.artifacts.choice, 'local');
+    assert.equal(context.artifacts.commitMessage, '以本机覆盖云端');
+    assert.equal(context.report.snapshotChoice, 'local');
+    // 云端此刻就是本机内容：遗留的 Profile 差异与采用云端标记必须清掉。
+    assert.deepEqual(updates, [{ profileMismatch: undefined, cloudAdoptPending: false }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('覆盖云端保留其他平台的快捷键，不保留本机没有的 Profile 下的那份', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-override-keys-'));
+  try {
+    const context = await overrideScenario(
+      root,
+      { profiles: [DEFAULT_PROFILE], files: { 'profiles/default/keybindings.win32.json': '[{"key":"a"}]' } },
+      {
+        profiles: [DEFAULT_PROFILE, { id: 'named-cloud', name: '云端独有', isDefault: false }],
+        files: {
+          'profiles/default/keybindings.win32.json': '[{"key":"old"}]',
+          'profiles/default/keybindings.darwin.json': '[{"key":"mac"}]',
+          'profiles/named-cloud/keybindings.darwin.json': '[{"key":"gone"}]',
+        },
+      },
+    );
+    const { repositoryHostRoot } = context.paths;
+
+    await overrideTesting.overrideCloudStage.run(context);
+
+    // 本平台的以本机为准；其他平台的原样保留；本机没有的 Profile 随之删除。
+    assert.equal(await readFile(path.join(repositoryHostRoot, 'profiles', 'default', 'keybindings.win32.json'), 'utf8'), '[{"key":"a"}]');
+    assert.equal(await readFile(path.join(repositoryHostRoot, 'profiles', 'default', 'keybindings.darwin.json'), 'utf8'), '[{"key":"mac"}]');
+    await assert.rejects(readFile(path.join(repositoryHostRoot, 'profiles', 'named-cloud', 'keybindings.darwin.json'), 'utf8'), /ENOENT/);
+    const manifest = JSON.parse(await readFile(path.join(repositoryHostRoot, 'manifest.json'), 'utf8')) as { files: Record<string, string> };
+    assert.equal('profiles/default/keybindings.darwin.json' in manifest.files, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('覆盖云端时本机采集不到扩展信息则保留云端的扩展清单', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-override-extensions-'));
+  try {
+    const context = await overrideScenario(
+      root,
+      { profiles: [DEFAULT_PROFILE], files: { 'profiles/default/settings.json': '{}' } },
+      {
+        profiles: [DEFAULT_PROFILE],
+        files: { 'profiles/default/settings.json': '{"a":1}', 'extensions.json': formatExtensionManifest(['cloud.keep']) },
+      },
+    );
+    await overrideTesting.overrideCloudStage.run(context);
+    assert.match(await readFile(path.join(context.paths.repositoryHostRoot, 'extensions.json'), 'utf8'), /cloud\.keep/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('云端还没有本宿主快照时覆盖直接以本机内容初始化', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-override-empty-'));
+  try {
+    const context = await overrideScenario(
+      root,
+      { profiles: [DEFAULT_PROFILE], files: { 'profiles/default/settings.json': '{"a":1}' } },
+      undefined,
+    );
+    assert.deepEqual(await overrideTesting.overrideCloudStage.run(context), { kind: 'continue' });
+    assert.equal(await readFile(path.join(context.paths.repositoryHostRoot, 'profiles', 'default', 'settings.json'), 'utf8'), '{"a":1}');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('覆盖云端拒绝含凭据的内容，且不记录提交说明与选择', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-override-secret-'));
+  try {
+    const context = await overrideScenario(
+      root,
+      { profiles: [DEFAULT_PROFILE], files: { 'profiles/default/settings.json': '{"apiKey": "abcdef123456"}' } },
+      undefined,
+    );
+    await assert.rejects(() => overrideTesting.overrideCloudStage.run(context), /已拒绝覆盖云端/);
+    assert.equal(context.artifacts.choice, undefined);
+    assert.equal(context.artifacts.commitMessage, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('覆盖云端的推送阶段按采用本机提交并前移基准，使用预置说明', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-override-push-'));
+  try {
+    const localManifest = testManifest({ 'profiles/default/settings.json': 'x' });
+    const localHostRoot = path.join(root, 'tmp', 'vscode');
+    const repositoryHostRoot = path.join(root, 'repository', 'vscode');
+    await mkdir(repositoryHostRoot, { recursive: true });
+    await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify(localManifest));
+    let committed: string | undefined;
+    let aiCalled = false;
+    const updates: Array<Record<string, unknown>> = [];
+    const context = stageContext({
+      artifacts: { localManifest, choice: 'local', commitMessage: '以本机覆盖云端' },
+      paths: { temporaryRoot: path.join(root, 'tmp'), localHostRoot, repositoryHostRoot },
       dependencies: stageDependencies({
-        environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime', platform: 'win32', inDefaultProfile: false },
+        git: fakeGit({
+          stageHost: async () => ['profiles/default/settings.json'],
+          commitAndPush: async (_configuration: SyncConfiguration, message: string) => { committed = message; },
+        }),
+        ai: { createCommitMessage: async () => { aiCalled = true; return 'AI 生成的说明'; } } as unknown as AiService,
         runtimeState: {
-          get: () => ({
-            ...DEFAULT_RUNTIME_STATE,
-            baseline: { localSnapshot: 'l', localExtensions: 'old-local', cloudSnapshot: 'c', cloudExtensions: 'old-cloud' },
-            extensionsPending: ['p.one'],
-            extensionsPendingRounds: 1,
-          }),
+          get: () => ({ ...DEFAULT_RUNTIME_STATE }),
           update: async (patch: Record<string, unknown>) => { updates.push(patch); },
         } as unknown as RuntimeStateStore,
       }),
     });
-    assert.deepEqual(await stageTesting.finalizeStage.run(finalizing), { kind: 'continue' });
-    const baseline = updates[0]?.baseline as { localExtensions: string; cloudExtensions: string };
-    // 前移扩展基准会把没装的云端清单记成「已同步」，回到默认 Profile 窗口后也不会再装。
-    assert.equal(baseline.localExtensions, 'old-local');
-    assert.equal(baseline.cloudExtensions, 'old-cloud');
-    assert.deepEqual(updates[0]?.extensionsPending, ['p.one']);
-    assert.equal(updates[0]?.extensionsPendingRounds, 1);
+    assert.deepEqual(await stageTesting.pushStage.run(context), { kind: 'continue' });
+    assert.equal(committed, '[test-device] 以本机覆盖云端');
+    assert.equal(aiCalled, false);
+    assert.equal(updates.some((patch) => 'baseline' in patch), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
-    // 第一次同步就在命名 Profile 窗口里时没有可沿用的基准，云端扩展部分记成空，留给默认 Profile 窗口去收敛。
-    updates.length = 0;
-    const first = stageContext({
-      ...finalizing,
-      dependencies: { ...finalizing.dependencies, runtimeState: {
-        get: () => ({ ...DEFAULT_RUNTIME_STATE }),
-        update: async (patch: Record<string, unknown>) => { updates.push(patch); },
-      } as unknown as RuntimeStateStore },
+test('关闭同步留下的停止意图不会取消用户显式发起的覆盖云端与还原', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-manual-stop-'));
+  try {
+    const runtimeState = new RuntimeStateStore(root);
+    await runtimeState.initialize();
+    let snapshots = 0;
+    const engine = new SyncEngine(
+      { kind: 'vscode', userDataPath: root, runtimePath: root },
+      {
+        createSnapshot: async () => {
+          snapshots += 1;
+          throw new Error('快照已执行');
+        },
+      } as unknown as ProfileAdapter,
+      fakeGit({}),
+      {} as unknown as AiService,
+      { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git' }) } as unknown as ConfigurationStore,
+      runtimeState,
+      () => undefined,
+      async () => ({ activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 }),
+    );
+
+    // 模拟用户关闭开关：停止意图一直留着，直到下一次自动同步才会被消费。
+    engine.requestStop();
+    const overridden = await engine.overrideCloud();
+    assert.equal(overridden?.cancelled, undefined);
+    assert.equal(snapshots, 1);
+
+    engine.requestStop();
+    const restored = await engine.restoreCommit({
+      hash: 'a'.repeat(40),
+      shortHash: 'aaaaaaa',
+      committedAt: '2026-08-20T10:00:00.000Z',
+      subject: '初始配置',
+      tags: [],
     });
-    assert.deepEqual(await stageTesting.finalizeStage.run(first), { kind: 'continue' });
-    assert.equal((updates[0]?.baseline as { cloudExtensions: string }).cloudExtensions, '');
+    assert.equal(restored?.cancelled, undefined);
+    assert.equal(snapshots, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
