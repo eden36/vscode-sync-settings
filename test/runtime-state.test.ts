@@ -93,3 +93,34 @@ test('运行状态保存基准、待收敛扩展与用户选择', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('运行状态保存基准里的 Profile 名单与待处理的 Profile 差异', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-profiles-state-'));
+  try {
+    const store = new RuntimeStateStore(root);
+    await store.initialize();
+    const baseline = {
+      localSnapshot: 'l', localExtensions: '', cloudSnapshot: 'c', cloudExtensions: '', localProfiles: ['开发'], cloudProfiles: ['开发', '工作'],
+    };
+    const mismatch = { kind: 'cloud-only' as const, names: ['工作'] };
+    await store.update({ baseline, profileMismatch: mismatch, profileResolution: mismatch });
+
+    const reloaded = new RuntimeStateStore(root);
+    await reloaded.initialize();
+    assert.deepEqual(reloaded.get().baseline, baseline);
+    assert.deepEqual(reloaded.get().profileMismatch, mismatch);
+
+    // 只有名单不同也要算作变化，否则其他窗口读不到新的基准。
+    await store.update({ baseline: { ...baseline, cloudProfiles: ['开发'] }, profileResolution: undefined });
+    assert.equal(await reloaded.reload(), true);
+    assert.deepEqual(reloaded.get().baseline?.cloudProfiles, ['开发']);
+    assert.equal(reloaded.get().profileResolution, undefined);
+
+    const valid = { schemaVersion: 1, enabled: true, link: 'in-sync', cloudAdoptPending: false };
+    assert.equal(parseRuntimeState({ ...valid, profileMismatch: { kind: 'other', names: [] } }), undefined);
+    assert.equal(parseRuntimeState({ ...valid, profileMismatch: { kind: 'cloud-only', names: [1] } }), undefined);
+    assert.equal(parseRuntimeState({ ...valid, baseline: { ...baseline, localProfiles: 'x' } }), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -4,6 +4,8 @@ const STARTUP_SYNC_DELAY_MS = 1_500;
 
 export interface SyncSchedulesOptions {
   fingerprint: () => Promise<string>;
+  /** 远端是否可能有新内容；为否时远程轮询不发起整轮同步。探测失败按有变化处理。 */
+  remoteChanged: () => Promise<boolean>;
   isLeader: () => boolean;
   isEnabled: () => boolean;
   configuration: () => PluginConfiguration;
@@ -22,6 +24,7 @@ export class SyncSchedules {
   private retryTimer: NodeJS.Timeout | undefined;
   private localFingerprint: string | undefined;
   private localCheckRunning = false;
+  private remoteCheckRunning = false;
   /** start 中途要等一次指纹计算，期间若又被 stop 或重新 start，旧的那次必须作废。 */
   private generation = 0;
 
@@ -55,7 +58,7 @@ export class SyncSchedules {
     }, configuration.debounceSeconds * 1_000);
     // 备份模式不写回本机，远端轮询拉不出任何要应用的变化，只会空转并占用独占锁。
     if (configuration.mode === 'sync') {
-      this.remoteTimer = setInterval(() => this.options.requestSync('timer'), configuration.pollIntervalSeconds * 1_000);
+      this.remoteTimer = setInterval(() => void this.checkRemote(), configuration.pollIntervalSeconds * 1_000);
     }
     this.startupTimer = setTimeout(() => {
       this.startupTimer = undefined;
@@ -95,5 +98,20 @@ export class SyncSchedules {
   public dispose(): void {
     this.stop();
     this.cancelRetry();
+  }
+
+  /**
+   * 远程轮询先用一次 ls-remote 探测，远端没动就不跑整轮：整轮要采集快照、起十几个 Git 进程并抢独占锁。
+   * 本机改动由指纹检测负责，这里只关心远端。
+   */
+  private async checkRemote(): Promise<void> {
+    if (this.remoteCheckRunning || !this.options.isLeader()) return;
+    this.remoteCheckRunning = true;
+    try {
+      const changed = await this.options.remoteChanged().catch(() => true);
+      if (changed && this.options.isLeader()) this.options.requestSync('timer');
+    } finally {
+      this.remoteCheckRunning = false;
+    }
   }
 }

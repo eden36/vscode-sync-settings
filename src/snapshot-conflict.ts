@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { HOST_EXTENSIONS_FILE } from './extension-manifest';
-import { SnapshotManifest } from './types';
+import { HOST_KINDS, SnapshotManifest } from './types';
+
+const KNOWN_HOSTS = new Set<string>(HOST_KINDS);
+const PLATFORM_KEYBINDINGS = /^profiles\/[^/]+\/keybindings\.([^/.]+)\.json$/;
 
 /** 一份快照的两个可比较部分：扩展清单单独拆出，装卸收敛期间要能把它排除在判定之外。 */
 export interface SnapshotDigest {
@@ -14,10 +17,11 @@ export interface SnapshotDigest {
  * 快照指纹：判断某一侧相对基准改没改的唯一依据。
  * 键序归一后再哈希——两台机器写出的元数据键序可能不同，内容其实一样，
  * 不归一就会被判成改动，导致整份覆盖和无意义的来回提交。
+ * 其他平台的快捷键不参与比较：本机既不会写回、也不会改动它们，算进来会让两侧永远不一致。
  */
-export function snapshotDigest(manifest: SnapshotManifest): SnapshotDigest {
+export function snapshotDigest(manifest: SnapshotManifest, platform: string): SnapshotDigest {
   const files = Object.entries(manifest.files)
-    .filter(([relative]) => relative !== HOST_EXTENSIONS_FILE)
+    .filter(([relative]) => relative !== HOST_EXTENSIONS_FILE && !isOtherPlatformFile(relative, platform))
     .sort(([left], [right]) => left.localeCompare(right));
   const canonical = canonicalize({
     profiles: manifest.profiles,
@@ -31,8 +35,15 @@ export function snapshotDigest(manifest: SnapshotManifest): SnapshotDigest {
   };
 }
 
-export function emptyManifest(host: SnapshotManifest['host']): SnapshotManifest {
-  return { schemaVersion: 1, host, createdAt: '', profiles: [], files: {} };
+/** 按平台分开存放的快捷键里，属于其他平台的那几份。 */
+export function isOtherPlatformFile(relative: string, platform: string): boolean {
+  const match = PLATFORM_KEYBINDINGS.exec(relative);
+  return match !== null && match[1] !== platform;
+}
+
+/** 命名 Profile 的名称；默认 Profile 两侧都一定存在，不参与 Profile 集合的比较。 */
+export function namedProfiles(manifest: SnapshotManifest): string[] {
+  return manifest.profiles.filter((profile) => !profile.isDefault).map((profile) => profile.name);
 }
 
 /** 快照清单可能来自远端仓库，必须校验后再使用，否则字段缺失会以难以定位的运行时错误暴露。 */
@@ -52,8 +63,8 @@ export async function readManifest(root: string): Promise<SnapshotManifest> {
 }
 
 export function parseManifest(value: unknown): SnapshotManifest | undefined {
-  if (!isRecord(value) || value.schemaVersion !== 1) return undefined;
-  if (value.host !== 'vscode' && value.host !== 'cursor') return undefined;
+  if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2)) return undefined;
+  if (typeof value.host !== 'string' || !KNOWN_HOSTS.has(value.host)) return undefined;
   if (typeof value.createdAt !== 'string') return undefined;
   if (!Array.isArray(value.profiles)) return undefined;
   const profiles = value.profiles.map((profile) => {
@@ -66,8 +77,8 @@ export function parseManifest(value: unknown): SnapshotManifest | undefined {
   if (value.profileMetadata !== undefined && !Array.isArray(value.profileMetadata)) return undefined;
   if (value.profileMetadata?.some((entry: unknown) => !isRecord(entry))) return undefined;
   return {
-    schemaVersion: 1,
-    host: value.host,
+    schemaVersion: value.schemaVersion,
+    host: value.host as SnapshotManifest['host'],
     createdAt: value.createdAt,
     profiles: profiles as SnapshotManifest['profiles'],
     files: value.files as Record<string, string>,

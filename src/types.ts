@@ -1,4 +1,17 @@
-export type HostKind = 'vscode' | 'cursor';
+/**
+ * 支持的宿主。每种宿主在仓库里各占一个目录，彼此不共享：
+ * 扩展市场与扩展标识不同，混用同一份快照会互相覆盖并反复装卸扩展。
+ */
+export const HOST_KINDS = ['vscode', 'vscode-insiders', 'cursor', 'vscodium', 'windsurf'] as const;
+export type HostKind = (typeof HOST_KINDS)[number];
+
+export const HOST_LABELS: Record<HostKind, string> = {
+  'vscode': 'VS Code',
+  'vscode-insiders': 'VS Code Insiders',
+  'cursor': 'Cursor',
+  'vscodium': 'VSCodium',
+  'windsurf': 'Windsurf',
+};
 
 /** 备份模式只把本机配置提交到仓库，同步模式才会把仓库内容写回本机。 */
 export type SyncMode = 'backup' | 'sync';
@@ -27,7 +40,7 @@ export type StageName = (typeof STAGE_NAMES)[number];
 export const BLOCK_REASONS = [
   'dirty-windows',
   'unreadable-windows',
-  'other-windows',
+  'profiles-mismatch',
   'unrelated',
   'both-changed',
   'local-changed',
@@ -63,12 +76,20 @@ export interface SyncOutcome {
   retry?: boolean;
   unrelated?: boolean;
   blockReason?: BlockReason;
-  /** Profile 增删因窗口数未满足而搁置，同步本身已完成。 */
-  waitingForWindows?: boolean;
   extensionsPending?: string[];
-  structuralApplied?: boolean;
   /** 本机与云端都相对基准有改动，必须由用户选定一方，重试无法解决。 */
   bothChanged?: boolean;
+  /** 两侧 Profile 不一致且插件无法自行处理（不增删 Profile），必须由用户决定。 */
+  profilesMismatch?: boolean;
+}
+
+/**
+ * 两侧 Profile 不一致、需要用户处理的一组 Profile 名称。
+ * cloud-only：云端有、本机没有，且不是本机删掉的；deleted-in-cloud：本机仍有、云端已删除。
+ */
+export interface ProfileMismatch {
+  kind: 'cloud-only' | 'deleted-in-cloud';
+  names: string[];
 }
 
 /** 本轮该采用哪一方的完整快照；不做内容合并，结果永远等于某一台机器的真实状态。 */
@@ -83,6 +104,12 @@ export interface SyncBaseline {
   localExtensions: string;
   cloudSnapshot: string;
   cloudExtensions: string;
+  /**
+   * 两侧命名 Profile 的名称集合，用来区分「本机删了」与「云端新增」、「云端删了」与「本机新增」。
+   * 旧版本写下的基准没有这两项，此时按无法区分处理。
+   */
+  localProfiles?: string[];
+  cloudProfiles?: string[];
 }
 
 /** 整轮同步累积的观察结果，只用于生成最终文案与返回值。 */
@@ -93,12 +120,14 @@ export interface SyncReport {
   recoveredFromDivergence: boolean;
   adoptedCloud: boolean;
   changedFileCount: number;
-  /** Profile 增删需要单窗口才能应用；未应用时同步仍算完成，但要提示用户关闭其他窗口。 */
-  waitingForWindows: boolean;
-  structuralApplied: boolean;
   activeWindows?: number;
-  structuralMessage?: string;
+  /** 两侧 Profile 不一致但本轮可以继续时给用户的说明，例如云端有本机没有的 Profile。 */
+  profileMessage?: string;
   extensionsPending?: string[];
+  /** 安装或卸载命令失败的扩展（市场里没有、平台不支持等），不再等待，只在文案里说明。 */
+  extensionsFailed?: string[];
+  /** 当前窗口不在默认 Profile，本轮没有装卸扩展。 */
+  extensionsDeferred?: boolean;
   /** 本轮采用了哪一方；'none' 表示两侧都没有改动。 */
   snapshotChoice?: Exclude<SnapshotChoice, 'conflict'>;
   /** 本轮是按用户选定的一方执行的，文案要说明另一份已备份。 */
@@ -113,8 +142,6 @@ export function createSyncReport(mode: SyncMode): SyncReport {
     recoveredFromDivergence: false,
     adoptedCloud: false,
     changedFileCount: 0,
-    waitingForWindows: false,
-    structuralApplied: false,
     resolvedConflict: false,
   };
 }
@@ -151,11 +178,18 @@ export interface ProfileDescriptor {
   isDefault: boolean;
 }
 
+/**
+ * 快照清单版本。2 起命名 Profile 的 id 由名称派生、快捷键按平台分文件、增加宿主级文件；
+ * 旧版本插件只认 1，读到 2 会直接报格式无效而不是按旧语义误删本机 Profile。
+ */
+export const SNAPSHOT_SCHEMA_VERSION = 2;
+
 export interface SnapshotManifest {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   host: HostKind;
   createdAt: string;
   profiles: Array<Pick<ProfileDescriptor, 'id' | 'name' | 'isDefault'>>;
+  /** 只出现在旧版本快照里，仅用于兼容读取，不再写入。 */
   profileMetadata?: Array<Record<string, unknown>>;
   files: Record<string, string>;
 }

@@ -31,6 +31,25 @@ test('凭据扫描放行不含真实凭据的取值，引用后拼接内容仍�
   assert.equal(containsPotentialSecret('{"note":"ghp_1234567890123456789012345678901234"}'), true);
 });
 
+test('凭据格式要求前缀处于单词边界，普通文本里夹带的前缀不算', () => {
+  // task-、disk-、desk- 里都含有 sk-，误判会让整轮同步被拒绝。
+  assert.equal(containsPotentialSecret('{"label":"task-dependencies-build"}'), false);
+  assert.equal(containsPotentialSecret('清理脚本 disk-cleanup-script-v2'), false);
+  assert.equal(containsPotentialSecret('{"key":"sk-proj-abcdefghijklmnop"}'), true);
+  assert.equal(containsPotentialSecret('{"value":"sk-ant-api03-abcdefghij"}'), true);
+});
+
+test('凭据扫描覆盖云服务密钥、私钥与 JWT', () => {
+  assert.equal(containsPotentialSecret('{"aws":"AKIAIOSFODNN7EXAMPLE"}'), true);
+  assert.equal(containsPotentialSecret('{"maps":"AIzaSyA1234567890abcdefghijklmnopqrstuv"}'), true);
+  assert.equal(containsPotentialSecret('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'), true);
+  assert.equal(containsPotentialSecret('-----BEGIN PRIVATE KEY-----'), true);
+  assert.equal(containsPotentialSecret('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N'), true);
+  // 公钥与普通的大写单词不是凭据。
+  assert.equal(containsPotentialSecret('-----BEGIN PUBLIC KEY-----'), false);
+  assert.equal(containsPotentialSecret('{"note":"AKIA is the prefix"}'), false);
+});
+
 test('凭据扫描覆盖环境变量风格的键名且不误伤配置项', () => {
   // mcp.json 里的 MCP 服务器凭据是这种形态，键名带业务前缀。
   assert.equal(containsPotentialSecret('{"env":{"BRAVE_API_KEY":"BSAxxx"}}'), true);

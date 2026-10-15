@@ -50,7 +50,10 @@ export interface SyncArtifacts {
   /** 轮初的本机指纹，写回前用它确认本机没有在同步期间被改动。 */
   localFingerprint?: string;
   restore?: RestoreResult;
-  /** 预置的提交说明；有值时不再调用 AI 生成（还原历史提交时使用）。 */
+  /**
+   * 预置的提交说明；有值时不再调用 AI 生成，且即使没有采用本机也要提交仓库改动
+   * （还原历史提交、按用户选择从云端删除 Profile 时使用）。
+   */
   commitMessage?: string;
 }
 
@@ -79,4 +82,23 @@ export interface Stage {
 export function requireValue<T>(value: T | undefined, name: string): T {
   if (value === undefined) throw new Error(`同步流程内部状态缺失：${name}`);
   return value;
+}
+
+/** 窗口存在未保存或状态不明的配置文档时暂停同步，安全后由调度层重试。 */
+export function windowBlock(safety: WindowSafetySnapshot): StageOutcome | undefined {
+  if (safety.dirtyWindows > 0) {
+    return {
+      kind: 'blocked',
+      reason: 'dirty-windows',
+      message: `有 ${safety.dirtyWindows} 个窗口存在未保存的配置文件，保存后会自动继续。`,
+    };
+  }
+  if (safety.unreadableWindows > 0) {
+    return {
+      kind: 'blocked',
+      reason: 'unreadable-windows',
+      message: `有 ${safety.unreadableWindows} 个窗口状态无法确认，已暂停同步。`,
+    };
+  }
+  return undefined;
 }

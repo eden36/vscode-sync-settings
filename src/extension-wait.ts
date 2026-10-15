@@ -14,14 +14,21 @@ const skippedInstallIds = new Set<string>();
 const skippedUninstallIds = new Set<string>();
 
 export interface WaitForExtensionsOptions {
+  /**
+   * 读取本机已安装扩展的标识，必须来自扩展清单文件。
+   * 不能用 vscode.extensions.getExtension 判断：被禁用的扩展在那里查不到，会被当成缺失反复安装并空等。
+   */
+  listInstalled: () => Promise<string[]>;
   timeoutMs?: number;
   pollIntervalMs?: number;
   onProgress?: (message: string) => void;
 }
 
-export interface WaitForExtensionsResult {
-  converged: boolean;
+export interface InstallExtensionsResult {
+  /** 安装命令已经执行、但清单里还没出现的扩展，下一轮继续等待。 */
   pending: string[];
+  /** 安装命令失败的扩展（市场里没有、平台不支持等），本进程内不再重试，也不再等待。 */
+  failed: string[];
 }
 
 export async function collectExtensionIdsFromFiles(files: string[]): Promise<string[]> {
@@ -33,25 +40,17 @@ export async function collectExtensionIdsFromFiles(files: string[]): Promise<str
   return [...ids];
 }
 
-function getInstalledIds(targetIds: readonly string[]): string[] {
-  return targetIds.filter((id) => Boolean(vscode.extensions.getExtension(id)));
-}
-
-function getPendingIds(targetIds: readonly string[]): string[] {
-  return targetIds.filter((id) => !vscode.extensions.getExtension(id));
-}
-
 export async function installAndWaitForExtensions(
   targetIds: readonly string[],
-  options: WaitForExtensionsOptions = {},
-): Promise<WaitForExtensionsResult> {
-  const unique = [...new Set(targetIds)];
-  const skipIds = [SELF_EXTENSION_ID];
+  options: WaitForExtensionsOptions,
+): Promise<InstallExtensionsResult> {
   const onProgress = options.onProgress;
   const started = Date.now();
   const budgetMs = options.timeoutMs ?? EXTENSION_INSTALL_BUDGET_MS;
-  const missing = selectMissingExtensionIds(unique, getInstalledIds(unique), skipIds);
+  const missing = selectMissingExtensionIds(targetIds, await options.listInstalled(), [SELF_EXTENSION_ID]);
+  const failed = missing.filter((id) => skippedInstallIds.has(id));
   const retryable = missing.filter((id) => !skippedInstallIds.has(id));
+  const requested: string[] = [];
 
   for (const [index, id] of retryable.entries()) {
     const remaining = budgetMs - (Date.now() - started);
@@ -63,35 +62,32 @@ export async function installAndWaitForExtensions(
         Math.min(EXTENSION_INSTALL_EACH_MS, remaining),
         `安装超时：${id}`,
       );
+      requested.push(id);
     } catch {
       skippedInstallIds.add(id);
+      failed.push(id);
     }
   }
 
-  const pendingAfterInstall = selectMissingExtensionIds(unique, getInstalledIds(unique), skipIds);
-  const waiting = pendingAfterInstall.filter((id) => !skippedInstallIds.has(id));
-  const failed = pendingAfterInstall.filter((id) => skippedInstallIds.has(id));
+  // 预算用完没来得及发起安装的，与已发起但还没落地的一样留到下一轮。
+  const waiting = retryable.filter((id) => !failed.includes(id));
   const waitBudget = Math.min(EXTENSION_WAIT_MS, Math.max(0, budgetMs - (Date.now() - started)));
-  if (waiting.length === 0 || waitBudget <= 0) {
-    return { converged: failed.length === 0 && waiting.length === 0, pending: [...waiting, ...failed] };
+  if (!requested.length || waitBudget <= 0) {
+    return { pending: await stillMissing(waiting, options), failed };
   }
-
-  const waited = await waitForExtensions(waiting, { ...options, timeoutMs: waitBudget });
-  return {
-    converged: waited.converged && failed.length === 0,
-    pending: [...waited.pending, ...failed],
-  };
+  const pending = await waitForExtensions(waiting, { ...options, timeoutMs: waitBudget });
+  return { pending, failed };
 }
 
 /**
- * 卸载云端已经移除的扩展。
+ * 卸载云端已经移除的扩展，返回卸载失败的标识。
  * installedIds 必须来自本机扩展清单文件，内置扩展不在其中，不会被误卸载；
  * targetIds 为空时不执行任何卸载，避免云端缺少扩展信息时清空本机。
  */
 export async function uninstallRemovedExtensions(
   targetIds: readonly string[],
   installedIds: readonly string[],
-  options: WaitForExtensionsOptions = {},
+  options: Omit<WaitForExtensionsOptions, 'listInstalled'> = {},
 ): Promise<string[]> {
   const removable = selectRemovableExtensionIds(installedIds, targetIds, [SELF_EXTENSION_ID])
     .filter((id) => !skippedUninstallIds.has(id));
@@ -121,51 +117,24 @@ export async function uninstallRemovedExtensions(
   return failed;
 }
 
-export function waitForExtensions(
-  targetIds: readonly string[],
-  options: WaitForExtensionsOptions = {}
-): Promise<WaitForExtensionsResult> {
-  const unique = [...new Set(targetIds)];
+/** 轮询扩展清单直到目标全部出现或超时，返回仍未出现的标识。 */
+export async function waitForExtensions(targetIds: readonly string[], options: WaitForExtensionsOptions): Promise<string[]> {
   // 等待过程占用跨窗口独占锁，超时不能太长，否则其他窗口的同步会长时间被阻塞。
   const timeoutMs = options.timeoutMs ?? EXTENSION_WAIT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? 2_000;
-  const onProgress = options.onProgress;
-
-  const pending = getPendingIds(unique);
-  if (unique.length === 0 || pending.length === 0) {
-    return Promise.resolve({ converged: true, pending: [] });
+  const deadline = Date.now() + timeoutMs;
+  let pending = await stillMissing(targetIds, options);
+  while (pending.length && Date.now() < deadline) {
+    options.onProgress?.(`剩余 ${pending.length} 个扩展待安装…`);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, Math.max(0, deadline - Date.now()))));
+    pending = await stillMissing(targetIds, options);
   }
+  if (!pending.length && targetIds.length) options.onProgress?.('扩展已同步完成。');
+  return pending;
+}
 
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result: WaitForExtensionsResult) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      clearInterval(poll);
-      disposable.dispose();
-      resolve(result);
-    };
-
-    const report = () => {
-      const current = getPendingIds(unique);
-      if (current.length === 0) {
-        onProgress?.('扩展已同步完成。');
-        finish({ converged: true, pending: [] });
-        return;
-      }
-      onProgress?.(`剩余 ${current.length} 个扩展待安装…`);
-    };
-
-    const disposable = vscode.extensions.onDidChange(report);
-    const poll = setInterval(report, pollIntervalMs);
-    const timeout = setTimeout(() => {
-      finish({ converged: false, pending: getPendingIds(unique) });
-    }, timeoutMs);
-
-    onProgress?.(`剩余 ${pending.length} 个扩展待安装…`);
-    report();
-  });
+async function stillMissing(targetIds: readonly string[], options: WaitForExtensionsOptions): Promise<string[]> {
+  return targetIds.length ? selectMissingExtensionIds(targetIds, await options.listInstalled()) : [];
 }
 
 function raceTimeout(promise: Promise<unknown>, timeoutMs: number, message: string): Promise<unknown> {

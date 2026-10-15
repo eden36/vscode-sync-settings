@@ -24,11 +24,6 @@ export const workspace = {
   }),
 };
 
-export const extensions = {
-  getExtension: (id: string) => installedExtensions.get(id),
-  onDidChange: () => ({ dispose() {} }),
-};
-
 export const commands = {
   executeCommand: async (command: string, argument?: unknown): Promise<unknown> => {
     if (typeof argument !== 'string') return undefined;
@@ -62,6 +57,11 @@ export function resetExtensionStub(): void {
 
 export function markExtensionInstalled(id: string): void {
   installedExtensions.set(id, { id });
+}
+
+/** 模拟扩展清单文件：安装命令成功后标识立刻出现在清单里。 */
+export async function installedExtensionIds(): Promise<string[]> {
+  return [...installedExtensions.keys()];
 }
 
 export function markExtensionInstallFailed(id: string): void {

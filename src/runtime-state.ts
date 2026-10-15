@@ -1,12 +1,20 @@
 import * as path from 'node:path';
 import { withFileLock } from './file-lock';
 import { atomicWriteJson, readJsonFile as readJson } from './json-store';
-import { LINK_STATES, LinkState, SyncBaseline } from './types';
+import { LINK_STATES, LinkState, ProfileMismatch, SyncBaseline } from './types';
 
 const RUNTIME_STATE_LOCK_BUSY = '同步状态正在被其他窗口更新，请稍后重试。';
 const KNOWN_LINK_STATES = new Set<string>(LINK_STATES);
 /** 显式传 undefined 表示删除，这些键不能靠展开保留旧值。 */
-const OPTIONAL_KEYS = ['lastSyncAt', 'baseline', 'extensionsPending', 'extensionsPendingRounds', 'pendingResolution'] as const;
+const OPTIONAL_KEYS = [
+  'lastSyncAt',
+  'baseline',
+  'extensionsPending',
+  'extensionsPendingRounds',
+  'pendingResolution',
+  'profileMismatch',
+  'profileResolution',
+] as const;
 
 /**
  * 跨窗口、跨 Profile 共享的运行状态。
@@ -28,6 +36,13 @@ export interface RuntimeStateRecord {
   extensionsPendingRounds?: number;
   /** 用户对「两边都改了」的选择；整轮成功后才清除，中途失败下一轮继续沿用。 */
   pendingResolution?: 'local' | 'cloud';
+  /**
+   * 等待用户处理的 Profile 差异。cloud-only 的名称还用来认领用户随后新建的同名 Profile：
+   * 新建的 Profile 先套用云端内容，否则下一轮会把它的空配置当成本机改动推上去覆盖云端。
+   */
+  profileMismatch?: ProfileMismatch;
+  /** 用户对 profileMismatch 的处理：cloud-only 表示从云端删除，deleted-in-cloud 表示保留本机的。整轮成功后清除。 */
+  profileResolution?: ProfileMismatch;
 }
 
 // 默认关闭：同步模式下本机没有仓库时首轮同步会整包采用云端覆盖本机，不能在用户无感知时发生。
@@ -107,6 +122,10 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
     return undefined;
   }
   if (value.baseline !== undefined && !baseline) return undefined;
+  const profileMismatch = parseProfileMismatch(value.profileMismatch);
+  if (value.profileMismatch !== undefined && !profileMismatch) return undefined;
+  const profileResolution = parseProfileMismatch(value.profileResolution);
+  if (value.profileResolution !== undefined && !profileResolution) return undefined;
   return {
     schemaVersion: 1,
     enabled: value.enabled,
@@ -121,6 +140,8 @@ export function parseRuntimeState(value: unknown): RuntimeStateRecord | undefine
     ...(value.pendingResolution !== undefined
       ? { pendingResolution: value.pendingResolution as 'local' | 'cloud' }
       : {}),
+    ...(profileMismatch ? { profileMismatch } : {}),
+    ...(profileResolution ? { profileResolution } : {}),
   };
 }
 
@@ -128,12 +149,24 @@ function parseBaseline(value: unknown): SyncBaseline | undefined {
   if (!isRecord(value)) return undefined;
   const keys = ['localSnapshot', 'localExtensions', 'cloudSnapshot', 'cloudExtensions'] as const;
   if (!keys.every((key) => typeof value[key] === 'string')) return undefined;
+  const localProfiles = parseStringArray(value.localProfiles);
+  const cloudProfiles = parseStringArray(value.cloudProfiles);
+  if (value.localProfiles !== undefined && !localProfiles) return undefined;
+  if (value.cloudProfiles !== undefined && !cloudProfiles) return undefined;
   return {
     localSnapshot: value.localSnapshot as string,
     localExtensions: value.localExtensions as string,
     cloudSnapshot: value.cloudSnapshot as string,
     cloudExtensions: value.cloudExtensions as string,
+    ...(localProfiles ? { localProfiles } : {}),
+    ...(cloudProfiles ? { cloudProfiles } : {}),
   };
+}
+
+function parseProfileMismatch(value: unknown): ProfileMismatch | undefined {
+  if (!isRecord(value) || (value.kind !== 'cloud-only' && value.kind !== 'deleted-in-cloud')) return undefined;
+  const names = parseStringArray(value.names);
+  return names ? { kind: value.kind, names } : undefined;
 }
 
 function parseStringArray(value: unknown): string[] | undefined {
@@ -153,7 +186,9 @@ function sameRuntimeState(left: RuntimeStateRecord, right: RuntimeStateRecord): 
     && left.pendingResolution === right.pendingResolution
     && left.extensionsPendingRounds === right.extensionsPendingRounds
     && sameBaseline(left.baseline, right.baseline)
-    && sameIds(left.extensionsPending, right.extensionsPending);
+    && sameIds(left.extensionsPending, right.extensionsPending)
+    && sameMismatch(left.profileMismatch, right.profileMismatch)
+    && sameMismatch(left.profileResolution, right.profileResolution);
 }
 
 function sameBaseline(left: SyncBaseline | undefined, right: SyncBaseline | undefined): boolean {
@@ -161,7 +196,14 @@ function sameBaseline(left: SyncBaseline | undefined, right: SyncBaseline | unde
   return left.localSnapshot === right.localSnapshot
     && left.localExtensions === right.localExtensions
     && left.cloudSnapshot === right.cloudSnapshot
-    && left.cloudExtensions === right.cloudExtensions;
+    && left.cloudExtensions === right.cloudExtensions
+    && sameIds(left.localProfiles, right.localProfiles)
+    && sameIds(left.cloudProfiles, right.cloudProfiles);
+}
+
+function sameMismatch(left: ProfileMismatch | undefined, right: ProfileMismatch | undefined): boolean {
+  if (!left || !right) return left === right;
+  return left.kind === right.kind && sameIds(left.names, right.names);
 }
 
 function sameIds(left: string[] | undefined, right: string[] | undefined): boolean {

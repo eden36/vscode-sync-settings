@@ -19,6 +19,8 @@ const modeButtons = [element<HTMLButtonElement>('modeBackup'), element<HTMLButto
 const choicePanel = element('choicePanel');
 const chooseLocal = element<HTMLButtonElement>('chooseLocal');
 const chooseCloud = element<HTMLButtonElement>('chooseCloud');
+const profilePanel = element('profilePanel');
+const resolveProfiles = element<HTMLButtonElement>('resolveProfiles');
 const mainPage = element('mainPage');
 const historyPage = element('historyPage');
 const historyBody = element('historyBody');
@@ -51,6 +53,10 @@ addEventListener('scroll', closeTagMenu, true);
 
 chooseLocal.onclick = () => resolveConflict('local');
 chooseCloud.onclick = () => resolveConflict('cloud');
+resolveProfiles.onclick = () => {
+  resolveProfiles.disabled = true;
+  vscode.postMessage({ type: 'resolveProfiles' });
+};
 toggleEnabled.onclick = () => {
   toggleEnabled.disabled = true;
   vscode.postMessage({ type: 'toggleEnabled', enabled: !enabled });
@@ -156,6 +162,11 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   choicePanel.hidden = !status.needsChoice;
   chooseLocal.disabled = false;
   chooseCloud.disabled = false;
+  profilePanel.hidden = !status.profileChoice;
+  element('profileSummary').textContent = status.profileChoice?.summary ?? '';
+  element('profileDetail').textContent = status.profileChoice?.detail ?? '';
+  resolveProfiles.textContent = status.profileChoice?.action ?? '';
+  resolveProfiles.disabled = false;
   lastSyncAt = status.lastSyncAt;
   renderLastSyncAt();
 }

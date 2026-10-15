@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { isValidTagName } from './configuration-record';
 import { runProcess } from './process';
@@ -35,6 +36,8 @@ export class ConfigurationRepositoryGitService {
   public readonly repositoryPath: string;
   /** 供通用失败路径脱敏用：Git 常在 stderr 中回显完整远程地址。由 prepare 赋值，之前的调用不脱敏。 */
   private remoteUrl = '';
+  /** 首次执行 Git 时决定是否给 SSH 加 BatchMode，之后复用。 */
+  private sshArguments: Promise<string[]> | undefined;
 
   public constructor(runtimePath: string) {
     this.repositoryPath = path.join(runtimePath, 'repository');
@@ -136,6 +139,20 @@ export class ConfigurationRepositoryGitService {
     if (needed) await this.git(['fetch', '--prune', 'origin', configuration.branch, '+refs/tags/*:refs/tags/*']);
     // 刷新永远是重新核对最前面这一段，「加载更多」不会触发刷新，因此 offset 固定为 0。
     return this.readCommits(configuration, host, limit, 0);
+  }
+
+  /**
+   * 远端分支 tip 是否与本地跟踪分支不同，用于远程轮询前的廉价探测。
+   * 只读：直接对仓库地址 ls-remote，不改仓库配置，可以在独占锁之外执行。
+   * 探测失败按「有变化」处理，交给完整的一轮去报告具体错误。
+   */
+  public async remoteChanged(configuration: SyncConfiguration): Promise<boolean> {
+    if (!(await exists(path.join(this.repositoryPath, '.git')))) return true;
+    const remote = await this.git(['ls-remote', '--heads', configuration.repositoryUrl, `refs/heads/${configuration.branch}`], true);
+    if (remote.exitCode !== 0) return true;
+    const remoteTip = remote.stdout.split('\t')[0] ?? '';
+    const local = await this.git(['rev-parse', '--verify', `origin/${configuration.branch}`], true);
+    return remoteTip !== (local.exitCode === 0 ? local.stdout : '');
   }
 
   /** 给指定提交打标签并推到远端。标签是共享的，只存在本机没有意义。 */
@@ -313,11 +330,26 @@ export class ConfigurationRepositoryGitService {
   }
 
   private async git(args: string[], allowFailure = false, timeoutMs = 60_000) {
-    const result = await runProcess('git', args, this.repositoryPath, timeoutMs);
+    const result = await runProcess('git', [...await this.sshOptions(), ...args], this.repositoryPath, timeoutMs);
     if (!allowFailure && result.exitCode !== 0) {
       throw new Error(`配置同步仓库 Git 操作失败：${redact(result.stderr || result.stdout, this.remoteUrl)}`);
     }
     return result;
+  }
+
+  /**
+   * 后台同步没有终端回答 SSH 的主机密钥确认或私钥口令，交互提示只会让命令挂到超时，
+   * 因此默认加上 BatchMode 让它立即失败并给出提示。用户自己配置了 SSH 命令时尊重用户配置。
+   */
+  private sshOptions(): Promise<string[]> {
+    this.sshArguments ??= (async () => {
+      if (process.env.GIT_SSH_COMMAND || process.env.GIT_SSH) return [];
+      // 在临时目录读取，只看系统与全局配置，不受扩展宿主当前目录所在仓库的影响。
+      const configured = await runProcess('git', ['config', '--get', 'core.sshCommand'], os.tmpdir()).catch(() => undefined);
+      if (!configured || configured.stdout) return [];
+      return ['-c', 'core.sshCommand=ssh -o BatchMode=yes'];
+    })();
+    return this.sshArguments;
   }
 
   private async push(configuration: SyncConfiguration): Promise<void> {
@@ -367,7 +399,10 @@ function parseDecoratedTags(decoration: string): string[] {
 
 function formatRemoteError(message: string, repositoryUrl: string): string {
   const detail = redact(message, repositoryUrl);
-  if (/password|authentication|publickey|credential|interactiv/i.test(detail)) {
+  if (/host key verification failed/i.test(detail)) {
+    return `SSH 主机密钥未确认。请先在终端对该仓库执行一次 git ls-remote 并确认主机密钥。详细信息：${detail}`;
+  }
+  if (/password|authentication|publickey|credential|interactiv|passphrase/i.test(detail)) {
     return `Git 认证失败。插件已调用本机 SSH/Git Credential Manager，请先在终端完成一次该仓库的认证。详细信息：${detail}`;
   }
   return `无法访问远程仓库：${detail}`;

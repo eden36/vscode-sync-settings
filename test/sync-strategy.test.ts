@@ -22,6 +22,7 @@ test('备份模式任何情况下都不采用云端', () => {
 test('AI 不可用时仍可生成稳定的提交信息', () => {
   assert.equal(fallbackCommitMessage('vscode'), 'chore(sync): 同步 VS Code 配置');
   assert.equal(fallbackCommitMessage('cursor'), 'chore(sync): 同步 Cursor 配置');
+  assert.equal(fallbackCommitMessage('vscode-insiders'), 'chore(sync): 同步 VS Code Insiders 配置');
 });
 
 test('首次接入的状态文案说明已按云端覆盖并提示备份', () => {
@@ -33,9 +34,20 @@ test('首次接入的状态文案说明已按云端覆盖并提示备份', () =>
     finalSyncMessage({
       ...createSyncReport('sync'),
       adoptedCloud: true,
-      structuralMessage: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。',
+      profileMessage: '云端有本机没有的 Profile：工作，在本机新建同名 Profile 后会自动套用云端配置',
     }),
-    '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用；已按云端配置覆盖本机；本机原配置已备份到扩展运行目录。',
+    '同步完成（已按云端配置覆盖本机；本机原配置已备份到扩展运行目录；云端有本机没有的 Profile：工作，在本机新建同名 Profile 后会自动套用云端配置）。',
+  );
+});
+
+test('装不上的扩展与推迟的扩展同步写进状态文案', () => {
+  assert.equal(
+    finalSyncMessage({ ...createSyncReport('sync'), extensionsFailed: ['gone.one'] }),
+    '同步完成（部分扩展无法安装或卸载，已跳过：gone.one）。',
+  );
+  assert.equal(
+    finalSyncMessage({ ...createSyncReport('sync'), extensionsDeferred: true }),
+    '同步完成（当前窗口不在默认 Profile，扩展将在默认 Profile 的窗口中同步）。',
   );
 });
 

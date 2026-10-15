@@ -25,7 +25,7 @@ test('同步进行中关闭开关后等待当前安全操作完成再停止', ()
   assert.deepEqual(closed.next.sync, { kind: 'running', stage: 'push' });
   assert.deepEqual(closed.commands.map((command) => command.type), ['stop-schedules', 'cancel-retry']);
 
-  const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  const finished = reduce(closed.next, { type: 'sync-finished', outcome: { ok: true } });
   assert.deepEqual(finished.next.sync, { kind: 'disabled' });
 });
 
@@ -67,7 +67,7 @@ test('同步期间的请求排队，结束后再跑一轮', () => {
   assert.equal(queued.next.pending, true);
   assert.deepEqual(queued.commands, []);
 
-  const finished = reduce(queued.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  const finished = reduce(queued.next, { type: 'sync-finished', outcome: { ok: true } });
   assert.deepEqual(finished.next.sync, { kind: 'running', stage: 'snapshot' });
   assert.deepEqual(finished.commands, [{ type: 'start-sync', adoptCloud: false }]);
 });
@@ -77,7 +77,7 @@ test('阻塞是否可自动恢复取决于原因', () => {
   const resolvable: Array<[SchedulerMachine['sync'], boolean]> = [
     [{ kind: 'blocked', reason: 'dirty-windows' }, true],
     [{ kind: 'blocked', reason: 'unreadable-windows' }, true],
-    [{ kind: 'blocked', reason: 'other-windows' }, true],
+    [{ kind: 'blocked', reason: 'profiles-mismatch' }, false],
     [{ kind: 'blocked', reason: 'unrelated' }, false],
     [{ kind: 'blocked', reason: 'exclusive-lock' }, false],
   ];
@@ -136,7 +136,7 @@ test('抢不到独占锁时按指数退避重试', () => {
   assert.deepEqual(machine.sync, { kind: 'blocked', reason: 'exclusive-lock' });
 
   // 成功一轮后退避重新归零。
-  const recovered = reduce(machine, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  const recovered = reduce(machine, { type: 'sync-finished', outcome: { ok: true } });
   assert.equal(recovered.next.retryAttempt, 0);
   assert.deepEqual(recovered.next.sync, { kind: 'idle' });
 });
@@ -167,7 +167,7 @@ test('同步失败后按退避自动重试，成功后撤销排下的重试', ()
   const retried = reduce(machine, { type: 'sync-requested', source: 'timer' });
   assert.deepEqual(retried.commands, [{ type: 'start-sync', adoptCloud: false }]);
 
-  const recovered = reduce(retried.next, { type: 'sync-finished', outcome: { ok: true, structuralApplied: false } });
+  const recovered = reduce(retried.next, { type: 'sync-finished', outcome: { ok: true } });
   assert.equal(recovered.next.retryAttempt, 0);
   assert.deepEqual(recovered.commands, [{ type: 'cancel-retry' }, { type: 'complete-sync-requests' }]);
 });
@@ -198,25 +198,33 @@ test('删除本地仓库后链路状态回到没有仓库', () => {
   assert.equal(displayPhase(next.sync, next.link), '未同步');
 });
 
-test('结构变化已应用时请求重载窗口', () => {
-  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'apply' } };
-  const { next, commands } = reduce(running, {
+test('Profile 不一致时暂停并只弹一次，之后的请求照常开跑以便检测用户是否已处理', () => {
+  const blocked = reduce(leaderMachine(), {
     type: 'sync-finished',
-    outcome: { ok: true, structuralApplied: true, waitingForWindows: false },
+    outcome: { ok: false, profilesMismatch: true, blockReason: 'profiles-mismatch' },
   });
-  assert.deepEqual(next.sync, { kind: 'idle' });
-  assert.deepEqual(commands, [{ type: 'reload-window' }]);
-});
+  assert.deepEqual(blocked.next.sync, { kind: 'blocked', reason: 'profiles-mismatch' });
+  assert.deepEqual(blocked.commands, [{ type: 'prompt-profile-choice' }]);
 
-test('重载窗口时不再并行开启排队的同步', () => {
-  const running: SchedulerMachine = { ...leaderMachine(), sync: { kind: 'running', stage: 'apply' }, pending: true };
-  const { next, commands } = reduce(running, {
+  // 用户新建或删除 Profile 后由指纹检测发起请求，必须能开跑，否则阻塞永远解不开。
+  const again = reduce(blocked.next, { type: 'sync-requested', source: 'timer' });
+  assert.deepEqual(again.commands, [{ type: 'start-sync', adoptCloud: false }]);
+  const stillBlocked = reduce(again.next, {
     type: 'sync-finished',
-    outcome: { ok: true, structuralApplied: true, waitingForWindows: false },
+    outcome: { ok: false, profilesMismatch: true, blockReason: 'profiles-mismatch' },
   });
-  // 同步与重载并行会把 Git 操作掐断在中途；排队请求留到重启后由 leader 重新认领。
-  assert.deepEqual(commands, [{ type: 'reload-window' }]);
-  assert.equal(next.pending, false);
+  assert.deepEqual(stillBlocked.commands, []);
+
+  // 窗口状态变化解不开这种阻塞。
+  const windows = reduce(blocked.next, {
+    type: 'windows-changed',
+    safety: { activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 },
+  });
+  assert.deepEqual(windows.commands, []);
+
+  // 成功一轮后允许下一次差异重新弹窗。
+  const recovered = reduce(again.next, { type: 'sync-finished', outcome: { ok: true } });
+  assert.equal(recovered.next.profilesPrompted, false);
 });
 
 test('两边都改时暂停并只询问一次，选定一方后才继续', () => {

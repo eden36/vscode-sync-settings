@@ -4,15 +4,20 @@ import * as path from 'node:path';
 import { applyEdits, modify, parse } from 'jsonc-parser';
 import { formatExtensionManifest, HOST_EXTENSIONS_FILE, parseExtensionIds, sortExtensionIds } from './extension-manifest';
 import type { HostEnvironment } from './host';
-import { readManifest } from './snapshot-conflict';
-import { ProfileDescriptor, SnapshotManifest } from './types';
+import { namedProfiles, readManifest } from './snapshot-conflict';
+import { ProfileDescriptor, SNAPSHOT_SCHEMA_VERSION, SnapshotManifest } from './types';
 
 // Profile 目录下的 extensions.json 是 IDE 维护的启用状态，跨机器同步会引用本机没有的扩展；
 // 扩展改由快照根目录的宿主级清单统一处理。
 const FILE_RESOURCES = ['settings.json', 'keybindings.json', 'tasks.json', 'mcp.json'];
 const DIRECTORY_RESOURCES = ['snippets', 'prompts'];
+const SETTINGS_FILE = 'settings.json';
+const KEYBINDINGS_FILE = 'keybindings.json';
+/** 宿主级文件在仓库宿主目录下的子目录名。 */
+const HOST_FILE_DIRECTORY = 'global';
 const TEMPORARY_MARKER = '.profile-git-sync-';
 const PLUGIN_SETTING_PREFIX = 'profileGitSync.';
+const IGNORED_SETTINGS_KEY = 'settingsSync.ignoredSettings';
 const BACKUP_RETENTION = 10;
 const STABLE_READ_RETRY_MS = 80;
 
@@ -28,16 +33,27 @@ interface StorageFile {
 
 export interface RestoreResult {
   changedFiles: string[];
-  structuralChange: boolean;
-  structuralApplied: boolean;
-  message?: string;
+  /** 云端有、本机没有的命名 Profile；插件不新建 Profile，这些 Profile 的配置没有写回。 */
+  missingProfiles: string[];
+  /** 本机有、云端没有的命名 Profile；插件不删除 Profile，原样保留。 */
+  localOnlyProfiles: string[];
+}
+
+export interface RestoreOptions {
+  /** 只写回这些名称的命名 Profile，用于让用户新建的 Profile 先套用云端内容；不写默认 Profile 与宿主级文件。 */
+  profileNames?: ReadonlySet<string>;
 }
 
 export class ProfileAdapter {
   private readonly fingerprintCache = new Map<string, { mtimeMs: number; size: number; hash: string }>();
+  private installedExtensionsCache: { mtimeMs: number; size: number; ids: string[] } | undefined;
 
   public constructor(private readonly environment: HostEnvironment) {}
 
+  /**
+   * 命名 Profile 的 id 由名称派生，不用磁盘目录名：目录名是各机器随机生成的，
+   * 同名 Profile 在两台机器上目录不同，按目录名比较会被当成一删一增。
+   */
   public async listProfiles(): Promise<ProfileDescriptor[]> {
     const profiles: ProfileDescriptor[] = [
       { id: 'default', name: '默认', location: this.environment.userDataPath, isDefault: true }
@@ -48,7 +64,7 @@ export class ProfileAdapter {
         continue;
       }
       profiles.push({
-        id: profile.location,
+        id: profileSnapshotId(profile.name),
         name: profile.name,
         location: path.join(this.environment.userDataPath, 'profiles', profile.location),
         isDefault: false
@@ -63,6 +79,10 @@ export class ProfileAdapter {
     // 安装或卸载扩展也要触发同步，但只认标识变化，扩展升级不算。
     const installedExtensions = await this.readInstalledExtensions();
     if (installedExtensions) hash.update(HOST_EXTENSIONS_FILE).update(sha256(installedExtensions));
+    for (const hostFile of this.hostFiles) {
+      const fileHash = await this.portableHash(hostFile.path, hostFile.name);
+      if (fileHash) hash.update(`${HOST_FILE_DIRECTORY}/${hostFile.name}`).update(fileHash);
+    }
     for (const profile of profiles) {
       hash.update(`${profile.id}\0${profile.name}\0${profile.isDefault ? '1' : '0'}\0`);
       for (const resource of FILE_RESOURCES) {
@@ -73,7 +93,7 @@ export class ProfileAdapter {
         const root = path.join(profile.location, resource);
         const files = (await collectFiles(root)).sort();
         for (const file of files) {
-          const fileHash = await this.portableHash(file, path.basename(file));
+          const fileHash = await this.portableHash(file, resource);
           if (fileHash) hash.update(path.relative(root, file)).update(fileHash);
         }
       }
@@ -97,7 +117,6 @@ export class ProfileAdapter {
 
   public async createSnapshot(hostRoot: string): Promise<SnapshotManifest> {
     const profiles = await this.listProfiles();
-    const storage = await this.readStorage();
     const staging = `${hostRoot}.staging-${process.pid}-${Date.now()}`;
     await fs.rm(staging, { recursive: true, force: true });
     await fs.mkdir(staging, { recursive: true });
@@ -106,11 +125,16 @@ export class ProfileAdapter {
     for (const profile of profiles) {
       const targetRoot = path.join(staging, 'profiles', profile.id);
       for (const resource of FILE_RESOURCES) {
-        await this.snapshotFile(profile.location, resource, targetRoot, files, profile.id);
+        // 快捷键按平台分文件：Windows 与 macOS 的修饰键不同，共用一份会互相覆盖。
+        const repositoryName = resource === KEYBINDINGS_FILE ? this.keybindingsName : resource;
+        await this.snapshotFile(path.join(profile.location, resource), resource, staging, `profiles/${profile.id}/${repositoryName}`, files);
       }
       for (const resource of DIRECTORY_RESOURCES) {
         await this.snapshotDirectory(profile.location, resource, targetRoot, files, profile.id);
       }
+    }
+    for (const hostFile of this.hostFiles) {
+      await this.snapshotFile(hostFile.path, hostFile.name, staging, `${HOST_FILE_DIRECTORY}/${hostFile.name}`, files);
     }
 
     const installedExtensions = await this.readInstalledExtensions();
@@ -120,11 +144,10 @@ export class ProfileAdapter {
     }
 
     const manifest: SnapshotManifest = {
-      schemaVersion: 1,
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       host: this.environment.kind,
       createdAt: '',
       profiles: profiles.map(({ id, name, isDefault }) => ({ id, name, isDefault })),
-      profileMetadata: storage.userDataProfiles?.map((profile) => ({ ...profile })) ?? [],
       files
     };
     await fs.writeFile(path.join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
@@ -132,140 +155,121 @@ export class ProfileAdapter {
     return manifest;
   }
 
-  public async restoreSnapshot(hostRoot: string, allowStructural: boolean, applyMatchingFiles = false): Promise<RestoreResult> {
+  /**
+   * 把快照写回本机。Profile 按名称对应，插件不新建也不删除 Profile：
+   * IDE 运行期间 storage.json 由主进程持有，外部改写会在它下次落盘时被覆盖，而 Profile 目录已经增删，两边就会错位。
+   */
+  public async restoreSnapshot(hostRoot: string, options: RestoreOptions = {}): Promise<RestoreResult> {
     const manifest = await readManifest(hostRoot);
     if (manifest.host !== this.environment.kind) throw new Error('远程快照的宿主类型与本机不一致。');
 
     const localProfiles = await this.listProfiles();
-    const localIds = new Set(localProfiles.map((profile) => profile.id));
-    const remoteIds = new Set(manifest.profiles.map((profile) => profile.id));
-    const structuralChange = !setsEqual(localIds, remoteIds);
-    if (structuralChange && !allowStructural && !applyMatchingFiles) {
-      return {
-        changedFiles: [],
-        structuralChange,
-        structuralApplied: false,
-        message: '远程包含 Profile 增删，只剩一个窗口时会自动应用。',
-      };
+    const localByName = new Map(localProfiles.filter((profile) => !profile.isDefault).map((profile) => [profile.name, profile]));
+    const defaultProfile = localProfiles[0];
+    const targets = new Map<string, ProfileDescriptor>();
+    const missingProfiles: string[] = [];
+    for (const remote of manifest.profiles) {
+      if (!isSafeSegment(remote.id)) throw new Error(`快照包含非法的 Profile 标识：${remote.id}`);
+      const local = remote.isDefault ? defaultProfile : localByName.get(remote.name);
+      if (!local) {
+        if (!remote.isDefault) missingProfiles.push(remote.name);
+        continue;
+      }
+      if (options.profileNames && (remote.isDefault || !options.profileNames.has(remote.name))) continue;
+      targets.set(remote.id, local);
     }
+    const remoteNames = new Set(namedProfiles(manifest));
+    const localOnlyProfiles = [...localByName.keys()].filter((name) => !remoteNames.has(name));
 
-    const applyStructure = structuralChange && allowStructural;
-    if (applyStructure) {
-      await this.restoreProfileStructure(manifest);
-    }
-
-    const refreshedProfiles = applyStructure ? await this.listProfiles() : localProfiles;
-    // 多窗口无法增删 Profile 时只动共有 Profile，避免随后合并把本机旧文件推回云端。
-    const targetProfiles = structuralChange && !allowStructural
-      ? refreshedProfiles.filter((profile) => remoteIds.has(profile.id))
-      : refreshedProfiles;
-    const localById = new Map(targetProfiles.map((profile) => [profile.id, profile]));
     const changedFiles: string[] = [];
     const backupsRoot = path.join(this.environment.runtimePath, 'backups');
     const backupRoot = path.join(backupsRoot, new Date().toISOString().replaceAll(':', '-'));
-    for (const profile of targetProfiles) {
+    for (const [remoteId, profile] of targets) {
       for (const resource of FILE_RESOURCES) {
-        const relative = `profiles/${profile.id}/${resource}`;
         const target = path.join(profile.location, resource);
-        if (!manifest.files[relative] && await pathExists(target)) {
-          await backupAndRemove(target, path.join(backupRoot, profile.id, resource));
+        const relative = this.cloudFileFor(manifest, remoteId, resource);
+        if (relative) {
+          await this.writeFromSnapshot(hostRoot, relative, target, resource === SETTINGS_FILE, changedFiles);
+        } else if (resource !== KEYBINDINGS_FILE && await pathExists(target)) {
+          // 云端没有本平台的快捷键时保留本机：可能只是还没有同平台的机器上传过，不能当成删除。
+          await backupAndRemove(target, path.join(backupRoot, remoteId, resource));
           changedFiles.push(target);
         }
       }
       for (const resource of DIRECTORY_RESOURCES) {
         const root = path.join(profile.location, resource);
+        const prefix = `profiles/${remoteId}/${resource}/`;
         for (const target of await collectFiles(root)) {
           const nested = path.relative(root, target).split(path.sep).join('/');
-          const relative = `profiles/${profile.id}/${resource}/${nested}`;
-          if (!manifest.files[relative]) {
-            await backupAndRemove(target, path.join(backupRoot, profile.id, resource, ...nested.split('/')));
+          if (!manifest.files[`${prefix}${nested}`]) {
+            await backupAndRemove(target, path.join(backupRoot, remoteId, resource, ...nested.split('/')));
             changedFiles.push(target);
           }
         }
+        for (const relative of Object.keys(manifest.files)) {
+          if (!relative.startsWith(prefix)) continue;
+          const normalized = normalizeRelative(relative);
+          // 扩展清单由 IDE 自己维护，绝不能写回本机。
+          if (path.posix.basename(normalized) === HOST_EXTENSIONS_FILE) continue;
+          const target = resolveInside(root, normalized.slice(prefix.length));
+          await this.writeFromSnapshot(hostRoot, normalized, target, false, changedFiles);
+        }
       }
     }
-    for (const relative of Object.keys(manifest.files)) {
-      const normalized = normalizeRelative(relative);
-      // 扩展清单由 IDE 自己维护，只用来决定装哪些扩展，绝不能写回本机。
-      // 旧版本的云端快照里还带 Profile 级 extensions.json（记录的是本机启用状态），一并跳过。
-      if (normalized === HOST_EXTENSIONS_FILE || normalized.endsWith(`/${HOST_EXTENSIONS_FILE}`)) continue;
-      const parts = normalized.split('/');
-      if (parts[0] !== 'profiles' || parts.length < 3) {
-        throw new Error(`快照包含非法路径：${relative}`);
+    if (!options.profileNames) {
+      for (const hostFile of this.hostFiles) {
+        const relative = `${HOST_FILE_DIRECTORY}/${hostFile.name}`;
+        // 云端没有时保留本机：旧版本的快照不含宿主级文件，不能据此删除本机配置。
+        if (!manifest.files[relative]) continue;
+        await this.writeFromSnapshot(hostRoot, relative, hostFile.path, false, changedFiles);
       }
-      const profile = localById.get(parts[1] ?? '');
-      if (!profile) {
-        continue;
-      }
-      const resourcePath = parts.slice(2).join(path.sep);
-      const target = resolveInside(profile.location, resourcePath);
-      const source = resolveInside(hostRoot, normalized);
-      const sourceContent = await stableRead(source);
-      const currentContent = await fs.readFile(target).catch(() => undefined);
-      const localContent = this.prepareForLocal(relative, sourceContent, currentContent);
-      if (currentContent?.equals(localContent)) {
-        continue;
-      }
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await atomicWrite(target, localContent, this.stagingPath);
-      changedFiles.push(target);
     }
     await pruneBackups(backupsRoot);
-    return {
-      changedFiles,
-      structuralChange,
-      structuralApplied: applyStructure,
-      ...(structuralChange && !applyStructure
-        ? { message: '已按云端覆盖共有 Profile 的配置；远程包含 Profile 增删，只剩一个窗口时会自动应用。' }
-        : {}),
-    };
+    return { changedFiles, missingProfiles, localOnlyProfiles };
   }
 
-  private async restoreProfileStructure(manifest: SnapshotManifest): Promise<void> {
-    const metadata = resolveProfileMetadata(manifest);
-    const locations = metadata.map((profile) => profile.location);
-    if (!locations.every((location) => typeof location === 'string' && isSafeSegment(location))) {
-      throw new Error('远程 Profile 元数据包含非法目录。');
-    }
-    const expected = new Set(manifest.profiles.filter((profile) => !profile.isDefault).map((profile) => profile.id));
-    if (!setsEqual(expected, new Set(locations as string[]))) {
-      throw new Error('远程 Profile 清单与元数据不一致。');
-    }
-    const storagePath = path.join(this.environment.userDataPath, 'globalStorage', 'storage.json');
-    const profilesPath = path.join(this.environment.userDataPath, 'profiles');
-    const backupRoot = path.join(this.environment.runtimePath, 'backups', `structure-${new Date().toISOString().replaceAll(':', '-')}`);
-    await fs.mkdir(backupRoot, { recursive: true });
-    await fs.copyFile(storagePath, path.join(backupRoot, 'storage.json'));
-    if (await pathExists(profilesPath)) await fs.cp(profilesPath, path.join(backupRoot, 'profiles'), { recursive: true });
+  /** 本机某个 Profile 文件在快照中对应的条目；快捷键优先取本平台的，没有时兼容旧快照的单份文件。 */
+  private cloudFileFor(manifest: SnapshotManifest, remoteId: string, resource: string): string | undefined {
+    const candidates = resource === KEYBINDINGS_FILE
+      ? [`profiles/${remoteId}/${this.keybindingsName}`, `profiles/${remoteId}/${KEYBINDINGS_FILE}`]
+      : [`profiles/${remoteId}/${resource}`];
+    return candidates.find((relative) => manifest.files[relative] !== undefined);
+  }
 
-    const storage = await this.readStorage();
-    storage.userDataProfiles = metadata as StoredProfile[];
-    await atomicWrite(storagePath, Buffer.from(`${JSON.stringify(storage, null, 2)}\n`, 'utf8'), this.stagingPath);
-    const allowed = new Set(locations as string[]);
-    for (const entry of await fs.readdir(profilesPath).catch(() => [])) {
-      if (!allowed.has(entry)) await fs.rm(path.join(profilesPath, entry), { recursive: true, force: true });
-    }
-    for (const location of allowed) await fs.mkdir(path.join(profilesPath, location), { recursive: true });
+  private async writeFromSnapshot(
+    hostRoot: string,
+    relative: string,
+    target: string,
+    settings: boolean,
+    changedFiles: string[],
+  ): Promise<void> {
+    const source = resolveInside(hostRoot, normalizeRelative(relative));
+    const sourceContent = await stableRead(source);
+    const currentContent = await fs.readFile(target).catch(() => undefined);
+    const localContent = this.prepareForLocal(settings, sourceContent, currentContent);
+    if (currentContent?.equals(localContent)) return;
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await atomicWrite(target, localContent, this.stagingPath);
+    changedFiles.push(target);
   }
 
   private async snapshotFile(
-    sourceRoot: string,
+    source: string,
     resource: string,
-    targetRoot: string,
+    stagingRoot: string,
+    relative: string,
     files: Record<string, string>,
-    profileId: string
   ): Promise<void> {
-    const source = path.join(sourceRoot, resource);
     const content = await stableRead(source).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return undefined;
       throw error;
     });
     if (!content) return;
     const portableContent = this.prepareForRepository(resource, content);
-    const target = path.join(targetRoot, resource);
+    const target = path.join(stagingRoot, ...relative.split('/'));
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, portableContent);
-    files[`profiles/${profileId}/${resource}`] = sha256(portableContent);
+    files[relative] = sha256(portableContent);
   }
 
   private async snapshotDirectory(
@@ -279,7 +283,7 @@ export class ProfileAdapter {
     const sorted = (await collectFiles(root)).sort((left, right) => left.localeCompare(right));
     for (const absolute of sorted) {
       const relative = path.relative(root, absolute);
-      const content = normalizeLineEndings(await stableRead(absolute));
+      const content = this.prepareForRepository(resource, await stableRead(absolute));
       const target = path.join(targetRoot, resource, relative);
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, content);
@@ -290,16 +294,26 @@ export class ProfileAdapter {
   /**
    * 本机用户安装的扩展标识，来自扩展目录的清单文件。
    * 内置扩展不在该文件中，因此这份列表可以安全地用于判断哪些扩展需要卸载。
+   * 指纹检测每隔几秒就要读一次，文件没变时直接复用上次的解析结果。
    */
   public async listInstalledExtensionIds(): Promise<string[]> {
     const manifestPath = this.environment.extensionsManifestPath;
     if (!manifestPath) return [];
+    const stat = await fs.stat(manifestPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (!stat) return [];
+    const cached = this.installedExtensionsCache;
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return [...cached.ids];
     const content = await stableRead(manifestPath).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return undefined;
       throw error;
     });
     if (!content) return [];
-    return sortExtensionIds(parseExtensionIds(content.toString('utf8')));
+    const ids = sortExtensionIds(parseExtensionIds(content.toString('utf8')));
+    this.installedExtensionsCache = { mtimeMs: stat.mtimeMs, size: stat.size, ids };
+    return [...ids];
   }
 
   /**
@@ -326,19 +340,34 @@ export class ProfileAdapter {
     return path.join(this.environment.runtimePath, 'staging');
   }
 
+  private get keybindingsName(): string {
+    return `keybindings.${this.environment.platform ?? process.platform}.json`;
+  }
+
+  private get hostFiles(): NonNullable<HostEnvironment['hostFiles']> {
+    return this.environment.hostFiles ?? [];
+  }
+
   private prepareForRepository(resource: string, content: Buffer): Buffer {
     const normalized = normalizeLineEndings(content);
-    // 插件自身设置由版本化配置记录负责收敛，随 settings.json 同步会与之互相覆盖。
-    if (resource === 'settings.json') return Buffer.from(stripPluginSettings(normalized.toString('utf8')), 'utf8');
+    // 插件自身设置与用户声明忽略的设置只属于本机，随 settings.json 同步会被另一台机器覆盖。
+    if (resource === SETTINGS_FILE) return Buffer.from(stripLocalSettings(normalized.toString('utf8')), 'utf8');
     return normalized;
   }
 
-  private prepareForLocal(relative: string, content: Buffer, current: Buffer | undefined): Buffer {
-    if (relative.endsWith('/settings.json')) {
-      return Buffer.from(restorePluginSettings(content.toString('utf8'), current?.toString('utf8') ?? ''), 'utf8');
-    }
-    return content;
+  private prepareForLocal(settings: boolean, content: Buffer, current: Buffer | undefined): Buffer {
+    const restored = settings
+      ? Buffer.from(restoreLocalSettings(content.toString('utf8'), current?.toString('utf8') ?? ''), 'utf8')
+      : content;
+    // 仓库统一存 LF；本机原来是 CRLF 时按 CRLF 写回，否则同步一次就会把用户文件的换行符整份改掉。
+    if (!current || !usesCrlf(current) || restored.includes(0)) return restored;
+    return Buffer.from(restored.toString('utf8').replace(/\r?\n/g, '\r\n'), 'utf8');
   }
+}
+
+/** 命名 Profile 在仓库中的目录名。名称可能含有文件系统不允许的字符，因此取哈希。 */
+function profileSnapshotId(name: string): string {
+  return `named-${sha256(Buffer.from(name, 'utf8')).slice(0, 16)}`;
 }
 
 async function stableRead(filePath: string): Promise<Buffer> {
@@ -353,10 +382,28 @@ async function stableRead(filePath: string): Promise<Buffer> {
   throw new Error(`配置文件持续变化，暂缓同步：${filePath}`);
 }
 
-/** 临时文件必须写在运行目录，否则崩溃残留会被快照当成用户配置提交到仓库。 */
+/**
+ * 临时文件必须写在运行目录，否则崩溃残留会被快照当成用户配置提交到仓库。
+ * 目标是软链接（用 dotfiles 仓库管理配置）时写到链接指向的文件：替换掉链接本身会让用户的 dotfiles 脱钩。
+ * 链接目标可能在另一个磁盘，跨盘不能重命名，因此临时文件放在目标旁边，名称带标记以便快照跳过。
+ */
 async function atomicWrite(target: string, content: Buffer, stagingRoot: string): Promise<void> {
-  await fs.mkdir(stagingRoot, { recursive: true });
   const token = `${process.pid}-${randomUUID()}`;
+  const link = await fs.lstat(target).catch(() => undefined);
+  if (link?.isSymbolicLink()) {
+    const real = await fs.realpath(target);
+    const temporary = `${real}${TEMPORARY_MARKER}${token}`;
+    await fs.writeFile(temporary, content);
+    try {
+      await fs.rename(temporary, real);
+    } catch (error) {
+      await fs.rm(temporary, { force: true });
+      throw error;
+    }
+    return;
+  }
+
+  await fs.mkdir(stagingRoot, { recursive: true });
   const temporary = path.join(stagingRoot, `write-${token}`);
   const previous = path.join(stagingRoot, `previous-${token}`);
   await fs.writeFile(temporary, content);
@@ -398,7 +445,7 @@ async function pathExists(filePath: string): Promise<boolean> {
 
 async function backupAndRemove(target: string, backup: string): Promise<void> {
   await fs.mkdir(path.dirname(backup), { recursive: true });
-  await fs.cp(target, backup, { recursive: true });
+  await fs.cp(target, backup, { recursive: true, dereference: true });
   await fs.rm(target, { recursive: true, force: true });
 }
 
@@ -419,15 +466,23 @@ function resolveInside(root: string, relative: string): string {
   return resolved;
 }
 
-/** 递归收集目录下的文件，并跳过旧版本原子写残留的临时文件，避免它们被同步到仓库。 */
+/**
+ * 递归收集目录下的文件，并跳过原子写残留的临时文件，避免它们被同步到仓库。
+ * 指向文件的软链接一并收集（dotfiles 管理的片段），指向目录的不跟随。
+ */
 async function collectFiles(root: string): Promise<string[]> {
   const entries = await fs.readdir(root, { recursive: true, withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return [];
     throw error;
   });
-  return entries
-    .filter((entry) => entry.isFile() && !entry.name.includes(TEMPORARY_MARKER))
-    .map((entry) => path.join(entry.parentPath ?? entry.path, entry.name));
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.includes(TEMPORARY_MARKER)) continue;
+    const absolute = path.join(entry.parentPath ?? entry.path, entry.name);
+    if (entry.isFile()) files.push(absolute);
+    else if (entry.isSymbolicLink() && (await fs.stat(absolute).catch(() => undefined))?.isFile()) files.push(absolute);
+  }
+  return files;
 }
 
 async function pruneBackups(backupsRoot: string): Promise<void> {
@@ -444,31 +499,50 @@ async function pruneBackups(backupsRoot: string): Promise<void> {
   }
 }
 
-/** 去掉本插件自身的设置项，保留原文的注释与格式。 */
-function stripPluginSettings(text: string): string {
-  return editPluginSettings(text, pluginSettingKeys(text).map((key) => [key, undefined]));
-}
-
-/** 写回本机时保留本机原有的插件设置，避免被不含这些键的仓库版本清空。 */
-function restorePluginSettings(text: string, current: string): string {
-  const parsed = parse(current, [], { allowTrailingComma: true }) as unknown;
+/** 去掉只属于本机的设置项，保留原文的注释与格式。 */
+function stripLocalSettings(text: string): string {
+  const parsed = parse(text, [], { allowTrailingComma: true }) as unknown;
   if (!isRecord(parsed)) return text;
-  const entries = Object.entries(parsed).filter(([key]) => key.startsWith(PLUGIN_SETTING_PREFIX));
-  return editPluginSettings(text, entries);
+  return editSettings(text, localSettingKeys(parsed).filter((key) => key in parsed).map((key) => [key, undefined]));
 }
 
-function editPluginSettings(text: string, entries: Array<[string, unknown]>): string {
+/**
+ * 写回本机时，只属于本机的设置项一律保持本机原值：本机有就恢复，本机没有就去掉仓库里带来的值。
+ * 忽略清单取两侧的并集，任一侧声明忽略的键都不应被另一侧覆盖。
+ */
+function restoreLocalSettings(text: string, current: string): string {
+  const currentParsed = parse(current, [], { allowTrailingComma: true }) as unknown;
+  const incomingParsed = parse(text, [], { allowTrailingComma: true }) as unknown;
+  const keys = new Set([...localSettingKeys(currentParsed), ...ignoredSettingKeys(incomingParsed)]);
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    const value = isRecord(currentParsed) ? currentParsed[key] : undefined;
+    if (value !== undefined || (isRecord(incomingParsed) && key in incomingParsed)) entries.push([key, value]);
+  }
+  return editSettings(text, entries);
+}
+
+/** 只属于本机的设置项：本插件自身的设置，以及 settingsSync.ignoredSettings 列出的键（沿用 IDE 内置同步的约定）。 */
+function localSettingKeys(parsed: unknown): string[] {
+  if (!isRecord(parsed)) return [];
+  const own = Object.keys(parsed).filter((key) => key.startsWith(PLUGIN_SETTING_PREFIX));
+  return [...new Set([...own, ...ignoredSettingKeys(parsed)])];
+}
+
+function ignoredSettingKeys(parsed: unknown): string[] {
+  if (!isRecord(parsed)) return [];
+  const ignored = parsed[IGNORED_SETTINGS_KEY];
+  if (!Array.isArray(ignored)) return [];
+  // 以 - 开头的写法表示取消 IDE 默认忽略的项，不是要忽略的键。
+  return ignored.filter((key): key is string => typeof key === 'string' && key.length > 0 && !key.startsWith('-'));
+}
+
+function editSettings(text: string, entries: Array<[string, unknown]>): string {
   let result = text;
   for (const [key, value] of entries) {
     result = applyEdits(result, modify(result, [key], value, {}));
   }
   return result;
-}
-
-function pluginSettingKeys(text: string): string[] {
-  const parsed = parse(text, [], { allowTrailingComma: true }) as unknown;
-  if (!isRecord(parsed)) return [];
-  return Object.keys(parsed).filter((key) => key.startsWith(PLUGIN_SETTING_PREFIX));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -500,16 +574,17 @@ function normalizeLineEndings(content: Buffer): Buffer {
   return Buffer.from(text.replaceAll('\r\n', '\n'), 'utf8');
 }
 
-function setsEqual(left: Set<string>, right: Set<string>): boolean {
-  return left.size === right.size && [...left].every((item) => right.has(item));
+function usesCrlf(content: Buffer): boolean {
+  return !content.includes(0) && content.toString('utf8').includes('\r\n');
 }
 
-/** 旧快照可能省略元数据；命名 Profile 的 id 就是磁盘目录名，可以按清单补全。 */
-function resolveProfileMetadata(manifest: SnapshotManifest): Array<Record<string, unknown>> {
-  if (manifest.profileMetadata) return manifest.profileMetadata;
-  return manifest.profiles
-    .filter((profile) => !profile.isDefault)
-    .map((profile) => ({ location: profile.id, name: profile.name }));
-}
-
-export const testing = { normalizeRelative, normalizeLineEndings, resolveInside, setsEqual, sha256, stripPluginSettings, restorePluginSettings, pruneBackups, resolveProfileMetadata };
+export const testing = {
+  normalizeRelative,
+  normalizeLineEndings,
+  resolveInside,
+  sha256,
+  profileSnapshotId,
+  stripLocalSettings,
+  restoreLocalSettings,
+  pruneBackups,
+};

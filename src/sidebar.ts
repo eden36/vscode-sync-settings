@@ -9,8 +9,8 @@ import {
   OutgoingMessage,
   parseMessage,
 } from './sidebar-messages';
-import { displayPhase, displayTone, modeLabel, modeNote, stageLabel } from './sidebar-status';
-import { RuntimeStatus, SyncMode } from './types';
+import { displayPhase, displayTone, modeLabel, modeNote, profileMismatchText, stageLabel } from './sidebar-status';
+import { ProfileMismatch, RuntimeStatus, SyncMode } from './types';
 
 const HISTORY_MESSAGES: string[] = ['loadHistory', 'loadMoreHistory', 'restoreCommit', 'createTag', 'deleteTag'];
 
@@ -32,6 +32,9 @@ export interface SidebarOptions {
   isEnabled: () => boolean;
   setEnabled: (enabled: boolean) => Promise<void>;
   onResolveConflict: (resolution: 'local' | 'cloud') => Promise<void>;
+  /** 当前等待处理的 Profile 差异，来自跨窗口共享的运行状态，follower 窗口同样能看到。 */
+  profileMismatch: () => ProfileMismatch | undefined;
+  onResolveProfiles: () => Promise<void>;
   history: HistoryHandlers;
 }
 
@@ -78,6 +81,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           await this.pushState();
         } else if (message.type === 'resolveConflict') {
           await this.options.onResolveConflict(message.resolution);
+          await this.pushState();
+        } else if (message.type === 'resolveProfiles') {
+          await this.options.onResolveProfiles();
           await this.pushState();
         } else if (message.type === 'setMode') {
           await this.applyMode(message.mode);
@@ -142,6 +148,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (!this.ready) return;
     const status = this.options.status();
     const configuration = this.options.configurationStore.get();
+    const mismatch = status.sync.kind === 'blocked' && status.sync.reason === 'profiles-mismatch'
+      ? this.options.profileMismatch()
+      : undefined;
     // 状态判定全部在此完成，Webview 脚本只负责按结果渲染。
     await this.post({
       type: 'state',
@@ -156,6 +165,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         ...(status.sync.kind === 'running' ? { stage: stageLabel(status.sync.stage) } : {}),
         // 判定放在这里：Webview 脚本只按结果显示或隐藏选择面板。
         needsChoice: status.sync.kind === 'blocked' && status.sync.reason === 'both-changed',
+        ...(mismatch ? { profileChoice: profileMismatchText(mismatch) } : {}),
       },
     });
   }
@@ -207,7 +217,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         '切换到同步模式',
         {
           modal: true,
-          detail: '同步模式会把仓库中的配置写回本机，覆盖本机对应的配置文件与扩展清单。若同时开启了 IDE 内置 Settings Sync，两者可能互相覆盖。',
+          detail: '同步模式会把仓库中的配置写回本机，覆盖本机对应的配置文件；本机尚未同步过时，首轮会整份采用云端配置。'
+            + '扩展会按云端清单安装，本机有而云端清单没有的扩展会被卸载。本机原配置会先备份到扩展运行目录。'
+            + '插件不会新建或删除 Profile，两侧 Profile 不一致时会暂停并请你处理。'
+            + '若同时开启了 IDE 内置 Settings Sync，两者可能互相覆盖。',
         },
         '切换到同步模式',
       );
@@ -241,13 +254,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 </div>
 <div class="status"><strong id="phase">正在加载</strong><div id="detail" class="muted"></div></div>
 <div id="choicePanel" class="status" hidden><strong>需要选择以哪一方为准</strong><div class="muted">本机与云端都有改动。选定一方后，另一份配置会先备份到扩展运行目录。</div><div><button id="chooseLocal" type="button">以本机为准</button><button id="chooseCloud" class="secondary" type="button">以云端为准</button></div></div>
+<div id="profilePanel" class="status" hidden><strong id="profileSummary"></strong><div id="profileDetail" class="muted"></div><div><button id="resolveProfiles" class="secondary" type="button"></button></div></div>
 <div class="toggle-row"><span>同步开关</span><button id="toggleEnabled" class="toggle-switch" type="button" role="switch" aria-checked="false" aria-label="正在加载"></button></div>
 <p class="muted">关闭后不创建本地仓库、不访问远程仓库，也不写回本机配置。</p>
 <div class="mode-switch" role="group" aria-label="运行模式"><button id="modeBackup" type="button" data-mode="backup" aria-pressed="false">备份模式</button><button id="modeSync" type="button" data-mode="sync" aria-pressed="false">同步模式</button></div>
 <p id="modeNote" class="muted"></p>
 <div class="repository-details"><div class="repository-item"><span>远程仓库</span><strong id="repositorySummary">正在加载</strong></div><div class="repository-item"><span>分支</span><strong id="branchSummary">正在加载</strong></div></div>
 <button id="editRepository" type="button">修改远程仓库</button>
-<dialog id="configurationDialog" class="configuration-dialog"><form id="configurationForm" novalidate><h2>配置同步仓库</h2><label for="repositoryUrl">配置同步仓库地址</label><input id="repositoryUrl" placeholder="git@github.com:user/settings.git"><label for="branch">分支</label><input id="branch"><div class="row"><div><label for="gitUserName">Git 用户名（可选）</label><input id="gitUserName" placeholder="留空使用本机配置"></div><div><label for="gitUserEmail">Git 邮箱（可选）</label><input id="gitUserEmail" type="email" placeholder="留空使用本机配置"></div></div><div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div><p class="muted">保存后会自动同步。同步模式下首次接入会以云端配置覆盖本机，原有配置会先备份；备份模式只把本机配置上传到仓库。</p><div class="dialog-actions"><button id="cancelConfiguration" class="secondary" type="button">取消</button><button id="saveConfiguration" type="submit">保存更改</button></div></form></dialog>
+<dialog id="configurationDialog" class="configuration-dialog"><form id="configurationForm" novalidate><h2>配置同步仓库</h2><label for="repositoryUrl">配置同步仓库地址</label><input id="repositoryUrl" placeholder="git@github.com:user/settings.git"><label for="branch">分支</label><input id="branch"><div class="row"><div><label for="gitUserName">Git 用户名（可选）</label><input id="gitUserName" placeholder="留空使用本机配置"></div><div><label for="gitUserEmail">Git 邮箱（可选）</label><input id="gitUserEmail" type="email" placeholder="留空使用本机配置"></div></div><div class="row"><div><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"></div><div><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div></div><p class="muted">保存后会自动同步。同步模式下首次接入会以云端配置覆盖本机并按云端清单装卸扩展，原有配置会先备份；备份模式只把本机配置上传到仓库。</p><div class="dialog-actions"><button id="cancelConfiguration" class="secondary" type="button">取消</button><button id="saveConfiguration" type="submit">保存更改</button></div></form></dialog>
 </div>
 <div id="historyPage" hidden>
   <div class="history-header"><button id="historyBack" class="icon-button" type="button" title="返回">←</button><strong>云端提交历史</strong><button id="historyRefresh" class="icon-button" type="button" title="刷新">↻</button></div>

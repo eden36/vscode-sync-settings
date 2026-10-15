@@ -8,12 +8,15 @@ import {
 } from '../src/extension-wait';
 import {
   resetExtensionStub,
+  installedExtensionIds,
   markExtensionInstalled,
   markExtensionInstallFailed,
   markExtensionUninstallFailed,
   installCommandCalls,
   uninstallCommandCalls,
 } from './vscode-stub';
+
+const options = { timeoutMs: 1_000, pollIntervalMs: 10, listInstalled: installedExtensionIds };
 
 test('解析 extensions.json 中的扩展标识', () => {
   assert.deepEqual(parseExtensionIds('[]'), []);
@@ -35,31 +38,51 @@ test('筛选待安装扩展时跳过已安装、需跳过和重复项', () => {
   assert.deepEqual(selectMissingExtensionIds([], ['a.b']), []);
 });
 
+test('扩展标识比较不区分大小写，写法不同不会卸了再装', () => {
+  assert.deepEqual(selectMissingExtensionIds(['GitHub.Copilot'], ['github.copilot']), []);
+  assert.deepEqual(selectRemovableExtensionIds(['github.copilot', 'drop.one'], ['GitHub.Copilot']), ['drop.one']);
+});
+
 test('同步后会调用 IDE 安装尚未存在的扩展', async () => {
   resetExtensionStub();
   extensionWaitTesting.resetSkippedInstallIds();
   markExtensionInstalled('already.present');
   const result = await installAndWaitForExtensions(
     ['already.present', 'ms-python.python', 'saltcoreyan.my-setting-sync'],
-    { timeoutMs: 1_000 },
+    options,
   );
-  assert.equal(result.converged, true);
-  assert.deepEqual(result.pending, []);
+  assert.deepEqual(result, { pending: [], failed: [] });
   assert.deepEqual(installCommandCalls, ['ms-python.python']);
 });
 
-test('扩展安装失败时不中断同步并记录未完成项', async () => {
+test('已在清单里的扩展即使被禁用也不再安装', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  // 禁用的扩展在 vscode.extensions 里查不到，但仍在扩展清单文件中，按清单判断就不会反复安装并空等。
+  const result = await installAndWaitForExtensions(['disabled.one'], { ...options, listInstalled: async () => ['disabled.one'] });
+  assert.deepEqual(result, { pending: [], failed: [] });
+  assert.deepEqual(installCommandCalls, []);
+});
+
+test('扩展安装失败时记为失败而不是待收敛，本进程内不再重试', async () => {
   resetExtensionStub();
   extensionWaitTesting.resetSkippedInstallIds();
   markExtensionInstallFailed('missing.one');
-  const result = await installAndWaitForExtensions(['missing.one', 'ok.two'], { timeoutMs: 1_000 });
-  assert.equal(result.converged, false);
-  assert.deepEqual(result.pending, ['missing.one']);
+  const result = await installAndWaitForExtensions(['missing.one', 'ok.two'], options);
+  // 装不上的扩展不能留在待收敛名单里，否则扩展清单会一直被排除在改动判定之外。
+  assert.deepEqual(result, { pending: [], failed: ['missing.one'] });
   assert.deepEqual(installCommandCalls, ['missing.one', 'ok.two']);
   installCommandCalls.length = 0;
-  const retry = await installAndWaitForExtensions(['missing.one', 'ok.two'], { timeoutMs: 1_000 });
-  assert.deepEqual(retry.pending, ['missing.one']);
+  const retry = await installAndWaitForExtensions(['missing.one', 'ok.two'], options);
+  assert.deepEqual(retry, { pending: [], failed: ['missing.one'] });
   assert.deepEqual(installCommandCalls, []);
+});
+
+test('安装命令成功但清单里迟迟没有出现时记为待收敛', async () => {
+  resetExtensionStub();
+  extensionWaitTesting.resetSkippedInstallIds();
+  const result = await installAndWaitForExtensions(['slow.one'], { ...options, timeoutMs: 50, listInstalled: async () => [] });
+  assert.deepEqual(result, { pending: ['slow.one'], failed: [] });
 });
 
 test('云端移除的扩展会在本机卸载', async () => {

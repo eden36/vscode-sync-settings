@@ -10,6 +10,8 @@ test('侧边栏消息解析拒绝越界参数与非法标识', () => {
   assert.equal(parseMessage({ type: 'toggleEnabled', enabled: 'true' }), undefined);
   assert.equal(parseMessage({ type: 'setMode', mode: 'merge' }), undefined);
   assert.equal(parseMessage({ type: 'resolveConflict', resolution: 'both' }), undefined);
+  // 处理哪一组 Profile 由扩展按共享状态决定，Webview 多带的字段不得随消息进入后续逻辑。
+  assert.deepEqual(parseMessage({ type: 'resolveProfiles', names: ['伪造'] }), { type: 'resolveProfiles' });
   assert.equal(parseMessage({ type: 'unknown' }), undefined);
   assert.equal(parseMessage(null), undefined);
 
@@ -60,7 +62,7 @@ test('状态栏只在同步执行阶段显示忙碌', () => {
   assert.equal(displayIcon({ kind: 'running', stage: 'pull' }, 'in-sync'), '$(sync~spin)');
   assert.equal(displayIcon({ kind: 'running', stage: 'ai' }, 'in-sync'), '$(sync~spin)');
   assert.equal(displayIcon({ kind: 'idle' }, 'in-sync'), '$(check)');
-  assert.equal(displayIcon({ kind: 'blocked', reason: 'other-windows' }, 'in-sync'), '$(question)');
+  assert.equal(displayIcon({ kind: 'blocked', reason: 'profiles-mismatch' }, 'in-sync'), '$(question)');
 });
 
 test('对外状态由链路状态和本地远端关系共同决定', () => {

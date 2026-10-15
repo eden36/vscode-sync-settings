@@ -13,10 +13,9 @@ export function finalSyncMessage(report: SyncReport): string {
   } else if (report.snapshotChoice === 'cloud') {
     notes.push('已按云端配置覆盖本机');
   }
-  if (report.structuralMessage) {
-    return `${[report.structuralMessage.replace(/。$/, ''), ...notes].join('；')}。`;
-  }
-  if (!report.changedFileCount && !notes.length) {
+  if (report.profileMessage) notes.push(report.profileMessage);
+  if (report.extensionsDeferred) notes.push('当前窗口不在默认 Profile，扩展将在默认 Profile 的窗口中同步');
+  if (!report.changedFileCount && !notes.length && !report.extensionsPending?.length && !report.extensionsFailed?.length) {
     if (report.recoveredFromDivergence) return '已重新对齐上次未推送成功的提交，配置已是最新。';
     return report.recoveredPendingChanges ? '已清理上次中断的暂存状态，配置已是最新。' : '配置已是最新。';
   }
@@ -25,6 +24,9 @@ export function finalSyncMessage(report: SyncReport): string {
   if (report.recoveredFromDivergence) notes.push('已重新对齐上次未推送成功的提交');
   if (report.extensionsPending?.length) {
     notes.push(`部分扩展尚未安装完成：${report.extensionsPending.join('、')}`);
+  }
+  if (report.extensionsFailed?.length) {
+    notes.push(`部分扩展无法安装或卸载，已跳过：${report.extensionsFailed.join('、')}`);
   }
   const done = report.mode === 'backup' ? '备份完成' : '同步完成';
   return notes.length ? `${done}（${notes.join('；')}）。` : `${done}。`;

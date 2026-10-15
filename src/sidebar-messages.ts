@@ -28,6 +28,8 @@ export type IncomingMessage =
   | { type: 'toggleEnabled'; enabled: boolean }
   | { type: 'setMode'; mode: SyncMode }
   | { type: 'resolveConflict'; resolution: 'local' | 'cloud' }
+  /** 确认对当前 Profile 差异的处理；处理哪一组由扩展按共享状态决定，消息本身不带参数。 */
+  | { type: 'resolveProfiles' }
   | { type: 'loadHistory'; limit: number; refresh: boolean }
   | { type: 'loadMoreHistory' }
   | { type: 'restoreCommit'; hash: string }
@@ -40,6 +42,8 @@ export interface DisplayStatus extends RuntimeStatus {
   tone: DisplayTone;
   stage?: string;
   needsChoice: boolean;
+  /** Profile 不一致时的处理面板文案；无需处理时缺省。 */
+  profileChoice?: { summary: string; detail: string; action: string };
 }
 
 /** 扩展发给 Webview 的消息。 */
@@ -70,6 +74,7 @@ export function parseMessage(raw: unknown): IncomingMessage | undefined {
       ? { type: 'resolveConflict', resolution: value.resolution }
       : undefined;
   }
+  if (value.type === 'resolveProfiles') return { type: 'resolveProfiles' };
   if (value.type === 'loadHistory') {
     const limit = value.limit;
     // 翻页靠 loadMoreHistory 累加，单次请求仍收在 HISTORY_LIMIT_MAX 内，同时挡掉 Infinity / NaN。

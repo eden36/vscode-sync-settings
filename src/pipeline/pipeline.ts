@@ -20,6 +20,7 @@ export async function runPipeline(context: SyncContext, stages: Stage[]): Promis
     // 不同源与「两边都改了」都无法靠重试解决，必须交回调度层询问用户，与其它可自动恢复的阻塞区分开。
     if (outcome.reason === 'unrelated') return { ok: false, unrelated: true, blockReason: 'unrelated' };
     if (outcome.reason === 'both-changed') return { ok: false, bothChanged: true, blockReason: 'both-changed' };
+    if (outcome.reason === 'profiles-mismatch') return { ok: false, profilesMismatch: true, blockReason: 'profiles-mismatch' };
     return { ok: false, retry: true, blockReason: outcome.reason };
   }
 
@@ -32,8 +33,6 @@ export async function runPipeline(context: SyncContext, stages: Stage[]): Promis
   });
   return {
     ok: true,
-    structuralApplied: report.structuralApplied,
-    waitingForWindows: report.waitingForWindows,
     ...(report.extensionsPending ? { extensionsPending: report.extensionsPending } : {}),
   };
 }

@@ -17,7 +17,21 @@ const SENSITIVE_ENV_KEY = /["'][A-Z0-9_]*(?:API_?KEY|ACCESS_?TOKEN|AUTH_?TOKEN|_
  */
 const HARMLESS_VALUE = /^\s*(?:null\b|(["'])(?:(?:Bearer\s+)?\$\{(?:input|env):[^}"']+\})?\1)/;
 
-const SENSITIVE_VALUE = /(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9\-_]{20,}|sk-[A-Za-z0-9\-_]{10,}|xox[baprs]-[A-Za-z0-9\-]+)/;
+/**
+ * 常见服务的凭据格式。前缀前必须是单词边界：否则 task-runner-config、disk-cleanup-script 这类普通文本
+ * 也会因为含有 sk- 被当成凭据，导致整轮同步被拒绝。
+ */
+const SENSITIVE_VALUE = new RegExp([
+  String.raw`\bghp_[A-Za-z0-9]{20,}`,
+  String.raw`\bgithub_pat_[A-Za-z0-9_]{20,}`,
+  String.raw`\bglpat-[A-Za-z0-9\-_]{20,}`,
+  String.raw`\bsk-[A-Za-z0-9\-_]{10,}`,
+  String.raw`\bxox[baprs]-[A-Za-z0-9\-]+`,
+  String.raw`\bAKIA[0-9A-Z]{16}\b`,
+  String.raw`\bAIza[0-9A-Za-z\-_]{35}`,
+  String.raw`-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----`,
+  String.raw`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`,
+].join('|'));
 
 /**
  * 扫描快照中的全部文件，不按扩展名筛选。

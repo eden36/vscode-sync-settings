@@ -11,7 +11,7 @@ const COMMIT_SUBJECT_LIMIT = 120;
 const exportHistoryStage: Stage = {
   name: 'export-history',
   async run(context: SyncContext): Promise<StageOutcome> {
-    const { git, adapter, environment, windowSafety } = context.dependencies;
+    const { git, environment } = context.dependencies;
     const { repositoryHostRoot, temporaryRoot } = context.paths;
     const target = requireValue(context.restoreTarget, 'restoreTarget');
 
@@ -26,20 +26,10 @@ const exportHistoryStage: Stage = {
     const secretFiles = await findPotentialSecrets(historyRoot, manifest);
     if (secretFiles.length) throw new Error(`检测到可能包含凭据的配置，已拒绝还原：${secretFiles.join('、')}`);
 
-    // Profile 增删只有在单窗口时才能写入本机；提前判定，避免推送出本机并未应用的状态。
-    const localIds = new Set((await adapter.listProfiles()).map((profile) => profile.id));
-    const historyIds = new Set(manifest.profiles.map((profile) => profile.id));
-    if (!setsEqual(localIds, historyIds) && (await windowSafety()).activeWindows > 1) {
-      return {
-        kind: 'blocked',
-        reason: 'other-windows',
-        message: '历史快照包含 Profile 增删，需要只剩一个窗口才能还原。关闭其他窗口后请重新执行还原。',
-      };
-    }
-
     const subject = target.subject.slice(0, COMMIT_SUBJECT_LIMIT);
     context.artifacts.commitMessage = subject ? `还原到 ${target.shortHash}：${subject}` : `还原到 ${target.shortHash}`;
     // 历史快照取代了「本机这一方」：仓库内容由它整份替换，后续按采用本机处理，照常推送与写回。
+    // 历史里有、本机没有的 Profile 不写回（插件不新建 Profile），但仍随历史快照推上云端，下一轮同步会请用户处理。
     context.artifacts.choice = 'local';
     context.report.snapshotChoice = 'local';
 
@@ -50,23 +40,9 @@ const exportHistoryStage: Stage = {
   },
 };
 
-/** 与同步流程相反：还原先写回本机，确认落地后才推送，否则云端会记下本机没有应用的状态。 */
-const restorePushStage: Stage = {
-  name: 'push',
-  async run(context: SyncContext): Promise<StageOutcome> {
-    if (context.report.waitingForWindows) {
-      return {
-        kind: 'blocked',
-        reason: 'other-windows',
-        message: '本机 Profile 结构未能应用，已放弃推送，请关闭其他窗口后重新还原。',
-      };
-    }
-    return pushStage.run(context);
-  },
-};
-
 /**
  * 还原流程：对齐远端 → 导出历史快照 → 写回本机与扩展 → 在远端 tip 上追加一条新提交 → 记录基准。
+ * 与同步流程相反，先写回本机、确认落地后才推送，否则云端会记下本机没有应用的状态。
  * 开头的 snapshot 只为拿到本机指纹与清单（写回前的二次确认、finalize 的基准都要用），不参与判定。
  */
 export const RESTORE_STAGES: Stage[] = [
@@ -76,12 +52,8 @@ export const RESTORE_STAGES: Stage[] = [
   exportHistoryStage,
   applyStage,
   extensionsStage,
-  restorePushStage,
+  pushStage,
   finalizeStage,
 ];
 
-export const testing = { exportHistoryStage, restorePushStage };
-
-function setsEqual(left: Set<string>, right: Set<string>): boolean {
-  return left.size === right.size && [...left].every((value) => right.has(value));
-}
+export const testing = { exportHistoryStage };

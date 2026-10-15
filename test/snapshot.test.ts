@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
-import { parseManifest, readManifest, snapshotDigest } from '../src/snapshot-conflict';
+import { isOtherPlatformFile, parseManifest, readManifest, snapshotDigest } from '../src/snapshot-conflict';
 import { SnapshotManifest } from '../src/types';
 import { testManifest } from './helpers';
 
@@ -24,7 +24,9 @@ test('快照清单缺字段或类型不符时拒绝解析', () => {
     schemaVersion: 1, host: 'vscode', createdAt: '', profiles: [{ id: 'default', name: '默认', isDefault: true }], files: {},
   };
   assert.equal(parseManifest(valid)?.host, 'vscode');
-  assert.equal(parseManifest({ ...valid, schemaVersion: 2 }), undefined);
+  assert.equal(parseManifest({ ...valid, schemaVersion: 2 })?.schemaVersion, 2);
+  assert.equal(parseManifest({ ...valid, host: 'vscode-insiders' })?.host, 'vscode-insiders');
+  assert.equal(parseManifest({ ...valid, schemaVersion: 3 }), undefined);
   assert.equal(parseManifest({ ...valid, host: 'sublime' }), undefined);
   assert.equal(parseManifest({ ...valid, profiles: [{ id: 'x' }] }), undefined);
   assert.equal(parseManifest({ ...valid, files: { 'a.json': 12 } }), undefined);
@@ -41,7 +43,19 @@ test('快照清单丢弃工作区关联，指纹不受其影响', () => {
   if (!local || !cloud) throw new Error('清单应当解析成功');
   assert.equal('profileAssociations' in local, false);
   // 旧版本推上去的快照仍带这个字段，解析时丢弃即可，两侧指纹要相同。
-  assert.equal(snapshotDigest(local).snapshot, snapshotDigest(cloud).snapshot);
+  assert.equal(snapshotDigest(local, 'win32').snapshot, snapshotDigest(cloud, 'win32').snapshot);
+});
+
+test('快照指纹只比较本平台的快捷键', () => {
+  const windows = testManifest({ 'profiles/default/keybindings.win32.json': 'w' });
+  const both = testManifest({ 'profiles/default/keybindings.win32.json': 'w', 'profiles/default/keybindings.darwin.json': 'm' });
+  // 本机既不写回也不采集其他平台的快捷键，算进来会让两侧永远不一致。
+  assert.equal(snapshotDigest(windows, 'win32').snapshot, snapshotDigest(both, 'win32').snapshot);
+  assert.notEqual(snapshotDigest(windows, 'darwin').snapshot, snapshotDigest(both, 'darwin').snapshot);
+  assert.equal(isOtherPlatformFile('profiles/default/keybindings.darwin.json', 'win32'), true);
+  assert.equal(isOtherPlatformFile('profiles/default/keybindings.win32.json', 'win32'), false);
+  assert.equal(isOtherPlatformFile('profiles/default/keybindings.json', 'win32'), false);
+  assert.equal(isOtherPlatformFile('profiles/default/snippets/keybindings.darwin.json', 'win32'), false);
 });
 
 test('快照指纹忽略键序与采集时间，扩展清单单独记录', () => {
@@ -53,11 +67,11 @@ test('快照指纹忽略键序与采集时间，扩展清单单独记录', () =>
     files: { 'extensions.json': 'e2', 'profiles/default/settings.json': 'x' },
   };
   // 两台机器写出的元数据键序可能不同，内容其实一样，不归一就会被判成改动。
-  assert.equal(snapshotDigest(left).snapshot, snapshotDigest(right).snapshot);
-  assert.equal(snapshotDigest(left).extensions, 'e1');
-  assert.equal(snapshotDigest(right).extensions, 'e2');
+  assert.equal(snapshotDigest(left, 'win32').snapshot, snapshotDigest(right, 'win32').snapshot);
+  assert.equal(snapshotDigest(left, 'win32').extensions, 'e1');
+  assert.equal(snapshotDigest(right, 'win32').extensions, 'e2');
   assert.notEqual(
-    snapshotDigest(testManifest({ 'profiles/default/settings.json': 'y' })).snapshot,
-    snapshotDigest(left).snapshot,
+    snapshotDigest(testManifest({ 'profiles/default/settings.json': 'y' }), 'win32').snapshot,
+    snapshotDigest(left, 'win32').snapshot,
   );
 });

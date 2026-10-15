@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import type * as vscode from 'vscode';
 import { ConfigurationRepositoryGitService } from '../src/git-service';
 import { ProfileAdapter } from '../src/profile-adapter';
-import { DEFAULT_RUNTIME_STATE, RuntimeStateStore } from '../src/runtime-state';
+import { DEFAULT_RUNTIME_STATE, RuntimeStateRecord, RuntimeStateStore } from '../src/runtime-state';
 import { AiService } from '../src/ai';
 import { SyncContext, SyncDependencies } from '../src/pipeline/types';
 import { createMachine, SchedulerMachine } from '../src/scheduler';
@@ -85,7 +85,8 @@ export async function chooseContext(
   cloudManifest: SnapshotManifest,
   baseline: SyncBaseline,
   resolution?: 'local' | 'cloud',
-): Promise<{ context: SyncContext; conflictBackupRoot: string }> {
+  options: { state?: Partial<RuntimeStateRecord>; dependencies?: Partial<SyncDependencies> } = {},
+): Promise<{ context: SyncContext; conflictBackupRoot: string; updates: Array<Partial<RuntimeStateRecord>> }> {
   const localHostRoot = path.join(root, 'tmp', 'vscode');
   const repositoryHostRoot = path.join(root, 'repository', 'vscode');
   const conflictBackupRoot = path.join(root, 'conflict-backups');
@@ -93,6 +94,7 @@ export async function chooseContext(
   await mkdir(repositoryHostRoot, { recursive: true });
   await writeFile(path.join(localHostRoot, 'manifest.json'), JSON.stringify(localManifest));
   await writeFile(path.join(repositoryHostRoot, 'manifest.json'), JSON.stringify(cloudManifest));
+  const updates: Array<Partial<RuntimeStateRecord>> = [];
   const context = stageContext({
     artifacts: { strategy: 'merge', remoteExists: true, localManifest },
     ...(resolution ? { resolution } : {}),
@@ -100,12 +102,27 @@ export async function chooseContext(
     dependencies: stageDependencies({
       conflictBackupRoot,
       runtimeState: {
-        get: () => ({ ...DEFAULT_RUNTIME_STATE, baseline }),
-        update: async () => undefined,
+        get: () => ({ ...DEFAULT_RUNTIME_STATE, baseline, ...options.state }),
+        update: async (patch: Partial<RuntimeStateRecord>) => { updates.push(patch); },
       } as unknown as RuntimeStateStore,
+      ...options.dependencies,
     }),
   });
-  return { context, conflictBackupRoot };
+  return { context, conflictBackupRoot, updates };
+}
+
+/** 带命名 Profile 的测试清单；命名 Profile 的 id 只是测试里的占位，真实 id 由名称派生。 */
+export function profileManifest(names: string[], files: Record<string, string> = {}): SnapshotManifest {
+  return {
+    schemaVersion: 2,
+    host: 'vscode',
+    createdAt: '',
+    profiles: [
+      { id: 'default', name: '默认', isDefault: true },
+      ...names.map((name) => ({ id: `named-${name}`, name, isDefault: false })),
+    ],
+    files,
+  };
 }
 
 export function leaderMachine(): SchedulerMachine {
@@ -114,7 +131,7 @@ export function leaderMachine(): SchedulerMachine {
 
 export function stageDependencies(overrides: Partial<SyncDependencies> = {}): SyncDependencies {
   return {
-    environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime' },
+    environment: { kind: 'vscode', userDataPath: '/user-data', runtimePath: '/runtime', platform: 'win32' },
     adapter: {} as unknown as ProfileAdapter,
     git: fakeGit({}),
     ai: {} as unknown as AiService,

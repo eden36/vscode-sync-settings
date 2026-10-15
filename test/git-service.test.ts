@@ -49,6 +49,39 @@ test('Git 服务通过普通快进推送同步宿主目录', async () => {
   }
 });
 
+test('远端探测只在远端分支前进时报告变化', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-remote-probe-'));
+  const remote = path.join(root, 'remote.git');
+  const configuration: SyncConfiguration = { repositoryUrl: remote, branch: 'main', gitUserName: '测试用户', gitUserEmail: 'test@example.com' };
+  try {
+    assert.equal((await runProcess('git', ['init', '--bare', remote])).exitCode, 0);
+    const first = new ConfigurationRepositoryGitService(path.join(root, 'first'));
+    const second = new ConfigurationRepositoryGitService(path.join(root, 'second'));
+    // 还没有本地仓库时无从比较，交给完整的一轮。
+    assert.equal(await second.remoteChanged(configuration), true);
+
+    await first.prepare(configuration);
+    const hostRoot = path.join(first.repositoryPath, '.profile-git-sync', 'hosts', 'vscode');
+    await mkdir(hostRoot, { recursive: true });
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":1}');
+    await first.stageHost('vscode');
+    await first.commitAndPush(configuration, 'feat: 初始化');
+
+    await second.prepare(configuration);
+    await second.pull(configuration);
+    assert.equal(await second.remoteChanged(configuration), false);
+
+    await writeFile(path.join(hostRoot, 'manifest.json'), '{"schemaVersion":2}');
+    await first.stageHost('vscode');
+    await first.commitAndPush(configuration, 'feat: 更新');
+    assert.equal(await second.remoteChanged(configuration), true);
+    // 探测是只读的，不会顺手把本地跟踪分支拉到最新。
+    assert.equal(await second.remoteChanged(configuration), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('准备仓库时清除上一次 Git 进程残留的索引锁', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-index-lock-'));
   const remote = path.join(root, 'remote.git');

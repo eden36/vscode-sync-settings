@@ -25,6 +25,8 @@ export interface SchedulerMachine {
   cloudAdoptPrompted: boolean;
   /** 「两边都改了」同样只问一次；用户不选就一直暂停，不写任何一侧。 */
   choicePrompted: boolean;
+  /** Profile 不一致也只弹一次；之后的处理入口在侧边栏。 */
+  profilesPrompted: boolean;
 }
 
 export type SchedulerEvent =
@@ -47,10 +49,10 @@ export type SchedulerCommand =
   | { type: 'cancel-retry' }
   | { type: 'prompt-cloud-adopt' }
   | { type: 'prompt-version-choice' }
+  | { type: 'prompt-profile-choice' }
   | { type: 'start-schedules' }
   | { type: 'stop-schedules' }
-  | { type: 'complete-sync-requests' }
-  | { type: 'reload-window' };
+  | { type: 'complete-sync-requests' };
 
 export interface SchedulerTransition {
   next: SchedulerMachine;
@@ -72,6 +74,7 @@ export function createMachine(options: {
     retryAttempt: 0,
     cloudAdoptPrompted: false,
     choicePrompted: false,
+    profilesPrompted: false,
   };
 }
 
@@ -85,7 +88,7 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
       if (machine.enabled === event.enabled) return unchanged(machine);
       if (!event.enabled) {
         // 同步中途关闭不打断当前这一轮，否则可能停在已提交未推送的中间态。
-        const next = { ...machine, enabled: false, pending: false, cloudAdoptPrompted: false, choicePrompted: false };
+        const next = { ...machine, enabled: false, pending: false, cloudAdoptPrompted: false, choicePrompted: false, profilesPrompted: false };
         if (machine.sync.kind === 'running') return { next, commands: [{ type: 'stop-schedules' }, { type: 'cancel-retry' }] };
         return {
           next: { ...next, sync: { kind: 'disabled' }, retryAttempt: 0 },
@@ -99,6 +102,7 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
         retryAttempt: 0,
         cloudAdoptPrompted: false,
         choicePrompted: false,
+        profilesPrompted: false,
       };
       const commands: SchedulerCommand[] = [{ type: 'start-schedules' }];
       if (machine.configured && machine.isLeader) commands.push({ type: 'start-sync', adoptCloud: false });
@@ -112,6 +116,7 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
         // 换了仓库或分支，之前的不同源与择一判断都不再适用，允许重新询问。
         cloudAdoptPrompted: event.repositoryChanged ? false : machine.cloudAdoptPrompted,
         choicePrompted: event.repositoryChanged ? false : machine.choicePrompted,
+        profilesPrompted: event.repositoryChanged ? false : machine.profilesPrompted,
       };
       if (machine.sync.kind === 'running') return { next, commands: [] };
       if (event.repositoryChanged && machine.sync.kind === 'blocked' && machine.sync.reason === 'unrelated') {
@@ -199,6 +204,7 @@ export function reduce(machine: SchedulerMachine, event: SchedulerEvent): Schedu
           link: 'no-repository',
           cloudAdoptPrompted: false,
           choicePrompted: false,
+          profilesPrompted: false,
           sync: resolveIdleState(machine.enabled, machine.configured),
         },
         commands: [],
@@ -246,6 +252,18 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
     return { next: { ...next, choicePrompted: true }, commands: [{ type: 'prompt-version-choice' }] };
   }
 
+  // 用户新建或删除了 Profile 就能解除，因此之后的同步请求照常开跑，只是不再重复弹窗。
+  if (outcome.profilesMismatch) {
+    const next: SchedulerMachine = {
+      ...machine,
+      sync: { kind: 'blocked', reason: 'profiles-mismatch' },
+      pending: false,
+      retryAttempt: 0,
+    };
+    if (machine.profilesPrompted) return { next, commands: [] };
+    return { next: { ...next, profilesPrompted: true }, commands: [{ type: 'prompt-profile-choice' }] };
+  }
+
   if (outcome.unrelated) {
     const next: SchedulerMachine = {
       ...machine,
@@ -276,18 +294,14 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
   const settled: SchedulerCommand[] = machine.retryAttempt > 0 ? [{ type: 'cancel-retry' }] : [];
   const next: SchedulerMachine = {
     ...machine,
-    sync: outcome.waitingForWindows ? { kind: 'blocked', reason: 'other-windows' } : { kind: 'idle' },
+    sync: { kind: 'idle' },
     link: 'in-sync',
     pending: false,
     retryAttempt: 0,
     cloudAdoptPrompted: false,
     choicePrompted: false,
+    profilesPrompted: false,
   };
-  // 窗口即将重载，此时再开一轮同步会被中途掐断，可能留下已提交未推送的中间态。
-  // 排队中的请求不在这里消费，重载后由 leader 重新认领并触发启动同步。
-  if (outcome.structuralApplied) {
-    return { next: { ...next, pending: false }, commands: [...settled, { type: 'reload-window' }] };
-  }
   if (machine.pending && machine.isLeader) {
     return {
       next: { ...next, sync: { kind: 'running', stage: 'snapshot' } },
@@ -316,9 +330,10 @@ function isResolvedBlock(reason: BlockReason, safety: WindowSafetySnapshot): boo
   switch (reason) {
     case 'dirty-windows': return safety.dirtyWindows === 0;
     case 'unreadable-windows': return safety.unreadableWindows === 0;
-    case 'other-windows': return safety.activeWindows <= 1;
     case 'unrelated':
     case 'both-changed':
+    // 由用户新建、删除 Profile 或在侧边栏确认后解除，与窗口状态无关。
+    case 'profiles-mismatch':
     // 本机在同步期间被改动：本机检测的下一拍会重新发起，窗口状态变化与它无关。
     case 'local-changed':
     case 'exclusive-lock':

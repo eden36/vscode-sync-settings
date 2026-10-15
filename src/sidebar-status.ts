@@ -1,4 +1,4 @@
-import { BlockReason, LinkState, StageName, SyncMode, SyncState } from './types';
+import { BlockReason, LinkState, ProfileMismatch, StageName, SyncMode, SyncState } from './types';
 
 export type DisplayPhase = '已关闭' | '未配置' | '未同步' | '同步中' | '已同步' | '同步失败' | '需要处理';
 export type DisplayTone = 'success' | 'running' | 'warning' | 'error' | 'muted';
@@ -61,7 +61,7 @@ export function modeLabel(mode: SyncMode): string {
 
 export function modeNote(mode: SyncMode): string {
   return mode === 'sync'
-    ? '同步模式会把仓库内容写回本机；与 IDE 内置 Settings Sync 同时开启时，两者可能互相覆盖。'
+    ? '同步模式会把仓库内容写回本机并按云端清单装卸扩展；不会新建或删除 Profile。与 IDE 内置 Settings Sync 同时开启时，两者可能互相覆盖。'
     : '备份模式只把本机配置提交到仓库，不会写回本机，适合已经开启 IDE 内置 Settings Sync 的宿主。';
 }
 
@@ -69,10 +69,29 @@ export function blockReasonLabel(reason: BlockReason): string {
   switch (reason) {
     case 'dirty-windows': return '有窗口存在未保存的配置文件，保存后会自动继续。';
     case 'unreadable-windows': return '有窗口状态无法确认，已暂停同步。';
-    case 'other-windows': return 'Profile 增删需要在只剩一个窗口时应用，关闭其他窗口后会自动继续。';
+    case 'profiles-mismatch': return '本机与云端的 Profile 不一致，已暂停同步，请处理后继续。';
     case 'unrelated': return '本地配置同步仓库与远端仓库不同源，已停止同步，避免覆盖云端配置。';
     case 'both-changed': return '本机与云端都有改动，已暂停同步，请选择以哪一方为准。';
     case 'local-changed': return '同步期间本机配置发生了变化，本轮未写回，稍后会重新开始一轮。';
     case 'exclusive-lock': return '另一窗口正在执行同步，稍后将自动重试。';
   }
+}
+
+/** Profile 差异的提示文案：summary 用于状态说明，detail 说明两种处理方式，action 是需要用户确认的那一种。 */
+export function profileMismatchText(mismatch: ProfileMismatch): { summary: string; detail: string; action: string } {
+  const names = mismatch.names.join('、');
+  if (mismatch.kind === 'cloud-only') {
+    return {
+      summary: `云端有本机没有的 Profile：${names}，已暂停同步。`,
+      detail: '插件不会自动新建 Profile。在本机新建同名 Profile 后会自动套用云端配置并继续同步；'
+        + '也可以从云端删除这些 Profile，其他机器上的同名 Profile 不受影响，历史提交中仍可找回。不处理则一直暂停。',
+      action: '从云端删除',
+    };
+  }
+  return {
+    summary: `本机的 Profile 已在云端被删除：${names}，已暂停同步。`,
+    detail: '插件不会删除本机 Profile。如果不再需要，请在本机手动删除这些 Profile，删除后会自动继续同步；'
+      + '也可以选择保留，保留的 Profile 会随本机下次改动重新上传到云端。不处理则一直暂停。',
+    action: '保留本机 Profile',
+  };
 }

@@ -16,18 +16,26 @@ import {
   SchedulerEvent,
 } from './scheduler';
 import { SidebarProvider } from './sidebar';
+import { profileMismatchText } from './sidebar-status';
 import { reportActivationFailure, SyncStatusBar } from './status-bar';
 import { SyncEngine } from './sync-engine';
 import { SyncSchedules } from './sync-schedules';
 import { RuntimeStatus, SyncOutcome } from './types';
 
 const CONFIGURATION_POLL_MS = 5_000;
+/** 通过「打开用户设置 (JSON)」等入口打开的配置文件使用这个协议，而不是 file。 */
+const USER_DATA_SCHEME = 'vscode-userdata';
 
 /** 初始化成功后才有值；激活失败时没有任何需要清理的定时器与协调器状态。 */
 let shutdown: (() => Promise<void>) | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const environment = detectHost(context);
+  if (!environment) {
+    // 识别不了宿主就无法确定云端目录，归到别的宿主名下会与它互相覆盖快照、反复装卸扩展。纯内存判断，不涉及 IO。
+    reportActivationFailure(context, new Error(`暂不支持 ${vscode.env.appName}，配置同步未启动。`));
+    return;
+  }
   const configurationStore = new ConfigurationStore(context, environment.runtimePath);
   const runtimeState = new RuntimeStateStore(environment.runtimePath);
   // 构造函数不做任何 IO，真正的磁盘往返在 start 里；提前建好，下面的闭包就不必处理「协调器还不存在」。
@@ -50,6 +58,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     isEnabled: () => machine.enabled,
     setEnabled: async (enabled) => setEnabled(enabled),
     onResolveConflict: async (resolution) => applyResolution(resolution),
+    profileMismatch: () => runtimeState.get().profileMismatch,
+    onResolveProfiles: async () => promptProfileChoice(),
     history: {
       load: async (limit, refresh) => history.load(limit, refresh),
       loadMore: async () => history.loadMore(),
@@ -169,6 +179,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const schedules = new SyncSchedules({
     fingerprint: async () => adapter.fingerprint(),
+    // 还有扩展没装完时需要整轮继续收敛，远端没动也要跑。
+    remoteChanged: async () => (runtimeState.get().extensionsPending?.length ?? 0) > 0
+      || configurationRepository.remoteChanged(configurationStore.get()),
     isLeader: () => coordinator.isLeader,
     isEnabled: () => machine.enabled,
     configuration: () => configurationStore.get(),
@@ -219,6 +232,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       case 'prompt-version-choice':
         await promptVersionChoice();
         return;
+      case 'prompt-profile-choice':
+        await promptProfileChoice();
+        return;
       case 'start-schedules':
         await schedules.start();
         return;
@@ -227,9 +243,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       case 'complete-sync-requests':
         await coordinator.completeSyncRequests();
-        return;
-      case 'reload-window':
-        await vscode.commands.executeCommand('workbench.action.reloadWindow');
         return;
     }
   };
@@ -282,6 +295,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     if (choice !== '以本机为准' && choice !== '以云端为准') return;
     await applyResolution(choice === '以本机为准' ? 'local' : 'cloud');
+  };
+
+  /**
+   * Profile 不一致时只有一种需要用户确认的处理（从云端删除或保留本机的）；另一种是用户自己去新建或删除 Profile，
+   * 完成后指纹变化会自动继续同步。选择写进共享状态，本窗口不是 leader 时由 leader 读出来执行。
+   */
+  const promptProfileChoice = async () => {
+    await runtimeState.reload();
+    const mismatch = runtimeState.get().profileMismatch;
+    if (!mismatch) return;
+    const text = profileMismatchText(mismatch);
+    const confirmed = await vscode.window.showWarningMessage(
+      text.summary,
+      { modal: true, detail: text.detail },
+      text.action,
+    );
+    if (confirmed !== text.action) return;
+    await runtimeState.update({ profileResolution: mismatch });
+    applyStatus({ message: `已确认：${text.action}，正在继续同步。` }, false);
+    dispatch({ type: 'sync-requested', source: 'user' });
   };
 
   const promptCloudAdopt = async () => {
@@ -530,7 +563,7 @@ export async function deactivate(): Promise<void> {
 function countDirtyDocuments(userDataPath: string): number {
   return vscode.workspace.textDocuments.filter(
     (document) => document.isDirty
-      && document.uri.scheme === 'file'
+      && (document.uri.scheme === 'file' || document.uri.scheme === USER_DATA_SCHEME)
       && isInside(userDataPath, document.uri.fsPath),
   ).length;
 }
