@@ -6,6 +6,9 @@ button.secondary{background:var(--vscode-button-secondaryBackground);color:var(-
 button:disabled{cursor:default;opacity:.6}
 
 .toggle-row{display:flex;align-items:center;gap:10px;margin-top:12px}
+.interval-settings{margin-top:12px}
+.interval-settings label{margin:10px 0 4px}
+.interval-settings label:first-child{margin-top:0}
 .toggle-row span{flex:none}
 button.toggle-switch{position:relative;width:38px;height:22px;margin:0;padding:0;border-radius:11px;background:var(--vscode-button-secondaryBackground);transition:background .15s ease}
 button.toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--vscode-button-foreground);transition:transform .15s ease}

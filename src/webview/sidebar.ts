@@ -71,6 +71,8 @@ toggleEnabled.onclick = () => {
   toggleEnabled.disabled = true;
   vscode.postMessage({ type: 'toggleEnabled', enabled: !enabled });
 };
+input('debounceSeconds').addEventListener('change', () => commitInterval('debounceSeconds', 5));
+input('pollIntervalSeconds').addEventListener('change', () => commitInterval('pollIntervalSeconds', 30));
 for (const button of modeButtons) {
   button.onclick = () => {
     for (const other of modeButtons) other.disabled = true;
@@ -80,18 +82,17 @@ for (const button of modeButtons) {
 
 editRepository.onclick = () => {
   for (const id of CONFIGURATION_FIELDS) input(id).value = configuration[id] ?? '';
-  input('debounceSeconds').value = String(configuration.debounceSeconds ?? '');
-  input('pollIntervalSeconds').value = String(configuration.pollIntervalSeconds ?? '');
   configurationDialog.showModal();
 };
 cancelConfiguration.onclick = () => configurationDialog.close();
 configurationForm.onsubmit = (event) => {
   event.preventDefault();
+  if (configuration.debounceSeconds === undefined || configuration.pollIntervalSeconds === undefined) return;
   const next: SyncConfiguration = { repositoryUrl: '', branch: '', gitUserName: '', gitUserEmail: '' };
   for (const id of CONFIGURATION_FIELDS) next[id] = input(id).value;
   const automation = {
-    debounceSeconds: Number(input('debounceSeconds').value),
-    pollIntervalSeconds: Number(input('pollIntervalSeconds').value),
+    debounceSeconds: configuration.debounceSeconds,
+    pollIntervalSeconds: configuration.pollIntervalSeconds,
   };
   saveConfiguration.disabled = true;
   cancelConfiguration.disabled = true;
@@ -163,6 +164,7 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
     button.setAttribute('aria-pressed', String(active));
     button.disabled = false;
   }
+  renderIntervals();
   element('syncMode').textContent = modeLabel;
   element('modeNote').textContent = modeNote;
 
@@ -187,6 +189,38 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   resolveProfiles.disabled = false;
   lastSyncAt = status.lastSyncAt;
   renderLastSyncAt();
+}
+
+function renderIntervals(): void {
+  setIntervalValue('debounceSeconds', configuration.debounceSeconds);
+  setIntervalValue('pollIntervalSeconds', configuration.pollIntervalSeconds);
+}
+
+function setIntervalValue(id: 'debounceSeconds' | 'pollIntervalSeconds', value: number | undefined): void {
+  const field = input(id);
+  if (document.activeElement === field) return;
+  field.value = value === undefined ? '' : String(value);
+}
+
+/** 数字输入在离开或点步进时才提交。不合法就恢复原值，避免把空串或小于下限的数写进设置。 */
+function commitInterval(field: 'debounceSeconds' | 'pollIntervalSeconds', minimum: number): void {
+  const fieldElement = input(field);
+  const parsed = Number(fieldElement.value);
+  const current = configuration[field];
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > 86_400) {
+    fieldElement.value = current === undefined ? '' : String(current);
+    return;
+  }
+  if (parsed === current) return;
+  if (configuration.debounceSeconds === undefined || configuration.pollIntervalSeconds === undefined) return;
+  vscode.postMessage({
+    type: 'saveAutomation',
+    automation: {
+      debounceSeconds: configuration.debounceSeconds,
+      pollIntervalSeconds: configuration.pollIntervalSeconds,
+      [field]: parsed,
+    },
+  });
 }
 
 function resolveConflict(resolution: 'local' | 'cloud'): void {
