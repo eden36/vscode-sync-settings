@@ -273,28 +273,36 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <link rel="stylesheet" href="${styleUri.toString()}">
 </head><body>
 <div id="mainPage">
-<div class="sync-summary">
-  <div class="sync-metric"><span class="metric-label">同步状态</span><span class="metric-value sync-status-value"><span id="syncDot" class="dot"></span><span id="syncMark" class="sync-mark" hidden title="正在同步"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-9-9 9.7 9.7 0 0 0-6.7 2.7L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 9 9 9.7 9.7 0 0 0 6.7-2.7L21 16"></path><path d="M16 16h5v5"></path></svg></span><span class="sync-phase-wrap"><span id="syncPhase">正在加载</span><span id="syncResult" class="sync-result" hidden></span></span></span></div>
-  <div class="sync-metric"><span class="metric-label">上次同步</span><span id="lastSyncAt" class="metric-value">尚未同步</span></div>
-  <div class="sync-metric"><span class="metric-label">运行模式</span><span id="syncMode" class="metric-value">正在加载</span></div>
-</div>
-<div class="status"><strong id="phase">正在加载</strong><div id="detail" class="muted"></div></div>
+<section class="panel-section"><div class="sync-summary">
+  <div class="sync-metric"><span class="metric-label" title="同步状态">同步状态</span><span class="metric-value sync-status-value"><span id="syncDot" class="dot"></span><span id="syncMark" class="sync-mark" hidden title="正在同步"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-9-9 9.7 9.7 0 0 0-6.7 2.7L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 9 9 9.7 9.7 0 0 0 6.7-2.7L21 16"></path><path d="M16 16h5v5"></path></svg></span><span class="sync-phase-wrap clamp-2"><span id="syncPhase">正在加载</span><span id="syncResult" class="sync-result" hidden></span></span></span></div>
+  <div class="sync-metric"><span class="metric-label" title="上次同步">上次同步</span><span id="lastSyncAt" class="metric-value clamp-2">尚未同步</span></div>
+  <div class="sync-metric"><span class="metric-label" title="运行模式">运行模式</span><span id="syncMode" class="metric-value clamp-2">正在加载</span></div>
+</div></section>
+<section class="panel-section">
+<div class="status"><strong id="phase" class="clamp-1">正在加载</strong><div id="detail" class="muted clamp-2"></div></div>
 <div id="choicePanel" class="status" hidden><strong>需要选择以哪一方为准</strong><div class="muted">本机与云端都有改动。选定一方后，另一份配置会先备份到扩展运行目录。</div><div><button id="chooseLocal" type="button">以本机为准</button><button id="chooseCloud" class="secondary" type="button">以云端为准</button></div></div>
 <div id="profilePanel" class="status" hidden><strong id="profileSummary"></strong><div id="profileDetail" class="muted"></div><div><button id="resolveProfiles" class="secondary" type="button"></button></div></div>
+</section>
+<section class="panel-section">
 <div class="toggle-row"><span>同步开关</span><button id="toggleEnabled" class="toggle-switch" type="button" role="switch" aria-checked="false" aria-label="正在加载"></button></div>
 <div class="interval-settings"><label for="debounceSeconds">本地检测间隔（秒）</label><input id="debounceSeconds" type="number" min="5" step="5"><label for="pollIntervalSeconds">远程轮询间隔（秒）</label><input id="pollIntervalSeconds" type="number" min="30" step="30"></div>
-<p class="muted">关闭后不会自动同步：不创建本地仓库、不访问远程仓库，也不写回本机配置；手动查看云端提交历史与覆盖云端不受此限。</p>
+</section>
+<section class="panel-section">
+<p class="muted clamp-3" title="关闭后不会自动同步：不创建本地仓库、不访问远程仓库，也不写回本机配置；手动查看云端提交历史与覆盖云端不受此限。">关闭后不会自动同步：不创建本地仓库、不访问远程仓库，也不写回本机配置；手动查看云端提交历史与覆盖云端不受此限。</p>
 <div class="mode-switch" role="group" aria-label="运行模式"><button id="modeBackup" type="button" data-mode="backup" aria-pressed="false">备份模式</button><button id="modeSync" type="button" data-mode="sync" aria-pressed="false">同步模式</button></div>
-<p id="modeNote" class="muted"></p>
-<div class="repository-details"><div class="repository-item"><span>远程仓库</span><strong id="repositorySummary">正在加载</strong></div><div class="repository-item"><span>分支</span><strong id="branchSummary">正在加载</strong></div></div>
+<p id="modeNote" class="muted clamp-3"></p>
+</section>
+<section class="panel-section">
+<div class="repository-details"><div class="repository-item"><span>远程仓库</span><strong id="repositorySummary" class="clamp-2">正在加载</strong></div><div class="repository-item"><span>分支</span><strong id="branchSummary" class="clamp-1">正在加载</strong></div></div>
 <button id="editRepository" type="button">修改远程仓库</button>
+</section>
 <dialog id="configurationDialog" class="configuration-dialog"><form id="configurationForm" novalidate><h2>配置同步仓库</h2><label for="repositoryUrl">配置同步仓库地址</label><input id="repositoryUrl" placeholder="git@github.com:user/settings.git"><label for="branch">分支</label><input id="branch"><div class="row"><div><label for="gitUserName">Git 用户名（可选）</label><input id="gitUserName" placeholder="留空使用本机配置"></div><div><label for="gitUserEmail">Git 邮箱（可选）</label><input id="gitUserEmail" type="email" placeholder="留空使用本机配置"></div></div><p class="muted">保存后会自动同步。同步模式下首次接入会以云端配置覆盖本机并按云端清单装卸扩展，原有配置会先备份；备份模式只把本机配置上传到仓库。</p><div class="dialog-actions"><button id="cancelConfiguration" class="secondary" type="button">取消</button><button id="saveConfiguration" type="submit">保存更改</button></div></form></dialog>
 </div>
 <div id="historyPage" hidden>
   <div class="history-header"><button id="historyBack" class="icon-button" type="button" title="返回">←</button><strong>云端提交历史</strong><span class="history-status-slot"><span id="historyRefreshing" class="history-status" hidden>正在刷新云端记录…</span><span id="historyError" class="history-status history-status-error" hidden></span></span><button id="openRepository" class="secondary open-repository" type="button">打开仓库</button><button id="historyRefresh" class="icon-button" type="button" title="刷新">↻</button></div>
   <div id="historyBody"></div>
   <button id="historyMore" class="secondary" type="button" hidden>加载更多</button>
-  <p class="muted">在某一项上点右键可以新增或删除标签。</p>
+  <p class="muted history-footnote" title="在某一项上点右键可以新增或删除标签。">在某一项上点右键可以新增或删除标签。</p>
 </div>
 <div id="tagMenu" class="context-menu" hidden></div>
 <script nonce="${nonce}" src="${scriptUri.toString()}"></script>

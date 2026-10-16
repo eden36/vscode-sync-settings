@@ -102,15 +102,17 @@ configurationForm.onsubmit = (event) => {
 addEventListener('message', ({ data }: MessageEvent<OutgoingMessage>) => {
   switch (data.type) {
     case 'failure':
-      element('phase').textContent = '启动失败';
-      element('detail').textContent = data.message;
-      element('syncPhase').textContent = '启动失败';
+      setText('phase', '启动失败');
+      setText('detail', data.message);
+      setText('syncPhase', '启动失败');
       element('syncDot').hidden = false;
       element('syncDot').className = 'dot error';
       syncMark.hidden = true;
       syncResult.hidden = true;
-      element('lastSyncAt').textContent = '—';
-      element('syncMode').textContent = '—';
+      syncResult.textContent = '';
+      syncResult.removeAttribute('title');
+      setText('lastSyncAt', '—');
+      setText('syncMode', '—');
       return;
     case 'configuration-saved':
       saveConfiguration.disabled = false;
@@ -156,8 +158,8 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   toggleEnabled.setAttribute('aria-checked', String(enabled));
   toggleEnabled.setAttribute('aria-label', enabled ? '停止同步' : '开启同步');
   toggleEnabled.disabled = false;
-  element('repositorySummary').textContent = configuration.repositoryUrl || '未配置远程仓库';
-  element('branchSummary').textContent = configuration.branch || '未配置分支';
+  setText('repositorySummary', configuration.repositoryUrl || '未配置远程仓库');
+  setText('branchSummary', configuration.branch || '未配置分支');
   for (const button of modeButtons) {
     const active = button.dataset.mode === configuration.mode;
     button.className = active ? 'active' : '';
@@ -165,20 +167,22 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
     button.disabled = false;
   }
   renderIntervals();
-  element('syncMode').textContent = modeLabel;
-  element('modeNote').textContent = modeNote;
+  setText('syncMode', modeLabel);
+  setText('modeNote', modeNote);
 
-  element('phase').textContent = `${status.displayPhase} · ${status.role}`;
+  setText('phase', `${status.displayPhase} · ${status.role}`);
   const notes = [`窗口 ${status.activeWindows}`, `Profiles ${status.profiles.join('、')}`];
   if (status.stage) notes.push(status.stage);
   if (status.message) notes.push(status.message);
-  element('detail').textContent = notes.join(' · ');
-  element('syncPhase').textContent = status.stepText ?? status.displayPhase;
+  setText('detail', notes.join(' · '));
+  setText('syncPhase', status.stepText ?? status.displayPhase);
   element('syncDot').hidden = status.transferring === true;
   element('syncDot').className = `dot ${status.tone}`;
   syncMark.hidden = status.transferring !== true;
   syncResult.hidden = status.transferring === true || !status.transferResultText;
   syncResult.textContent = status.transferResultText ?? '';
+  if (status.transferResultText) syncResult.title = status.transferResultText;
+  else syncResult.removeAttribute('title');
   choicePanel.hidden = !status.needsChoice;
   chooseLocal.disabled = false;
   chooseCloud.disabled = false;
@@ -189,6 +193,13 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   resolveProfiles.disabled = false;
   lastSyncAt = status.lastSyncAt;
   renderLastSyncAt();
+}
+
+function setText(id: string, text: string): void {
+  const node = element(id);
+  node.textContent = text;
+  if (text) node.title = text;
+  else node.removeAttribute('title');
 }
 
 function renderIntervals(): void {
@@ -233,17 +244,18 @@ function renderLastSyncAt(): void {
   const last = element('lastSyncAt');
   if (!lastSyncAt) {
     last.textContent = '尚未同步';
-    last.removeAttribute('title');
+    last.title = '尚未同步';
     return;
   }
   const date = new Date(lastSyncAt);
   if (Number.isNaN(date.getTime())) {
     last.textContent = '时间无效';
-    last.removeAttribute('title');
+    last.title = '时间无效';
     return;
   }
-  last.textContent = `${date.toLocaleString()}（${relativeTime(date.getTime())}）`;
-  last.title = lastSyncAt;
+  const text = `${date.toLocaleString()}（${relativeTime(date.getTime())}）`;
+  last.textContent = text;
+  last.title = text;
 }
 
 function relativeTime(timestamp: number): string {
@@ -350,8 +362,9 @@ function renderHistory(entries: HistoryEntry[], hasMore: boolean, refreshing: bo
     historyLimit += entries.length;
   } else if (!entries.length) {
     const empty = document.createElement('p');
-    empty.className = 'muted';
+    empty.className = 'muted history-footnote';
     empty.textContent = '云端还没有本宿主的配置提交。';
+    empty.title = empty.textContent;
     historyBody.replaceChildren(empty);
     historyLimit = 0;
   } else {
@@ -373,9 +386,18 @@ function historyItem(entry: HistoryEntry): HTMLLIElement {
   const subject = document.createElement('div');
   subject.className = 'history-subject';
   subject.textContent = entry.subject;
+  subject.title = entry.subject;
   const meta = document.createElement('div');
   meta.className = 'history-meta';
-  meta.textContent = `${entry.shortHash} · ${historyTime(entry.committedAt)}`;
+  const hash = document.createElement('span');
+  hash.className = 'history-hash';
+  hash.textContent = entry.shortHash;
+  const time = document.createElement('span');
+  time.className = 'history-time';
+  const timeText = historyTime(entry.committedAt);
+  time.textContent = timeText;
+  time.title = timeText;
+  meta.append(hash, time);
   main.append(subject, meta);
   if (entry.tags.length) {
     const tags = document.createElement('div');
@@ -384,6 +406,7 @@ function historyItem(entry: HistoryEntry): HTMLLIElement {
       const badge = document.createElement('span');
       badge.className = 'history-tag';
       badge.textContent = tag;
+      badge.title = tag;
       tags.append(badge);
     }
     main.append(tags);

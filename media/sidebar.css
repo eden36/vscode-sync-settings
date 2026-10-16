@@ -5,7 +5,14 @@ button{margin:12px 6px 0 0;padding:7px 11px;border:0;background:var(--vscode-but
 button.secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
 button:disabled{cursor:default;opacity:.6}
 
-.toggle-row{display:flex;align-items:center;gap:10px;margin-top:12px}
+.panel-section + .panel-section{margin-top:12px;padding-top:12px;border-top:1px solid var(--vscode-panel-border)}
+.panel-section p{margin:0}
+.panel-section .status + .status{margin-top:8px}
+.clamp-1{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.clamp-2,.clamp-3{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;line-height:1.4}
+.clamp-2{-webkit-line-clamp:2;min-height:2.8em}
+.clamp-3{-webkit-line-clamp:3;min-height:4.2em}
+.toggle-row{display:flex;align-items:center;gap:10px}
 .interval-settings{margin-top:12px}
 .interval-settings label{margin:10px 0 4px}
 .interval-settings label:first-child{margin-top:0}
@@ -15,14 +22,16 @@ button.toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:
 button.toggle-switch.enabled{background:var(--vscode-testing-iconPassed)}
 button.toggle-switch.enabled::after{transform:translateX(16px)}
 
-.mode-switch{display:grid;grid-template-columns:1fr 1fr;gap:1px;margin-top:14px;background:var(--vscode-panel-border);border:1px solid var(--vscode-panel-border)}
+.mode-switch{display:grid;grid-template-columns:1fr 1fr;gap:1px;margin-top:12px;background:var(--vscode-panel-border);border:1px solid var(--vscode-panel-border)}
+#modeNote{margin-top:8px}
 .mode-switch button{margin:0;padding:7px 6px;background:var(--vscode-sideBar-background);color:var(--vscode-foreground)}
 .mode-switch button.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
 
-.sync-summary{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;margin-bottom:10px;background:var(--vscode-panel-border)}
-.sync-metric{min-width:0;padding:10px;background:var(--vscode-sideBar-background)}
-.metric-label{display:block;margin-bottom:5px;opacity:.7;font-size:11px}
-.metric-value{display:flex;align-items:center;gap:6px;font-weight:600;overflow-wrap:anywhere}
+.sync-summary{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--vscode-panel-border)}
+.sync-metric{box-sizing:border-box;height:75px;min-width:0;padding:10px;overflow:hidden;background:var(--vscode-sideBar-background)}
+.metric-label{display:block;height:14px;margin-bottom:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.7;font-size:11px;line-height:14px}
+.metric-value{display:flex;align-items:center;gap:6px;font-weight:600}
+.metric-value.clamp-2{display:-webkit-box;-webkit-box-orient:vertical;height:36px;max-height:36px;line-height:18px}
 
 .dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--vscode-descriptionForeground)}
 .dot.muted{background:var(--vscode-descriptionForeground)}
@@ -31,23 +40,26 @@ button.toggle-switch.enabled::after{transform:translateX(16px)}
 .dot.warning{background:var(--vscode-editorWarning-foreground)}
 .dot.error{background:var(--vscode-testing-iconFailed)}
 
-.sync-status-value{align-items:flex-start}
+.sync-status-value{align-items:flex-start;height:36px;overflow:hidden}
 .sync-status-value .dot{margin-top:5px}
 .sync-mark{display:flex;align-items:center;justify-content:center;width:16px;height:16px;margin-top:1px;border-radius:50%;flex:none;background:var(--vscode-progressBar-background);color:#fff}
 .sync-mark[hidden]{display:none}
 .sync-mark svg{width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;animation:spin 1s linear infinite}
 .sync-phase-wrap{display:flex;flex-direction:column;min-width:0}
-.sync-result{margin-top:2px;font-size:11px;font-weight:600;line-height:1.3}
+.sync-phase-wrap.clamp-2{display:-webkit-box;-webkit-box-orient:vertical;height:36px;max-height:36px;line-height:18px}
+.sync-result{font-size:11px;font-weight:600;line-height:18px}
 .sync-result[hidden]{display:none}
+.sync-phase-wrap.clamp-2 > span{display:block}
+.sync-phase-wrap.clamp-2 > .sync-result[hidden]{display:none}
 
 .status{padding:10px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-focusBorder)}
 .muted{opacity:.75;font-size:12px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 
-.repository-details{display:grid;gap:8px;margin-top:14px}
-.repository-item{display:grid;gap:3px}
+.repository-details{display:grid;gap:8px}
+.repository-item{display:grid;gap:3px;min-width:0}
 .repository-item span{opacity:.7;font-size:11px}
-.repository-item strong{font-weight:400;overflow-wrap:anywhere}
+.repository-item strong{min-width:0;font-weight:400;overflow-wrap:anywhere}
 
 .configuration-dialog{max-width:calc(100vw - 32px);width:420px;padding:16px;border:1px solid var(--vscode-editorWidget-border);background:var(--vscode-editorWidget-background);color:var(--vscode-editorWidget-foreground)}
 .configuration-dialog::backdrop{background:rgba(0,0,0,.45)}
@@ -56,7 +68,7 @@ button.toggle-switch.enabled::after{transform:translateX(16px)}
 .dialog-actions button{margin:0}
 
 .history-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}
-.history-header strong{flex:none}
+.history-header strong{flex:none;white-space:nowrap}
 .history-status-slot{flex:1;min-width:0;display:flex;justify-content:flex-end}
 .history-status{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;opacity:.75}
 .history-status-error{opacity:1;color:var(--vscode-errorForeground)}
@@ -72,10 +84,13 @@ button.icon-button.refreshing:disabled{opacity:1}
 .history-actions button{margin:0;padding:4px 9px}
 .history-actions .history-view{padding:1px 7px;font-size:11px}
 .history-main{flex:1;min-width:0}
-.history-subject{overflow-wrap:anywhere}
-.history-meta{margin-top:3px;opacity:.7;font-size:11px;overflow-wrap:anywhere}
-.history-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
-.history-tag{padding:1px 7px;border-radius:9px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-size:11px;overflow-wrap:anywhere}
+.history-subject{height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:20px}
+.history-meta{display:flex;align-items:center;gap:6px;height:16px;margin-top:3px;overflow:hidden;font-size:11px;line-height:16px}
+.history-hash{flex:none;opacity:.7}
+.history-time{min-width:0;padding:0 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:8px;background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+.history-tags{display:flex;flex-wrap:nowrap;gap:4px;height:18px;margin-top:5px;overflow:hidden}
+.history-tag{flex:none;max-width:100%;padding:1px 7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:9px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-size:11px;line-height:16px}
+.history-footnote{height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:16px}
 .history-loading{display:flex;justify-content:center;padding:28px 0}
 .spinner{width:22px;height:22px;border:2px solid var(--vscode-panel-border);border-top-color:var(--vscode-progressBar-background);border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
