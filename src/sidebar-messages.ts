@@ -25,6 +25,7 @@ export interface HistoryEntry {
 export type IncomingMessage =
   | { type: 'ready' }
   | { type: 'save'; configuration: SyncConfiguration; automation: AutomationSettings }
+  | { type: 'saveAutomation'; automation: AutomationSettings }
   | { type: 'toggleEnabled'; enabled: boolean }
   | { type: 'setMode'; mode: SyncMode }
   | { type: 'resolveConflict'; resolution: 'local' | 'cloud' }
@@ -99,13 +100,14 @@ export function parseMessage(raw: unknown): IncomingMessage | undefined {
     if (typeof value.tag !== 'string' || !isValidTagName(value.tag)) return undefined;
     return { type: 'deleteTag', hash: value.hash, tag: value.tag };
   }
+  if (value.type === 'saveAutomation') return parseAutomation(value.automation);
   if (value.type !== 'save' || !value.configuration || typeof value.configuration !== 'object' || !value.automation || typeof value.automation !== 'object') return undefined;
   const configuration = value.configuration as Record<string, unknown>;
   const strings = ['repositoryUrl', 'branch', 'gitUserName', 'gitUserEmail'];
   if (!strings.every((key) => typeof configuration[key] === 'string')) return undefined;
   if (/\r|\n/.test(configuration.repositoryUrl as string) || !isValidBranch(configuration.branch as string)) return undefined;
-  const automation = value.automation as Record<string, unknown>;
-  if (!validInterval(automation.debounceSeconds, 5) || !validInterval(automation.pollIntervalSeconds, 30)) return undefined;
+  const automation = parseAutomationSettings(value.automation);
+  if (!automation) return undefined;
   // 只取已知字段：整个对象原样放行的话，消息里多带一个 mode 就会随保存生效，绕过切换同步模式的确认。
   return {
     type: 'save',
@@ -115,10 +117,22 @@ export function parseMessage(raw: unknown): IncomingMessage | undefined {
       gitUserName: configuration.gitUserName as string,
       gitUserEmail: configuration.gitUserEmail as string,
     },
-    automation: {
-      debounceSeconds: automation.debounceSeconds,
-      pollIntervalSeconds: automation.pollIntervalSeconds,
-    },
+    automation,
+  };
+}
+
+function parseAutomation(value: unknown): IncomingMessage | undefined {
+  const automation = parseAutomationSettings(value);
+  return automation ? { type: 'saveAutomation', automation } : undefined;
+}
+
+function parseAutomationSettings(value: unknown): AutomationSettings | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const automation = value as Record<string, unknown>;
+  if (!validInterval(automation.debounceSeconds, 5) || !validInterval(automation.pollIntervalSeconds, 30)) return undefined;
+  return {
+    debounceSeconds: automation.debounceSeconds,
+    pollIntervalSeconds: automation.pollIntervalSeconds,
   };
 }
 

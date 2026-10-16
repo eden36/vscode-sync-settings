@@ -162,8 +162,8 @@ const inspectFlag = process.argv.includes('--brk') ? '--inspect-brk-extensions' 
 const args = [`--extensionDevelopmentPath=${workspaceFolder}`, `${inspectFlag}=${inspectPort}`];
 if (hostId === 'cursor') {
   // Cursor 登录态在正式 User Data 里；再用隔离目录会被当成新安装，弹出登录页。
-  // 临时 Profile 避免在正式数据里留下「插件调试」。
-  args.push('--profile-temp');
+  // 固定到已有 Profile，避免每次空环境，也不把调试写进默认 Profile。
+  args.push('--profile=调试环境');
 } else {
   args.push(`--user-data-dir=${host.userDataDir}`, '--profile=插件调试');
 }

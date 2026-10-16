@@ -71,6 +71,8 @@ toggleEnabled.onclick = () => {
   toggleEnabled.disabled = true;
   vscode.postMessage({ type: 'toggleEnabled', enabled: !enabled });
 };
+input('debounceSeconds').addEventListener('change', () => commitInterval('debounceSeconds', 5));
+input('pollIntervalSeconds').addEventListener('change', () => commitInterval('pollIntervalSeconds', 30));
 for (const button of modeButtons) {
   button.onclick = () => {
     for (const other of modeButtons) other.disabled = true;
@@ -80,18 +82,17 @@ for (const button of modeButtons) {
 
 editRepository.onclick = () => {
   for (const id of CONFIGURATION_FIELDS) input(id).value = configuration[id] ?? '';
-  input('debounceSeconds').value = String(configuration.debounceSeconds ?? '');
-  input('pollIntervalSeconds').value = String(configuration.pollIntervalSeconds ?? '');
   configurationDialog.showModal();
 };
 cancelConfiguration.onclick = () => configurationDialog.close();
 configurationForm.onsubmit = (event) => {
   event.preventDefault();
+  if (configuration.debounceSeconds === undefined || configuration.pollIntervalSeconds === undefined) return;
   const next: SyncConfiguration = { repositoryUrl: '', branch: '', gitUserName: '', gitUserEmail: '' };
   for (const id of CONFIGURATION_FIELDS) next[id] = input(id).value;
   const automation = {
-    debounceSeconds: Number(input('debounceSeconds').value),
-    pollIntervalSeconds: Number(input('pollIntervalSeconds').value),
+    debounceSeconds: configuration.debounceSeconds,
+    pollIntervalSeconds: configuration.pollIntervalSeconds,
   };
   saveConfiguration.disabled = true;
   cancelConfiguration.disabled = true;
@@ -101,15 +102,17 @@ configurationForm.onsubmit = (event) => {
 addEventListener('message', ({ data }: MessageEvent<OutgoingMessage>) => {
   switch (data.type) {
     case 'failure':
-      element('phase').textContent = '启动失败';
-      element('detail').textContent = data.message;
-      element('syncPhase').textContent = '启动失败';
+      setText('phase', '启动失败');
+      setText('detail', data.message);
+      setText('syncPhase', '启动失败');
       element('syncDot').hidden = false;
       element('syncDot').className = 'dot error';
       syncMark.hidden = true;
       syncResult.hidden = true;
-      element('lastSyncAt').textContent = '—';
-      element('syncMode').textContent = '—';
+      syncResult.textContent = '';
+      syncResult.removeAttribute('title');
+      setText('lastSyncAt', '—');
+      setText('syncMode', '—');
       return;
     case 'configuration-saved':
       saveConfiguration.disabled = false;
@@ -155,28 +158,31 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   toggleEnabled.setAttribute('aria-checked', String(enabled));
   toggleEnabled.setAttribute('aria-label', enabled ? '停止同步' : '开启同步');
   toggleEnabled.disabled = false;
-  element('repositorySummary').textContent = configuration.repositoryUrl || '未配置远程仓库';
-  element('branchSummary').textContent = configuration.branch || '未配置分支';
+  setText('repositorySummary', configuration.repositoryUrl || '未配置远程仓库');
+  setText('branchSummary', configuration.branch || '未配置分支');
   for (const button of modeButtons) {
     const active = button.dataset.mode === configuration.mode;
     button.className = active ? 'active' : '';
     button.setAttribute('aria-pressed', String(active));
     button.disabled = false;
   }
-  element('syncMode').textContent = modeLabel;
-  element('modeNote').textContent = modeNote;
+  renderIntervals();
+  setText('syncMode', modeLabel);
+  setText('modeNote', modeNote);
 
-  element('phase').textContent = `${status.displayPhase} · ${status.role}`;
+  setText('phase', `${status.displayPhase} · ${status.role}`);
   const notes = [`窗口 ${status.activeWindows}`, `Profiles ${status.profiles.join('、')}`];
   if (status.stage) notes.push(status.stage);
   if (status.message) notes.push(status.message);
-  element('detail').textContent = notes.join(' · ');
-  element('syncPhase').textContent = status.stepText ?? status.displayPhase;
+  setText('detail', notes.join(' · '));
+  setText('syncPhase', status.stepText ?? status.displayPhase);
   element('syncDot').hidden = status.transferring === true;
   element('syncDot').className = `dot ${status.tone}`;
   syncMark.hidden = status.transferring !== true;
   syncResult.hidden = status.transferring === true || !status.transferResultText;
   syncResult.textContent = status.transferResultText ?? '';
+  if (status.transferResultText) syncResult.title = status.transferResultText;
+  else syncResult.removeAttribute('title');
   choicePanel.hidden = !status.needsChoice;
   chooseLocal.disabled = false;
   chooseCloud.disabled = false;
@@ -189,6 +195,45 @@ function renderState(modeLabel: string, modeNote: string, status: DisplayStatus)
   renderLastSyncAt();
 }
 
+function setText(id: string, text: string): void {
+  const node = element(id);
+  node.textContent = text;
+  if (text) node.title = text;
+  else node.removeAttribute('title');
+}
+
+function renderIntervals(): void {
+  setIntervalValue('debounceSeconds', configuration.debounceSeconds);
+  setIntervalValue('pollIntervalSeconds', configuration.pollIntervalSeconds);
+}
+
+function setIntervalValue(id: 'debounceSeconds' | 'pollIntervalSeconds', value: number | undefined): void {
+  const field = input(id);
+  if (document.activeElement === field) return;
+  field.value = value === undefined ? '' : String(value);
+}
+
+/** 数字输入在离开或点步进时才提交。不合法就恢复原值，避免把空串或小于下限的数写进设置。 */
+function commitInterval(field: 'debounceSeconds' | 'pollIntervalSeconds', minimum: number): void {
+  const fieldElement = input(field);
+  const parsed = Number(fieldElement.value);
+  const current = configuration[field];
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > 86_400) {
+    fieldElement.value = current === undefined ? '' : String(current);
+    return;
+  }
+  if (parsed === current) return;
+  if (configuration.debounceSeconds === undefined || configuration.pollIntervalSeconds === undefined) return;
+  vscode.postMessage({
+    type: 'saveAutomation',
+    automation: {
+      debounceSeconds: configuration.debounceSeconds,
+      pollIntervalSeconds: configuration.pollIntervalSeconds,
+      [field]: parsed,
+    },
+  });
+}
+
 function resolveConflict(resolution: 'local' | 'cloud'): void {
   chooseLocal.disabled = true;
   chooseCloud.disabled = true;
@@ -199,17 +244,18 @@ function renderLastSyncAt(): void {
   const last = element('lastSyncAt');
   if (!lastSyncAt) {
     last.textContent = '尚未同步';
-    last.removeAttribute('title');
+    last.title = '尚未同步';
     return;
   }
   const date = new Date(lastSyncAt);
   if (Number.isNaN(date.getTime())) {
     last.textContent = '时间无效';
-    last.removeAttribute('title');
+    last.title = '时间无效';
     return;
   }
-  last.textContent = `${date.toLocaleString()}（${relativeTime(date.getTime())}）`;
-  last.title = lastSyncAt;
+  const text = `${date.toLocaleString()}（${relativeTime(date.getTime())}）`;
+  last.textContent = text;
+  last.title = text;
 }
 
 function relativeTime(timestamp: number): string {
@@ -246,6 +292,7 @@ function startHistoryRefresh(): void {
 
 function showHistoryStatus(text: string): void {
   historyRefreshing.textContent = text;
+  historyRefreshing.title = text;
   historyRefreshing.hidden = false;
 }
 
@@ -290,6 +337,7 @@ function renderHistoryLoading(): void {
 function renderHistoryError(message: string): void {
   clearHistoryRefresh();
   historyError.textContent = message;
+  historyError.title = message;
   historyError.hidden = false;
   if (!historyBody.querySelector('.history-list')) historyBody.replaceChildren();
   applyHistoryBusy(historyBusy);
@@ -314,8 +362,9 @@ function renderHistory(entries: HistoryEntry[], hasMore: boolean, refreshing: bo
     historyLimit += entries.length;
   } else if (!entries.length) {
     const empty = document.createElement('p');
-    empty.className = 'muted';
+    empty.className = 'muted history-footnote';
     empty.textContent = '云端还没有本宿主的配置提交。';
+    empty.title = empty.textContent;
     historyBody.replaceChildren(empty);
     historyLimit = 0;
   } else {
@@ -337,9 +386,18 @@ function historyItem(entry: HistoryEntry): HTMLLIElement {
   const subject = document.createElement('div');
   subject.className = 'history-subject';
   subject.textContent = entry.subject;
+  subject.title = entry.subject;
   const meta = document.createElement('div');
   meta.className = 'history-meta';
-  meta.textContent = `${entry.shortHash} · ${historyTime(entry.committedAt)}`;
+  const hash = document.createElement('span');
+  hash.className = 'history-hash';
+  hash.textContent = entry.shortHash;
+  const time = document.createElement('span');
+  time.className = 'history-time';
+  const timeText = historyTime(entry.committedAt);
+  time.textContent = timeText;
+  time.title = timeText;
+  meta.append(hash, time);
   main.append(subject, meta);
   if (entry.tags.length) {
     const tags = document.createElement('div');
@@ -348,6 +406,7 @@ function historyItem(entry: HistoryEntry): HTMLLIElement {
       const badge = document.createElement('span');
       badge.className = 'history-tag';
       badge.textContent = tag;
+      badge.title = tag;
       tags.append(badge);
     }
     main.append(tags);

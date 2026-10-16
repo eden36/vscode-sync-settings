@@ -59,6 +59,9 @@ test('侧边栏保存配置的消息只保留已知字段', () => {
   );
   assert.equal(parseMessage({ type: 'save', configuration, automation: { ...automation, debounceSeconds: 1 } }), undefined);
   assert.equal(parseMessage({ type: 'save', configuration }), undefined);
+  assert.deepEqual(parseMessage({ type: 'saveAutomation', automation: { ...automation, mode: 'sync' } }), { type: 'saveAutomation', automation });
+  assert.equal(parseMessage({ type: 'saveAutomation', automation: { debounceSeconds: 4, pollIntervalSeconds: 300 } }), undefined);
+  assert.equal(parseMessage({ type: 'saveAutomation', automation: { debounceSeconds: 10, pollIntervalSeconds: 29 } }), undefined);
 });
 
 test('状态栏只在同步执行阶段显示忙碌', () => {
