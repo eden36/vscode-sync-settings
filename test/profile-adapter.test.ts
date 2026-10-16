@@ -413,6 +413,56 @@ test('快照剥离插件自身设置并在写回本机时保留原值', () => {
   assert.equal(testing.restoreLocalSettings('{}', 'not-json'), '{}');
 });
 
+test('云端删除 settings.json 时保留本机专属值与忽略声明，只删除便携设置', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-settings-deleted-'));
+  try {
+    const { userDataPath, runtimePath, locations } = await machine(root, { 开发: 'abc123' });
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const snapshot = path.join(root, 'snapshot');
+    await adapter.createSnapshot(snapshot);
+    const original = '{\r\n  "profileGitSync.enabled": true,\r\n'
+      + '  "settingsSync.ignoredSettings": ["python.defaultInterpreterPath", "-editor.fontSize"],\r\n'
+      + '  "python.defaultInterpreterPath": "C:/local-python",\r\n  "editor.fontSize": 18\r\n}';
+    for (const profileRoot of [userDataPath, locations['开发']!]) {
+      await writeFile(path.join(profileRoot, 'settings.json'), original);
+    }
+    const restored = await adapter.restoreSnapshot(snapshot);
+    assert.equal(restored.changedFiles.length, 2);
+    for (const profileRoot of [userDataPath, locations['开发']!]) {
+      const content = await readFile(path.join(profileRoot, 'settings.json'), 'utf8');
+      assert.deepEqual(JSON.parse(content), {
+        'profileGitSync.enabled': true,
+        'settingsSync.ignoredSettings': ['python.defaultInterpreterPath', '-editor.fontSize'],
+        'python.defaultInterpreterPath': 'C:/local-python',
+      });
+      assert.ok(content.includes('\r\n'));
+      assert.doesNotMatch(testing.stripLocalSettings(content), /C:\/local-python|profileGitSync/);
+    }
+    assert.deepEqual((await adapter.restoreSnapshot(snapshot)).changedFiles, []);
+    const backups = path.join(runtimePath, 'backups');
+    const dated = await readdir(backups);
+    assert.equal(await readFile(path.join(backups, dated[0]!, 'default', 'settings.json'), 'utf8'), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('云端删除 settings.json 且本机没有专属设置时仍删除文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-settings-portable-'));
+  try {
+    const { userDataPath, runtimePath } = await machine(root);
+    const adapter = new ProfileAdapter({ kind: 'vscode', userDataPath, runtimePath });
+    const snapshot = path.join(root, 'snapshot');
+    await adapter.createSnapshot(snapshot);
+    const settings = path.join(userDataPath, 'settings.json');
+    await writeFile(settings, '{"editor.fontSize":18}');
+    assert.deepEqual((await adapter.restoreSnapshot(snapshot)).changedFiles, [settings]);
+    await assert.rejects(readFile(settings), { code: 'ENOENT' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('settingsSync.ignoredSettings 列出的设置只属于本机，不进仓库也不被覆盖', () => {
   const local = '{\n  "settingsSync.ignoredSettings": ["python.defaultInterpreterPath", "-editor.fontSize"],\n'
     + '  "python.defaultInterpreterPath": "C:/Python/python.exe",\n  "editor.fontSize": 14\n}';

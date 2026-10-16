@@ -192,6 +192,25 @@ export class ProfileAdapter {
           await this.writeFromSnapshot(hostRoot, relative, target, resource === SETTINGS_FILE, changedFiles);
         } else if (resource !== KEYBINDINGS_FILE && await pathExists(target)) {
           // 云端没有本平台的快捷键时保留本机：可能只是还没有同平台的机器上传过，不能当成删除。
+          if (resource === SETTINGS_FILE) {
+            const current = await stableRead(target);
+            const text = current.toString('utf8');
+            const parsed = parse(text, [], { allowTrailingComma: true }) as unknown;
+            const retained = new Set([...localSettingKeys(parsed), IGNORED_SETTINGS_KEY]);
+            if (isRecord(parsed) && Object.keys(parsed).some((key) => retained.has(key))) {
+              // 云端删除只作用于便携设置；忽略声明也要留下，否则下一轮会把本机专属值上传。
+              const entries: Array<[string, unknown]> = Object.keys(parsed)
+                .filter((key) => !retained.has(key)).map((key) => [key, undefined]);
+              const content = this.prepareForLocal(false, Buffer.from(editSettings(text, entries), 'utf8'), current);
+              if (current.equals(content)) continue;
+              const backup = path.join(backupRoot, remoteId, resource);
+              await fs.mkdir(path.dirname(backup), { recursive: true });
+              await fs.cp(target, backup, { dereference: true });
+              await atomicWrite(target, content, this.stagingPath);
+              changedFiles.push(target);
+              continue;
+            }
+          }
           await backupAndRemove(target, path.join(backupRoot, remoteId, resource));
           changedFiles.push(target);
         }

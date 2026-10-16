@@ -72,6 +72,28 @@ test('同步期间的请求排队，结束后再跑一轮', () => {
   assert.deepEqual(finished.commands, [{ type: 'start-sync', adoptCloud: false }]);
 });
 
+test('本机变化导致阻塞时自动重试，不依赖已被检测器消费的变化请求', () => {
+  for (const pending of [false, true]) {
+    const running: SchedulerMachine = { ...leaderMachine(), pending, sync: { kind: 'running', stage: 'apply' } };
+    const blocked = reduce(running, { type: 'sync-finished', outcome: { ok: false, retry: true, blockReason: 'local-changed' } });
+    assert.deepEqual(blocked.next.sync, { kind: 'blocked', reason: 'local-changed' });
+    assert.deepEqual(blocked.commands, [{ type: 'schedule-retry', delayMs: 5_000 }]);
+    const retried = reduce(blocked.next, { type: 'sync-requested', source: 'timer' });
+    assert.deepEqual(retried.commands, [{ type: 'start-sync', adoptCloud: false }]);
+    const finished = reduce(retried.next, { type: 'sync-finished', outcome: { ok: true } });
+    assert.deepEqual(finished.commands, [{ type: 'cancel-retry' }, { type: 'complete-sync-requests' }]);
+  }
+});
+
+test('本机变化阻塞时已关闭、未配置或失去 leader 的窗口不排重试', () => {
+  for (const patch of [{ enabled: false }, { configured: false }, { isLeader: false }]) {
+    const result = reduce({ ...leaderMachine(), ...patch }, {
+      type: 'sync-finished', outcome: { ok: false, retry: true, blockReason: 'local-changed' },
+    });
+    assert.ok(!result.commands.some((command) => command.type === 'schedule-retry'));
+  }
+});
+
 test('阻塞是否可自动恢复取决于原因', () => {
   const safe = { activeWindows: 1, dirtyWindows: 0, unreadableWindows: 0 };
   const resolvable: Array<[SchedulerMachine['sync'], boolean]> = [

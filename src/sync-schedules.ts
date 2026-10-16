@@ -90,9 +90,9 @@ export class SyncSchedules {
     this.retryTimer = undefined;
   }
 
-  /** 把当前本机状态记为已知：写回本机之后必须调用，否则指纹检测会把写回结果当成用户改动再跑一轮。 */
-  public async refreshFingerprint(): Promise<void> {
-    this.localFingerprint = await this.options.fingerprint();
+  /** 只接收本轮实际处理过的指纹，轮后采集当前状态会吞掉尚未同步的新改动。 */
+  public acceptFingerprint(fingerprint: string): void {
+    this.localFingerprint = fingerprint;
   }
 
   public dispose(): void {

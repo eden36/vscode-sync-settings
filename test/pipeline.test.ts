@@ -42,6 +42,81 @@ test('备份模式的流程止于推送，不含写回本机的步骤', () => {
   assert.deepEqual(sync, names);
 });
 
+test('快照采集期间本机发生改动时阻塞，不继续推送或写回旧快照', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-snapshot-race-'));
+  try {
+    const environment = { kind: 'vscode' as const, userDataPath: path.join(root, 'User'), runtimePath: path.join(root, 'runtime') };
+    await mkdir(environment.userDataPath, { recursive: true });
+    const settings = path.join(environment.userDataPath, 'settings.json');
+    await writeFile(settings, '{"editor.fontSize":14}');
+    const adapter = new ProfileAdapter(environment);
+    const createSnapshot = adapter.createSnapshot.bind(adapter);
+    adapter.createSnapshot = async (target) => {
+      const manifest = await createSnapshot(target);
+      await writeFile(settings, '{"editor.fontSize":200}');
+      return manifest;
+    };
+    const context = stageContext({
+      dependencies: stageDependencies({ adapter, environment }),
+      paths: { temporaryRoot: root, localHostRoot: path.join(root, 'snapshot'), repositoryHostRoot: path.join(root, 'repository') },
+    });
+    const outcome = await runPipeline(context, [stageTesting.snapshotStage, {
+      name: 'push', run: async () => assert.fail('快照不一致时不能推送'),
+    }]);
+    assert.deepEqual(outcome, { ok: false, retry: true, blockReason: 'local-changed' });
+    assert.equal(await readFile(settings, 'utf8'), '{"editor.fontSize":200}');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('快照稳定时记录对应指纹，完成后不采集尚未处理的新状态', async () => {
+  let current = '轮初';
+  const context = stageContext({
+    dependencies: stageDependencies({
+      adapter: {
+        fingerprint: async () => current,
+        createSnapshot: async () => profileManifest([]),
+      } as unknown as ProfileAdapter,
+    }),
+  });
+  const outcome = await runPipeline(context, [stageTesting.snapshotStage, {
+    name: 'push', run: async () => { current = '推送期间的新改动'; return { kind: 'continue' }; },
+  }]);
+  assert.deepEqual(outcome, { ok: true, localFingerprint: '轮初' });
+});
+
+test('写回后重采集快照稳定才前移基准，并返回对应指纹', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-finalize-race-'));
+  try {
+    const local = profileManifest([]);
+    await writeFile(path.join(root, 'manifest.json'), JSON.stringify(local));
+    let current = '写回结果';
+    let mutate = true;
+    let updates = 0;
+    const context = stageContext({
+      paths: { temporaryRoot: root, localHostRoot: path.join(root, 'local'), repositoryHostRoot: root },
+      artifacts: { localManifest: local, localFingerprint: '轮初', restore: { changedFiles: ['settings.json'], missingProfiles: [], localOnlyProfiles: [] } },
+      dependencies: stageDependencies({
+        adapter: {
+          fingerprint: async () => current,
+          createSnapshot: async () => { if (mutate) current = '采集期间的新改动'; return local; },
+        } as unknown as ProfileAdapter,
+        runtimeState: { update: async () => { updates += 1; } } as unknown as RuntimeStateStore,
+      }),
+    });
+    assert.deepEqual(await stageTesting.finalizeStage.run(context), { kind: 'blocked', reason: 'local-changed' });
+    assert.equal(updates, 0);
+    assert.equal(context.artifacts.localFingerprint, '轮初');
+    mutate = false;
+    assert.deepEqual(await stageTesting.finalizeStage.run(context), { kind: 'continue' });
+    assert.equal(updates, 1);
+    assert.equal(context.artifacts.localFingerprint, current);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('备份模式同步前会清除遗留的采用云端标记', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-backup-pending-'));
   try {
@@ -50,7 +125,7 @@ test('备份模式同步前会清除遗留的采用云端标记', async () => {
     await runtimeState.update({ cloudAdoptPending: true });
     const engine = new SyncEngine(
       { kind: 'vscode', userDataPath: root, runtimePath: root },
-      { createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
+      { fingerprint: async () => '本机', createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
       fakeGit({ prepare: async () => undefined, pull: async () => ({ state: 'synced', recoveredFromDivergence: false }) }),
       {} as unknown as AiService,
       { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git', mode: 'backup' }) } as unknown as ConfigurationStore,
@@ -71,7 +146,7 @@ test('尚未开始的同步也会响应停止请求，且停止意图只兑现�
   try {
     const engine = new SyncEngine(
       { kind: 'vscode', userDataPath: root, runtimePath: root },
-      { createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
+      { fingerprint: async () => '本机', createSnapshot: async () => { throw new Error('快照未执行'); } } as unknown as ProfileAdapter,
       fakeGit({}),
       {} as unknown as AiService,
       { get: () => ({ ...DEFAULT_CONFIGURATION, repositoryUrl: 'git@example.com:user/settings.git' }) } as unknown as ConfigurationStore,
@@ -713,10 +788,11 @@ test('本机新建了云端已有的同名 Profile 时先套用云端内容再�
             return { changedFiles: [], missingProfiles: [], localOnlyProfiles: [] };
           },
           createSnapshot: async () => profileManifest(['工作'], files),
-          fingerprint: async () => 'claimed',
+          fingerprint: async () => claimed ? 'claimed' : 'unclaimed',
         } as unknown as ProfileAdapter,
       },
     });
+    context.artifacts.localFingerprint = 'unclaimed';
     assert.deepEqual(await chooseStage.run(context), { kind: 'continue' });
     assert.deepEqual(claimed, ['工作']);
     // 写回前的二次确认要以套用后的本机为准，否则会被误判成同步期间被改动。
@@ -724,6 +800,38 @@ test('本机新建了云端已有的同名 Profile 时先套用云端内容再�
     // 新建的空 Profile 没有被当成本机改动推上去覆盖云端。
     assert.equal(context.report.snapshotChoice, 'none');
     assert.match(context.report.profileMessage ?? '', /工作/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('认领同名 Profile 前后发现本机变化时阻塞，不把新改动当成稳定快照', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-claim-race-'));
+  try {
+    for (const changedBeforeClaim of [true, false]) {
+      let fingerprint = changedBeforeClaim ? '新改动' : '轮初';
+      let restored = 0;
+      const manifest = profileManifest(['工作']);
+      const { context } = await chooseContext(root, manifest, manifest, {
+        localSnapshot: '旧基准', cloudSnapshot: '旧基准', localProfiles: [], cloudProfiles: ['工作'],
+      }, undefined, {
+        dependencies: {
+          adapter: {
+            fingerprint: async () => fingerprint,
+            restoreSnapshot: async () => {
+              restored += 1;
+              fingerprint = '云端写回结果';
+              return { changedFiles: [], missingProfiles: [], localOnlyProfiles: [] };
+            },
+            createSnapshot: async () => { fingerprint = '采集期间的新改动'; return manifest; },
+          } as unknown as ProfileAdapter,
+        },
+      });
+      context.artifacts.localFingerprint = '轮初';
+      assert.deepEqual(await chooseStage.run(context), { kind: 'blocked', reason: 'local-changed' });
+      assert.equal(restored, changedBeforeClaim ? 0 : 1);
+      assert.equal(context.artifacts.choice, undefined);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1088,6 +1196,7 @@ test('关闭同步留下的停止意图不会取消用户显式发起的覆盖�
     const engine = new SyncEngine(
       { kind: 'vscode', userDataPath: root, runtimePath: root },
       {
+        fingerprint: async () => '本机',
         createSnapshot: async () => {
           snapshots += 1;
           throw new Error('快照已执行');

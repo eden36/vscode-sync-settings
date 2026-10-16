@@ -72,6 +72,8 @@ export type SyncState =
 /** 一轮同步的结果报告；状态由调度层据此决定，流程本身不写链路状态。 */
 export interface SyncOutcome {
   ok: boolean;
+  /** 本轮实际处理过的本机指纹，检测器不能把轮后新改动标记为已同步。 */
+  localFingerprint?: string;
   /** 用户停止同步后，在当前安全操作结束时提前退出。 */
   cancelled?: boolean;
   retry?: boolean;

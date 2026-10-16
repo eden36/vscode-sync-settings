@@ -124,11 +124,18 @@ async function reconcileProfiles(
   if (claimed.length) {
     const blocked = windowBlock(await windowSafety());
     if (blocked) return { blocked };
+    if (await adapter.fingerprint() !== context.artifacts.localFingerprint) {
+      return { blocked: { kind: 'blocked', reason: 'local-changed' } };
+    }
     await backupConflictSnapshots(conflictBackupRoot, localHostRoot, repositoryHostRoot);
     await adapter.restoreSnapshot(repositoryHostRoot, { profileNames: new Set(claimed) });
     // 本机刚被写过，后面的判定与写回前的二次确认都要以写入后的状态为准。
+    const before = await adapter.fingerprint();
     context.artifacts.localManifest = await adapter.createSnapshot(localHostRoot);
     context.artifacts.localFingerprint = await adapter.fingerprint();
+    if (before !== context.artifacts.localFingerprint) {
+      return { blocked: { kind: 'blocked', reason: 'local-changed' } };
+    }
     localNames = new Set(namedProfiles(context.artifacts.localManifest));
     context.report.profileMessage = `已为本机新建的 Profile 套用云端配置：${claimed.join('、')}`;
   }

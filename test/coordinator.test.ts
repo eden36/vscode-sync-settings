@@ -21,6 +21,81 @@ test('同一运行目录只选出一个 leader', async () => {
   }
 });
 
+test('默认 Profile 窗口接管已存在的命名 Profile leader，并接收转发请求', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-preferred-leader-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 1_000 };
+  const named = new MultiWindowCoordinator(root, options);
+  const preferred = new MultiWindowCoordinator(root, { ...options, preferredLeader: true });
+  try {
+    await named.start();
+    assert.equal(named.isLeader, true);
+    await preferred.start();
+    await waitFor(() => preferred.isLeader && !named.isLeader);
+    let requests = 0;
+    preferred.on('syncRequested', () => { requests += 1; });
+    await named.requestSync();
+    await waitFor(() => requests > 0);
+    assert.equal(named.isLeader, false);
+    assert.equal(preferred.isLeader, true);
+    await preferred.dispose();
+    await waitFor(() => named.isLeader);
+  } finally {
+    await Promise.all([named.dispose(), preferred.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('默认 Profile 接管前等待旧 leader 的独占操作完成', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-leader-handover-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 1_000 };
+  const named = new MultiWindowCoordinator(root, options);
+  const preferred = new MultiWindowCoordinator(root, { ...options, preferredLeader: true });
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => { release = resolve; });
+  let operation: Promise<boolean> | undefined;
+  try {
+    await named.start();
+    let entered = false;
+    operation = named.runExclusive(async () => { entered = true; await blocker; });
+    await waitFor(() => entered);
+    await preferred.start();
+    let observed = false;
+    named.on('windowsChanged', () => { observed = true; });
+    await waitFor(() => observed);
+    assert.equal(named.isLeader, true);
+    assert.equal(preferred.isLeader, false);
+    release();
+    assert.equal(await operation, true);
+    await waitFor(() => preferred.isLeader && !named.isLeader);
+  } finally {
+    release();
+    await operation;
+    await Promise.all([named.dispose(), preferred.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('多个默认 Profile 窗口竞争时仍只有一个 leader，失效优先窗口不阻止接管', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-preferred-race-'));
+  const options = { heartbeatMs: 20, leaseTtlMs: 1_000, preferredLeader: true };
+  const first = new MultiWindowCoordinator(root, options);
+  const second = new MultiWindowCoordinator(root, options);
+  const named = new MultiWindowCoordinator(root, { ...options, preferredLeader: false });
+  try {
+    await Promise.all([first.start(), second.start(), named.start()]);
+    await waitFor(() => first.isLeader || second.isLeader);
+    assert.equal(Number(first.isLeader) + Number(second.isLeader) + Number(named.isLeader), 1);
+    await Promise.all([first.dispose(), second.dispose()]);
+    await writeFile(path.join(root, 'window-expired.json'), JSON.stringify({
+      instanceId: 'expired', pid: process.pid, updatedAt: Date.now() - 10_000, preferredLeader: true,
+    }));
+    await waitFor(() => named.isLeader);
+  } finally {
+    await Promise.all([first.dispose(), second.dispose(), named.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('新 leader 会立即接管死亡进程租约并清理孤儿操作锁', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'profile-git-sync-orphan-'));
   await writeFile(path.join(root, 'coordinator.lease.json'), JSON.stringify({

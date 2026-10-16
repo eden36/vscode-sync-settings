@@ -19,9 +19,12 @@ export const snapshotStage: Stage = {
   name: 'snapshot',
   async run(context: SyncContext): Promise<StageOutcome> {
     const { adapter } = context.dependencies;
+    const before = await adapter.fingerprint();
     context.artifacts.localManifest = await adapter.createSnapshot(context.paths.localHostRoot);
-    // 写回前要用它确认本机没有在本轮期间被改动，采集完立刻记下。
-    context.artifacts.localFingerprint = await adapter.fingerprint();
+    const after = await adapter.fingerprint();
+    // 快照与指纹必须来自同一份本机状态，否则旧快照会配上新指纹并绕过写回检查。
+    if (before !== after) return { kind: 'blocked', reason: 'local-changed' };
+    context.artifacts.localFingerprint = after;
     return { kind: 'continue' };
   },
 };
@@ -232,9 +235,14 @@ export const finalizeStage: Stage = {
     const wroteBack = Boolean(restored && restored.changedFiles.length > 0);
     // 写回过本机才重新采集，否则采到的差异只可能是用户在本轮期间的改动；
     // 把它记进基准等于宣布已经同步过，那次改动就再也推不上去了。
-    const local = wroteBack
-      ? await adapter.createSnapshot(context.paths.localHostRoot)
-      : requireValue(context.artifacts.localManifest, 'localManifest');
+    let local = requireValue(context.artifacts.localManifest, 'localManifest');
+    if (wroteBack) {
+      const before = await adapter.fingerprint();
+      local = await adapter.createSnapshot(context.paths.localHostRoot);
+      const after = await adapter.fingerprint();
+      if (before !== after) return { kind: 'blocked', reason: 'local-changed' };
+      context.artifacts.localFingerprint = after;
+    }
     await runtimeState.update({
       baseline: await computeBaseline(context, local),
       // 用户的选择在这里才算兑现：中途失败保留它，下一轮直接沿用，不再重复询问。

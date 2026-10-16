@@ -39,7 +39,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const configurationStore = new ConfigurationStore(context, environment.runtimePath);
   const runtimeState = new RuntimeStateStore(environment.runtimePath);
   // 构造函数不做任何 IO，真正的磁盘往返在 start 里；提前建好，下面的闭包就不必处理「协调器还不存在」。
-  const coordinator = new MultiWindowCoordinator(path.join(environment.runtimePath, 'coordination'));
+  const coordinator = new MultiWindowCoordinator(path.join(environment.runtimePath, 'coordination'), {
+    preferredLeader: environment.inDefaultProfile !== false,
+  });
   // 先按默认值占位，初始化完成后再换成真实状态；此前 sidebar 不推状态，只渲染静态骨架。
   let machine = createMachine({ enabled: false, configured: false, link: 'no-repository' });
   const status: RuntimeStatus = {
@@ -200,8 +202,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let outcome: SyncOutcome | undefined;
     const acquired = await coordinator.runExclusive(async () => {
       outcome = await engine.synchronize(adoptCloud ? { adoptCloud } : {});
-      // 本机在本轮期间被改动时保留旧指纹，让本机检测的下一拍立刻重跑，而不是干等远端轮询。
-      if (!outcome?.cancelled && outcome?.blockReason !== 'local-changed') await schedules.refreshFingerprint();
+      if (outcome?.ok && outcome.localFingerprint !== undefined) schedules.acceptFingerprint(outcome.localFingerprint);
     });
     if (!acquired) {
       applyStatus({ message: '另一窗口正在执行同步，稍后将自动重试。' }, false);
@@ -357,9 +358,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       let outcome: SyncOutcome | undefined;
       const acquired = await coordinator.runExclusive(async () => {
         outcome = await engine.restoreCommit(target);
-        // 写回后必须刷新指纹，否则本机改动检测会把还原结果当成新改动，再空跑一轮同步；
-        // 本机在还原期间被改过时保留旧指纹，让本机检测的下一拍立刻发现并同步那次改动。
-        if (outcome?.blockReason !== 'local-changed') await schedules.refreshFingerprint();
+        if (outcome?.ok && outcome.localFingerprint !== undefined) schedules.acceptFingerprint(outcome.localFingerprint);
       });
       if (!acquired) {
         applyStatus({ message: '另一窗口正在执行同步，请稍后重试还原。' }, false);

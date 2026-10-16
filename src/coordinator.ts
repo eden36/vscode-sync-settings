@@ -28,6 +28,7 @@ interface WindowPresence {
   pid: number;
   updatedAt: number;
   dirtyDocuments?: number;
+  preferredLeader?: boolean;
 }
 
 interface SharedStatus {
@@ -62,6 +63,8 @@ export interface WindowSafetySnapshot {
 }
 
 export interface CoordinatorOptions {
+  /** 默认 Profile 窗口优先接管，扩展装卸命令只能在该窗口执行。 */
+  preferredLeader?: boolean;
   heartbeatMs?: number;
   leaseTtlMs?: number;
   staleConfirmationMs?: number;
@@ -87,6 +90,7 @@ export class MultiWindowCoordinator extends EventEmitter {
   private readonly heartbeatMs: number;
   private readonly leaseTtlMs: number;
   private readonly staleConfirmationMs: number;
+  private readonly preferredLeader: boolean;
   private readonly now: () => number;
   private readonly processAlive: (pid: number) => boolean;
   private readonly claimedRequests = new Set<string>();
@@ -114,6 +118,7 @@ export class MultiWindowCoordinator extends EventEmitter {
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
     this.staleConfirmationMs = options.staleConfirmationMs ?? DEFAULT_STALE_CONFIRMATION_MS;
+    this.preferredLeader = options.preferredLeader ?? false;
     this.now = options.now ?? Date.now;
     this.processAlive = options.isProcessAlive ?? isProcessAlive;
   }
@@ -284,6 +289,31 @@ export class MultiWindowCoordinator extends EventEmitter {
 
   private async electLeader(): Promise<void> {
     const lease = parseLease(await readJson(this.leasePath));
+    if (!this.preferredLeader) {
+      let preferredPresent = false;
+      for (const entry of await fs.readdir(this.runtimePath)) {
+        if (!/^window-.+\.json$/.test(entry)) continue;
+        const presence = parsePresence(await readJson(path.join(this.runtimePath, entry)));
+        if (presence?.preferredLeader && this.now() - presence.updatedAt <= this.leaseTtlMs && this.processAlive(presence.pid)) {
+          preferredPresent = true;
+          break;
+        }
+      }
+      if (preferredPresent) {
+        if (lease?.instanceId === this.instanceId && lease.token) {
+          // 交接也抢独占锁：本窗口仍在同步或还原时不能失去领导权，让新窗口先等当前操作结束。
+          const yielded = await this.runExclusive(async () => {
+            const current = parseLease(await readJson(this.leasePath));
+            if (current?.token === lease.token) await fs.rm(this.leasePath, { force: true });
+            this.setLeader(false);
+          });
+          if (!yielded) this.setLeader(await this.refreshLease(lease.token));
+        } else {
+          this.setLeader(false);
+        }
+        return;
+      }
+    }
     if (lease?.instanceId === this.instanceId && lease.token) {
       if (await this.refreshLease(lease.token)) {
         this.setLeader(true);
@@ -338,6 +368,7 @@ export class MultiWindowCoordinator extends EventEmitter {
       pid: process.pid,
       updatedAt: this.now(),
       dirtyDocuments: this.dirtyDocuments,
+      preferredLeader: this.preferredLeader,
     } satisfies WindowPresence));
     this.presenceWrite = write;
     await write;
@@ -486,6 +517,7 @@ function parsePresence(value: unknown): WindowPresence | undefined {
   if (!isRecord(value) || typeof value.instanceId !== 'string' || !validPid(value.pid) || typeof value.updatedAt !== 'number') return undefined;
   if (value.dirtyDocuments !== undefined
     && (typeof value.dirtyDocuments !== 'number' || !Number.isInteger(value.dirtyDocuments) || value.dirtyDocuments < 0)) return undefined;
+  if (value.preferredLeader !== undefined && typeof value.preferredLeader !== 'boolean') return undefined;
   return value as unknown as WindowPresence;
 }
 

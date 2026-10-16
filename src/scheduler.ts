@@ -277,14 +277,19 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
   }
 
   if (outcome.retry) {
+    // 检测器可能已经消费了本次改动并排过请求，不能指望下一次指纹变化来解除阻塞。
+    const retryLocal = outcome.blockReason === 'local-changed' && machine.isLeader && machine.configured;
+    const attempt = retryLocal ? machine.retryAttempt + 1 : 0;
     return {
       next: {
         ...machine,
         sync: { kind: 'blocked', reason: outcome.blockReason ?? 'dirty-windows' },
         pending: false,
-        retryAttempt: 0,
+        retryAttempt: attempt,
       },
-      commands: [],
+      commands: retryLocal
+        ? [{ type: 'schedule-retry', delayMs: retryDelayMs(attempt, OPERATION_RETRY_MS, MAX_OPERATION_RETRY_MS) }]
+        : [],
     };
   }
 
@@ -312,7 +317,7 @@ function finishSync(machine: SchedulerMachine, outcome: SyncOutcome | undefined)
 }
 
 /**
- * 失败后按退避自动重试。备份模式没有远程轮询，本机指纹又已在失败的这一轮刷新，
+ * 失败后按退避自动重试。备份模式没有远程轮询，检测器又可能已消费对应的本机改动，
  * 不排重试就要等到下次改配置或重启才会再推。
  */
 function failSync(machine: SchedulerMachine): SchedulerTransition {
@@ -334,7 +339,7 @@ function isResolvedBlock(reason: BlockReason, safety: WindowSafetySnapshot): boo
     case 'both-changed':
     // 由用户新建、删除 Profile 或在侧边栏确认后解除，与窗口状态无关。
     case 'profiles-mismatch':
-    // 本机在同步期间被改动：本机检测的下一拍会重新发起，窗口状态变化与它无关。
+    // 本机变化由退避重试或下一次指纹检测重新发起，窗口状态变化与它无关。
     case 'local-changed':
     case 'exclusive-lock':
       return false;

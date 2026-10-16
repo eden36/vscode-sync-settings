@@ -46,5 +46,8 @@ export async function runPipeline(context: SyncContext, stages: Stage[]): Promis
     ...(transferResult ? { transferResult } : {}),
     ...(report.activeWindows !== undefined ? { activeWindows: report.activeWindows } : {}),
   });
-  return { ok: true };
+  return {
+    ok: true,
+    ...(context.artifacts.localFingerprint !== undefined ? { localFingerprint: context.artifacts.localFingerprint } : {}),
+  };
 }
