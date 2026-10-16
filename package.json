@@ -28,7 +28,9 @@
     "commands": [
       {
         "command": "profileGitSync.syncNow",
-        "title": "My Setting Sync: 立即同步"
+        "title": "立即同步",
+        "category": "My Setting Sync",
+        "icon": "$(sync)"
       },
       {
         "command": "profileGitSync.openSettings",
@@ -58,6 +60,11 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "profileGitSync.syncNow",
+          "when": "view == profileGitSync.sidebar",
+          "group": "navigation@0"
+        },
         {
           "command": "profileGitSync.showHistory",
           "when": "view == profileGitSync.sidebar",
