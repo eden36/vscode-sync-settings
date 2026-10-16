@@ -137,7 +137,7 @@ npm test
 npm run package
 ```
 
-在 VS Code 或 Cursor 中打开项目后按 `F5`，会先构建插件，再弹出选择框，可选 **VS Code** 或 **Cursor** 作为 Extension Development Host。也可在运行和调试下拉框中直接选「调试 VS Code」或「调试 Cursor」，之后 F5 会沿用该配置。三者都是复合配置：启动宿主的同时把调试器附加到扩展宿主（端口 9229），可以直接在源码上打断点。VS Code 使用隔离 User Data（`.debug/vscode/`）；Cursor 复用本机已登录的 User Data，并用临时 Profile，避免弹出登录页、也不在正式数据里留下「插件调试」。若可执行文件不在 PATH 中，可设置 `VSCODE_EXECUTABLE` 或 `CURSOR_EXECUTABLE`。需要在 `activate` 内部打断点时，给 `scripts/launch-debug-host.mjs` 加 `--brk`，宿主会等调试器附加后再启动扩展；同时调试两个宿主时用 `--inspect-port` 错开端口。调试实例会加载本机已安装的扩展，以便使用 Copilot 等扩展提供的默认 AI 模型。
+在 VS Code 或 Cursor 中打开项目后按 `F5`，会先构建插件，再弹出选择框，可选 **VS Code** 或 **Cursor** 作为 Extension Development Host。也可在运行和调试下拉框中直接选「调试 VS Code」或「调试 Cursor」，之后 F5 会沿用该配置。三者都是复合配置：启动宿主的同时把调试器附加到扩展宿主（端口 9229），可以直接在源码上打断点。VS Code 使用隔离 User Data（`.debug/vscode/`）；Cursor 复用本机已登录的 User Data，并打开名为「调试环境」的 Profile，避免弹出登录页、也不把调试写进默认 Profile。若可执行文件不在 PATH 中，可设置 `VSCODE_EXECUTABLE` 或 `CURSOR_EXECUTABLE`。需要在 `activate` 内部打断点时，给 `scripts/launch-debug-host.mjs` 加 `--brk`，宿主会等调试器附加后再启动扩展；同时调试两个宿主时用 `--inspect-port` 错开端口。调试实例会加载本机已安装的扩展，以便使用 Copilot 等扩展提供的默认 AI 模型。
 
 需要验证多窗口时，可在已打开的调试宿主中执行“新建窗口”，并选择不同 Profile；这些窗口共享同一个隔离 User Data，适合观察 leader/follower 状态。
 

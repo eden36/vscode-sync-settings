@@ -53,8 +53,11 @@ button.toggle-switch.enabled::after{transform:translateX(16px)}
 .dialog-actions button{margin:0}
 
 .history-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}
-.history-header strong{flex:1;min-width:0}
-.history-header .open-repository{flex:none;margin:0;padding:3px 8px;font-size:12px}
+.history-header strong{flex:none}
+.history-status-slot{flex:1;min-width:0;display:flex;justify-content:flex-end}
+.history-status{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;opacity:.75}
+.history-status-error{opacity:1;color:var(--vscode-errorForeground)}
+.history-header .open-repository{flex:none;margin:0;padding:1px 7px;font-size:11px}
 button.icon-button{margin:0;padding:3px 8px;background:transparent;color:var(--vscode-foreground);font-size:14px;line-height:1.2}
 button.icon-button:hover:enabled{background:var(--vscode-toolbar-hoverBackground)}
 button.icon-button.refreshing{animation:spin 1s linear infinite}

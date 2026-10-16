@@ -246,6 +246,7 @@ function startHistoryRefresh(): void {
 
 function showHistoryStatus(text: string): void {
   historyRefreshing.textContent = text;
+  historyRefreshing.title = text;
   historyRefreshing.hidden = false;
 }
 
@@ -290,6 +291,7 @@ function renderHistoryLoading(): void {
 function renderHistoryError(message: string): void {
   clearHistoryRefresh();
   historyError.textContent = message;
+  historyError.title = message;
   historyError.hidden = false;
   if (!historyBody.querySelector('.history-list')) historyBody.replaceChildren();
   applyHistoryBusy(historyBusy);
