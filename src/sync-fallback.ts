@@ -1,5 +1,6 @@
-import { HOST_LABELS, HostKind } from './types';
+import { hostLabel } from './host-paths';
+import { HostKind } from './types';
 
-export function fallbackCommitMessage(host: HostKind): string {
-  return `chore(sync): 同步 ${HOST_LABELS[host]} 配置`;
+export function fallbackCommitMessage(host: HostKind, applicationName?: string): string {
+  return `chore(sync): 同步 ${hostLabel(host, applicationName)} 配置`;
 }

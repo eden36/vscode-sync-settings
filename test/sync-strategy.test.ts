@@ -23,6 +23,9 @@ test('AI 不可用时仍可生成稳定的提交信息', () => {
   assert.equal(fallbackCommitMessage('vscode'), 'chore(sync): 同步 VS Code 配置');
   assert.equal(fallbackCommitMessage('cursor'), 'chore(sync): 同步 Cursor 配置');
   assert.equal(fallbackCommitMessage('vscode-insiders'), 'chore(sync): 同步 VS Code Insiders 配置');
+  assert.equal(fallbackCommitMessage('antigravity'), 'chore(sync): 同步 Antigravity 配置');
+  assert.equal(fallbackCommitMessage('trae', 'Trae'), 'chore(sync): 同步 Trae 配置');
+  assert.equal(fallbackCommitMessage('trae'), 'chore(sync): 同步 trae 配置');
 });
 
 test('首次接入的状态文案说明已按云端覆盖并提示备份', () => {

@@ -1,16 +1,18 @@
 /**
- * 支持的宿主。每种宿主在仓库里各占一个目录，彼此不共享：
- * 扩展市场与扩展标识不同，混用同一份快照会互相覆盖并反复装卸扩展。
+ * 仓库目录名与快照 host 字段。已知宿主有固定 id；其余由应用名生成合法 slug。
+ * 每种宿主各占一个目录，彼此不共享：扩展市场不同，混用快照会互相覆盖并反复装卸扩展。
  */
-export const HOST_KINDS = ['vscode', 'vscode-insiders', 'cursor', 'vscodium', 'windsurf'] as const;
-export type HostKind = (typeof HOST_KINDS)[number];
+export type HostKind = string;
 
-export const HOST_LABELS: Record<HostKind, string> = {
+export const HOST_LABELS: Record<string, string> = {
   'vscode': 'VS Code',
   'vscode-insiders': 'VS Code Insiders',
+  'vscode-exploration': 'VS Code Exploration',
   'cursor': 'Cursor',
   'vscodium': 'VSCodium',
   'windsurf': 'Windsurf',
+  'antigravity': 'Antigravity',
+  'antigravity-insiders': 'Antigravity Insiders',
 };
 
 /** 备份模式只把本机配置提交到仓库，同步模式才会把仓库内容写回本机。 */

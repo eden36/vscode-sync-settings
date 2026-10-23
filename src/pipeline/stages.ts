@@ -7,11 +7,12 @@ import {
   selectRemovableExtensionIds,
 } from '../extension-manifest';
 import { requestExtensionChanges } from '../extension-wait';
+import { hostLabel } from '../host-paths';
 import { findPotentialSecrets } from '../secret-scanner';
 import { namedProfiles, readManifest, snapshotDigest } from '../snapshot-conflict';
 import { fallbackCommitMessage } from '../sync-fallback';
 import { decideCloudAdopt } from '../sync-strategy';
-import { HOST_LABELS, SnapshotManifest, SyncBaseline } from '../types';
+import { SnapshotManifest, SyncBaseline } from '../types';
 import { chooseStage } from './choose';
 import { requireValue, Stage, StageOutcome, SyncArtifacts, SyncContext, windowBlock } from './types';
 
@@ -75,7 +76,7 @@ const decideStage: Stage = {
     const strategy = decideCloudAdopt(context.configuration.mode, context.adoptCloud, pull.state, remoteExists);
     if (strategy === 'missing-cloud') {
       await context.dependencies.runtimeState.update({ cloudAdoptPending: false });
-      throw new Error(`云端没有 ${HOST_LABELS[environment.kind]} 的配置快照，无法覆盖本机。本机配置未被推送。如需用本机初始化该宿主，请使用立即同步。`);
+      throw new Error(`云端没有 ${hostLabel(environment.kind, environment.label)} 的配置快照，无法覆盖本机。本机配置未被推送。如需用本机初始化该宿主，请使用立即同步。`);
     }
     context.artifacts.strategy = strategy;
     context.artifacts.remoteExists = remoteExists;
@@ -110,7 +111,7 @@ export const pushStage: Stage = {
         try {
           message = prefix + (await ai.createCommitMessage(changed.map((file) => `- ${file}`).join('\n')));
         } catch {
-          message = prefix + fallbackCommitMessage(environment.kind);
+          message = prefix + fallbackCommitMessage(environment.kind, environment.label);
           context.report.usedAiFallback = true;
         }
       }

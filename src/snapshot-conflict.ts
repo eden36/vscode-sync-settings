@@ -2,9 +2,9 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { HOST_EXTENSIONS_FILE } from './extension-manifest';
-import { HOST_KINDS, SnapshotManifest } from './types';
+import { isHostKind } from './host-paths';
+import { SnapshotManifest } from './types';
 
-const KNOWN_HOSTS = new Set<string>(HOST_KINDS);
 const PLATFORM_KEYBINDINGS = /^profiles\/[^/]+\/keybindings\.([^/.]+)\.json$/;
 
 /** 一份快照的可比较部分。扩展清单不参与择一，按增删单独合并。 */
@@ -59,7 +59,7 @@ export async function readManifest(root: string): Promise<SnapshotManifest> {
 
 export function parseManifest(value: unknown): SnapshotManifest | undefined {
   if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2)) return undefined;
-  if (typeof value.host !== 'string' || !KNOWN_HOSTS.has(value.host)) return undefined;
+  if (typeof value.host !== 'string' || !isHostKind(value.host)) return undefined;
   if (typeof value.createdAt !== 'string') return undefined;
   if (!Array.isArray(value.profiles)) return undefined;
   const profiles = value.profiles.map((profile) => {

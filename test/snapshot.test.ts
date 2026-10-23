@@ -26,8 +26,11 @@ test('快照清单缺字段或类型不符时拒绝解析', () => {
   assert.equal(parseManifest(valid)?.host, 'vscode');
   assert.equal(parseManifest({ ...valid, schemaVersion: 2 })?.schemaVersion, 2);
   assert.equal(parseManifest({ ...valid, host: 'vscode-insiders' })?.host, 'vscode-insiders');
+  assert.equal(parseManifest({ ...valid, host: 'antigravity' })?.host, 'antigravity');
+  assert.equal(parseManifest({ ...valid, host: 'sublime' })?.host, 'sublime');
   assert.equal(parseManifest({ ...valid, schemaVersion: 3 }), undefined);
-  assert.equal(parseManifest({ ...valid, host: 'sublime' }), undefined);
+  assert.equal(parseManifest({ ...valid, host: 'Sublime' }), undefined);
+  assert.equal(parseManifest({ ...valid, host: '' }), undefined);
   assert.equal(parseManifest({ ...valid, profiles: [{ id: 'x' }] }), undefined);
   assert.equal(parseManifest({ ...valid, files: { 'a.json': 12 } }), undefined);
   assert.equal(parseManifest({ ...valid, files: null }), undefined);

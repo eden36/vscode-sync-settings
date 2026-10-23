@@ -1,11 +1,11 @@
 # My Setting Sync
 
-通过普通 Git 仓库自动同步 VS Code、Cursor 及其全部用户 Profiles 的便携配置。插件支持多个 IDE 窗口同时运行：同一 User Data 目录只会选出一个 leader 执行 Git 与 AI 操作，其余窗口作为 follower 转发同步请求。
+通过普通 Git 仓库自动同步 VS Code、Cursor 等 VS Code 兼容 IDE 以及它们全部用户 Profiles 的便携配置。插件支持多个 IDE 窗口同时运行：同一 User Data 目录只会选出一个 leader 执行 Git 与 AI 操作，其余窗口作为 follower 转发同步请求。
 
 ## 当前能力
 
 - 一次快照默认 Profile 与全部命名 Profile 的 `settings.json`、`keybindings.json`、`tasks.json`、`mcp.json`、`snippets/` 和 `prompts/`，以及宿主级已安装扩展清单；Cursor 还会同步用户主目录下的全局 MCP 配置 `~/.cursor/mcp.json`。
-- 每种宿主单独存放在 `.profile-git-sync/hosts/<宿主>` 下，互不覆盖：`vscode`、`vscode-insiders`、`cursor`、`vscodium`、`windsurf`。认不出的宿主不会启用同步，避免归到别的宿主名下互相覆盖、反复装卸扩展。
+- 每种宿主单独存放在 `.profile-git-sync/hosts/<宿主>` 下，互不覆盖。已识别的有 `vscode`、`vscode-insiders`、`cursor`、`vscodium`、`windsurf`、`antigravity`；其他 VS Code 兼容 IDE 在 User Data 布局能解析时，按应用名生成独立宿主目录后启用。宿主目录名取决于应用名，IDE 升级后若应用名改变，会按新名称另建目录、等同首次接入。得不到合法宿主 id 或标准布局（`User` 目录）的不会启用，避免归到别的宿主名下互相覆盖、反复装卸扩展。
 - 快捷键按平台分文件存放（`keybindings.win32.json`、`keybindings.darwin.json` 等），Windows 与 macOS 的快捷键互不覆盖；推送时保留云端其他平台的那份。
 - 遵循 IDE 内置同步的 `settingsSync.ignoredSettings`：其中列出的设置只属于本机，不提交到仓库，写回时也保留本机原值，适合解释器路径、终端配置等机器专属设置。
 - 软链接管理的配置文件（dotfiles）写回时写到链接目标，不替换链接本身；本机文件原本是 CRLF 时按 CRLF 写回。
@@ -141,7 +141,7 @@ npm run package
 
 需要验证多窗口时，可在已打开的调试宿主中执行“新建窗口”，并选择不同 Profile；这些窗口共享同一个隔离 User Data，适合观察 leader/follower 状态。
 
-生成的 `my-setting-sync-<版本号>.vsix` 可通过 VS Code 或 Cursor 的“从 VSIX 安装”功能安装。
+生成的 `my-setting-sync-<版本号>.vsix` 可通过 VS Code、Cursor 或其他 VS Code 兼容 IDE 的“从 VSIX 安装”功能安装。
 
 ## 使用
 

@@ -7,6 +7,7 @@ import { MultiWindowCoordinator, WindowSafetySnapshot } from './coordinator';
 import { ConfigurationRepositoryGitService, RepositoryCommit } from './git-service';
 import { HistoryController } from './history-controller';
 import { detectHost } from './host';
+import { hostLabel, resolveHostKind } from './host-paths';
 import { ProfileAdapter } from './profile-adapter';
 import { RuntimeStateStore } from './runtime-state';
 import {
@@ -20,7 +21,7 @@ import { profileMismatchText } from './sidebar-status';
 import { reportActivationFailure, SyncStatusBar } from './status-bar';
 import { SyncEngine } from './sync-engine';
 import { SyncSchedules } from './sync-schedules';
-import { HOST_LABELS, RuntimeStatus, SyncOutcome } from './types';
+import { RuntimeStatus, SyncOutcome } from './types';
 
 const CONFIGURATION_POLL_MS = 5_000;
 /** 通过「打开用户设置 (JSON)」等入口打开的配置文件使用这个协议，而不是 file。 */
@@ -32,8 +33,11 @@ let shutdown: (() => Promise<void>) | undefined;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const environment = detectHost(context);
   if (!environment) {
-    // 识别不了宿主就无法确定云端目录，归到别的宿主名下会与它互相覆盖快照、反复装卸扩展。纯内存判断，不涉及 IO。
-    reportActivationFailure(context, new Error(`暂不支持 ${vscode.env.appName}，配置同步未启动。`));
+    // 识别不了或 User Data 布局对不上就无法确定云端目录，归到别的宿主名下会与它互相覆盖快照、反复装卸扩展。纯内存判断，不涉及 IO。
+    const reason = resolveHostKind(vscode.env.appName)
+      ? `无法识别 ${vscode.env.appName} 的 User Data 目录布局（${context.globalStorageUri.fsPath}）`
+      : `暂不支持 ${vscode.env.appName}`;
+    reportActivationFailure(context, new Error(`${reason}，配置同步未启动。`));
     return;
   }
   const configurationStore = new ConfigurationStore(context, environment.runtimePath);
@@ -385,7 +389,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     const confirmed = await vscode.window.showWarningMessage(
-      `是否以本机配置覆盖云端 ${HOST_LABELS[environment.kind]} 的配置？`,
+      `是否以本机配置覆盖云端 ${hostLabel(environment.kind, environment.label)} 的配置？`,
       {
         modal: true,
         detail: [
